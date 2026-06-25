@@ -32,6 +32,18 @@ roc-obj / readelf on the .hsaco         # metadata (vgpr/sgpr/lds/scratch)
 The MAIN AGENT runs all on-device tests, one at a time, under `flock /tmp/mi355x_project_gpu.lock`.
 The node also runs a live R1 vLLM server — never disturb it, never take VRAM, never kill processes.
 
+### Compile coordination (node is shared — even compile-only must be gentle)
+The node serves a live model. Do NOT launch a wide parallel build. When you compile on the node:
+- use YOUR OWN build dir so agents don't stomp each other: `cmake -B build_<NN>` (NN = your agent
+  number), never the shared `build/`;
+- cap parallelism: `cmake --build build_<NN> -j8` (NOT -j16);
+- serialize against other agents with the COMPILE lock (separate from the GPU lock):
+  `flock /tmp/mi355x_compile.lock -c "cmake --build build_<NN> -j8 --target <dir>"`;
+- one compile at a time per agent; if you only need a syntax check, prefer a single-TU
+  `hipcc --offload-arch=gfx950 -fsyntax-only` over a full cmake build.
+Compiling is OPTIONAL for design-only agents (00/01/09). For schedule/occupancy agents (04/05/07)
+a static resource report IS the deliverable, so compiling is expected — just lock + low -j.
+
 Connection details (host/container/paths/build+run commands): see `NODE_ACCESS.local.md`
 (gitignored — do NOT copy its contents into any committed file; use the placeholders
 `<NODE>`,`<USER>`,`<HK_ROOT>`,`r1_c4` in committed docs).
