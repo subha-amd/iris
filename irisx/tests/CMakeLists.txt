@@ -31,6 +31,7 @@ set(TESTS
     test_producer
     test_moe_dispatch_pack
     test_moe_dispatch_pack_quant
+    test_moe_dispatch_pack_quant_pipelined
 )
 
 foreach(test ${TESTS})
