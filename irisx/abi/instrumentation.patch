@@ -1,0 +1,41 @@
+# instrumentation.patch -- opt-in route capture for the IRISX dispatch kernel
+#
+# Adds compile-time-gated route capture (ROUTE_CAPTURE_SCHEMA.md) to the V1 dispatch+pack
+# kernel. At ROUTE_CAPTURE=0 it compiles to nothing (graph-shape identical to baseline);
+# at >=1 it writes summary records into a pre-allocated ring; at >=2 it also emits the
+# route_reverse / topk_weights FULL arrays. Folds the route_reverse store into the pass
+# that already writes route_slot, so no extra kernel launch.
+#
+# Apply from the worktree root:
+#     git -C C:/Users/subvadla/repos/iris/.agents/00-production-abi apply irisx/abi/instrumentation.patch
+#
+# NOTE: line numbers below target moe_dispatch_pack_quant.hip as read 2026-06-25. If the
+# file drifts, apply by hand using the marked anchors. This patch is design-reviewed but
+# COMPILE-UNTESTED locally (no compiler in sandbox) -- main agent should syntax-check on node
+# under HIP_VISIBLE_DEVICES="" before any GPU run.
+#
+# The capture helpers live in route_capture.hpp (also in this dir) so the patch only wires
+# call sites; the helpers are the no-op-when-disabled inline bodies.
+
+--- a/irisx/benchmarks/moe_dispatch_pack_quant.hip
++++ b/irisx/benchmarks/moe_dispatch_pack_quant.hip
+@@
+ #include "iris/iris.hpp"
+ #include "utils.hpp"
++#include "../abi/route_capture.hpp"   // opt-in route capture (no-op at ROUTE_CAPTURE=0)
+@@ kernel: ep_dispatch_pack_quant_fp8, after route_slot store
+     const int slot = assign_slot[assignment];
+     if (slot >= PER_SRC_CAPACITY) continue;
+     if (threadIdx.x == 0) route_slot[t * TOPK + k] = slot;
++    // --- FULL route_reverse: packed-row -> (src_rank, src_token, topk_slot, weight) ---
++    // dst packed row for this assignment is (base) in expert-major space; combine needs it.
++    ROUTE_CAPTURE_REVERSE(/*packed_row=*/static_cast<int>(base),
++                          /*src_rank=*/my_rank, /*src_token=*/t, /*topk_slot=*/k,
++                          /*weight=*/route_weights ? route_weights[t * TOPK + k] : 1.0f);
+@@ host: run_v1 lambda, after moe_dispatch_count produces send_counts
+       moe_dispatch_count<<<(n_assign + block - 1) / block, block>>>(topk_ids, assign_slot, send_counts, T_LOCAL);
++      // --- SUMMARY capture: one record per step from send_counts (device-resident) ---
++      ROUTE_CAPTURE_SUMMARY(g_capture_ring, /*rank=*/rank, /*layer=*/0, /*step=*/epoch,
++                            send_counts, world_size, EXPERTS_PER_RANK, T_LOCAL);
+@@ host: signature add a route_weights buffer (optional; pass nullptr if absent)
+   // (caller threads route_weights[T_local*TOPK] fp32 through; nullptr -> weight=1.0f)
