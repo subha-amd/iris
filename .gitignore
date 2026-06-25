@@ -29,3 +29,7 @@ slurm*.out
 examples/gemm/results/*
 asm/
 *.img
+# Local-only / internal (not for public fork)
+NODE_ACCESS.local.md
+*.local.md
+.handoff/

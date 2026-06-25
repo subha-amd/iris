@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MoE Decode Fusion</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#0f172a;
+    background:#fff;margin:0;padding:30px 36px;}
+  .row{margin:0 0 24px;}
+  .label{font-size:14px;font-weight:700;margin:0 0 6px;}
+  .bar{display:flex;height:64px;}
+  .blk{display:flex;flex-direction:column;align-items:center;justify-content:center;
+    color:#fff;border-right:2px solid #fff;padding:0 6px;text-align:center;
+    overflow:hidden;}
+  .blk .n{font-size:11px;font-weight:600;line-height:1.15;word-break:break-word;}
+  .blk .t{font-size:11px;font-weight:700;opacity:.92;margin-top:3px;white-space:nowrap;}
+  .blk.dashed{border:2px dashed #064e3b;}
+</style>
+</head>
+<body>
+<div id="rows"></div>
+<script>
+const COL={router:'#94a3b8',gather:'#f59e0b',pack:'#cbd5e1',quant:'#fbbf24',
+  gemm:'#3b82f6',scatter:'#ef4444',shared:'#a855f7',fused:'#10b981'};
+const NAME={router:'grouped_topk',gather:'EpDispatch',pack:'opus_moe_sorting',
+  quant:'dynamic_quant',gemm:'fmoe (expert GEMM)',scatter:'EpCombine',
+  shared:'wv_splitk'};
+const SCALE=3.0, MINW=88;
+
+const rows=[
+ {label:'Current (production ATOM — measured per-call µs)', k:[
+   {c:'router',t:5.7},{c:'gather',t:29.2},{c:'pack',t:5.3},{c:'pack',t:5.7},
+   {c:'quant',t:5.8},{c:'gemm',t:128.8},{c:'scatter',t:33.5},{c:'shared',t:7.7}]},
+ {label:'V0 — fuse dispatch + sort/pack  (replaces 29.2+11.0 = 40 µs of prep)', k:[
+   {c:'router',t:5.7},{c:'fused',t:30,name:'ep_dispatch_pack',disp:'~30',dashed:true},
+   {c:'quant',t:5.8},{c:'gemm',t:128.8},{c:'scatter',t:33.5},{c:'shared',t:7.7}]},
+ {label:'V1 — fuse dispatch + sort/pack + FP8 quant  (replaces 46 µs of prep; ~2× payload cut)', k:[
+   {c:'router',t:5.7},{c:'fused',t:22,name:'ep_dispatch_pack_quant_fp8',disp:'~22',dashed:true},
+   {c:'gemm',t:128.8},{c:'scatter',t:33.5},{c:'shared',t:7.7}]},
+ {label:'V2 — gather fused into HipKittens expert GEMM', k:[
+   {c:'router',t:5.7},
+   {c:'gemm',t:128.8,name:'fmoe GEMM + gather (HipKittens, overlapped)'},
+   {c:'scatter',t:33.5},{c:'shared',t:7.7}]},
+];
+
+const R=document.getElementById('rows');
+rows.forEach(r=>{
+  let html=`<div class="row"><div class="label">${r.label}</div><div class="bar">`;
+  r.k.forEach(b=>{
+    const w=Math.max(b.t*SCALE,MINW);
+    const nm=b.name||NAME[b.c];
+    const tt=b.disp?(b.disp+' µs'):(b.t.toFixed(0)+' µs');
+    html+=`<div class="blk ${b.dashed?'dashed':''}" style="width:${w}px;background:${COL[b.c]}">
+      <div class="n">${nm}</div><div class="t">${tt}</div></div>`;
+  });
+  html+='</div></div>';
+  R.innerHTML+=html;
+});
+</script>
+</body>
+</html>

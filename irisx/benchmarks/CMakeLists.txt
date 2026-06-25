@@ -9,3 +9,4 @@ endfunction()
 # Add benchmarks
 add_iris_benchmark(put)
 add_iris_benchmark(all_put)
+add_iris_benchmark(moe_dispatch_pack)
