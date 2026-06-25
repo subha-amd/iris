@@ -30,6 +30,7 @@ set(TESTS
     test_remote_atomic
     test_producer
     test_moe_dispatch_pack
+    test_moe_dispatch_pack_quant
 )
 
 foreach(test ${TESTS})
