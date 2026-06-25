@@ -28,12 +28,24 @@ TFLOPs, rms_rel, zero_sentinel, spd_vs_B1, spd_vs_B2, spd_vs_B3, notes`
 
 ---
 
-## Phase A — rebaseline canonical V3/V4
-_status: PENDING (main agent)_
+## Phase A — rebaseline canonical V4
+_status: DONE 2026-06-25 (main agent, node cv350 / r1_c4, np=2, --mca pml ob1 --mca btl self,vader)_
 
-| candidate | M | N | K | lat_us | spd_vs_B3 | rms_rel | zero_sentinel | notes |
-|---|---|---|---|---|---|---|---|---|
-| _to be filled_ | | | | | | | | |
+Build clean (gfx950). Baseline here = V4's in-file `micro_tk_baseline` (= B3-family direct-pull,
+no overlap). All RMS_rel=0.00331, local_A_zero=True, C_zero=False (remote gather real).
+
+| candidate | M | N | K | baseline_us | fused_us | spd_vs_B3 | notes |
+|---|---|---|---|---|---|---|---|
+| V4 astationary | 1024 | 2048 | 7168 | 1240.6 | 679.9 | 1.825x | run1/3 |
+| V4 astationary | 1024 | 2048 | 7168 | 1222.3 | 675.6 | 1.809x | run2/3 |
+| V4 astationary | 1024 | 2048 | 7168 | 1243.2 | 682.6 | 1.821x | run3/3 (stable, ~44.2 TFLOP/s) |
+| V4 astationary | 512  | 2048 | 7168 | 642.5  | 563.0 | 1.141x | crossover into win |
+| V4 astationary | 256  | 2048 | 7168 | 490.4  | 546.6 | 0.897x | LOSS (grid-starved) |
+| V4 astationary | 128  | 2048 | 7168 | 464.7  | 549.2 | 0.846x | LOSS (grid-starved) |
+
+CONFIRMED: 1.80-1.83x stable at M=1024; wins M>=512; loses M<=256. Matches V4_ASTATIONARY_RESULTS.
+CAVEAT (Gate 1 unmet): this baseline refetches A per N-tile (weak). Honest speedup needs B1
+(gather-once + local GEMM) from Agent 01's harness — that is Phase B, not yet run.
 
 ## Phase B — strong baselines (B0/B1/B2) + recomputed V4 speedup
 _status: PENDING_
