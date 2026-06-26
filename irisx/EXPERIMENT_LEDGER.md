@@ -239,6 +239,25 @@ A-stationary fused body, so it shows the same ~2x-over-weak-baseline / ~17 TFLOP
 14.5ms vs its own direct-pull baseline 32ms). The low throughput is the direct-pull dataflow, to be
 replaced by copy-once gather when grouped is paired into B1-dispatch. Correctness was the goal here.
 
+## B1-dispatch main line — EP8 multi-source gather CORRECTNESS (Agent 03) — PASS (2026-06-26)
+np=8, Msrc=128 Mpacked=256 K=256, 10 route_segments, 4 tiles:
+- RMS_rel = 0.00167, max_rel 0.0039 -> PASSED
+- zero_sentinel_rows_exact_zero = True (unrouted/tail rows exactly 0)
+- remote (XGMI) gathered rows = 207 from MULTIPLE source ranks (proves real multi-source EP8 path)
+- segment-iterator straddle tiles = 4 (the cross-source-boundary path exercised)
+EP8 MULTI-SOURCE GATHER IS CORRECT across all 8 ranks. This is the GATHER half of B1-dispatch. [VERIFIED]
+Bugs fixed en route (all in the TEST/REF, not the gather kernel): (1) IRIS int32 alloc -> float32-
+backed; (2) the nan was the CPU reference using ml_dtypes.float8_e4m3 (has inf; encodes 448 as inf ->
+deq inf, 4135 non-finite) instead of float8_e4m3fn (OCP finite/saturating, what gfx950+torch use) +
+saturating clip; (3) comm.gather -> allgather + per-rank finite asserts to localize. The gather
+MECHANISM was correct from the first run (sentinel + 207 remote rows); only the reference was wrong.
+
+### B1-dispatch status: BOTH HALVES VERIFIED
+- LOCAL grouped 32-expert GEMM (Agent 02 V5): PASS all 5 routes (RMS 0.00331). [VERIFIED]
+- EP8 multi-source gather/pack (Agent 03): PASS np=8 (RMS 0.00167). [VERIFIED]
+NEXT: B1-dispatch V0 = wire EP8-gather-once (expert-major pack + route_reverse) -> local grouped GEMM,
+measure vs B1-copy. (fp8 e4m3fn saturation is a PROJECT-WIDE ref hazard — note for any CPU reference.)
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
