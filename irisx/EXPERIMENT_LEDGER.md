@@ -258,6 +258,37 @@ MECHANISM was correct from the first run (sentinel + 207 remote rows); only the 
 NEXT: B1-dispatch V0 = wire EP8-gather-once (expert-major pack + route_reverse) -> local grouped GEMM,
 measure vs B1-copy. (fp8 e4m3fn saturation is a PROJECT-WIDE ref hazard — note for any CPU reference.)
 
+## B1-dispatch V0 — production-shaped EP8 pipeline — CORRECTNESS PASS (2026-06-26) *** MILESTONE ***
+np=8, E=32, TOTAL_M=8192, N=2048, K=7168, MSRC=4096/rank. Composition of the two VERIFIED components
+(EP8 multi-source gather + v5 grouped GEMM), NO rewrite. Phase1 = gather/pack/quant ONCE into local
+expert-major buffer; Phase2 = local grouped GEMM (src_rank=CONSUMER -> ctx.load is local).
+
+| route | Mpacked | segs | phase1 packed-A RMS | e2e RMS_rel | verdict |
+|---|---|---|---|---|---|
+| uniform | 8192 | 420 | 0.000000 (0 mismatch) | 0.003702 | PASSED |
+| zipf | 8960 | 421 | 0.000000 | 0.003701 | PASSED |
+| one_hot | 8192 | 402 | 0.000000 | 0.003703 | PASSED |
+| several_hot | 8192 | 406 | 0.000000 | 0.003703 | PASSED |
+| many_empty | 8448 | 406 | 0.000000 | 0.003702 | PASSED |
+
+B1-DISPATCH V0 IS CORRECT: real EP8 multi-source routing -> gather/pack once -> grouped 32-expert
+GEMM, all distributions, 7111 rows over XGMI from multiple ranks. [VERIFIED]
+
+*** BUG FOUND + FIXED BY MAIN AGENT (directly, on the node) ***
+First run: e2e RMS=0.95, ~70% rows wrong. A phase-1 isolation probe (dequant the packed buffer, diff
+vs reference) localized it to PHASE 1: packed-A RMS=0.95, 5768/8192 rows mismatched. ROOT CAUSE:
+build_row_seg_map stored the ABSOLUTE segment index (seg_begin+si, up to ~420 at 32 experts) in a
+`signed char` row_seg[] -> overflow at 127 -> wrong segment for every row whose seg index >127 (~70%).
+This is EXACTLY the risk Agent 03 flagged in its original report. FIX: row_seg + SEG_NONE +
+build_row_seg_map + the reader changed signed char -> int (kernel.cpp AND ep8_gather.h). -> RMS 0.000.
+
+PERF (NOT optimized yet — next step): T_gather ~207us (phase1, the gather/pack ONCE) + T_gemm ~7400us
+(phase2) = ~7640us e2e at 31 TFLOP/s. The gather is cheap; T_gemm is huge because phase2 uses v5's
+DIRECT-PULL serial baseline (micro_tk_baseline re-reads A per N-tile via ctx.load — even though local,
+it re-reads K*N/BN bytes from HBM and runs at ~32 TFLOP/s, far below B0's 183). NEXT: replace phase2's
+per-tile A re-read with a copy-once-into-LDS local grouped GEMM (B0-class) so T_gemm approaches the B0
+ceiling. Then B1-dispatch total should approach T_gather + (B0-class grouped GEMM). Compare vs B1-copy.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
