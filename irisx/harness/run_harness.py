@@ -179,10 +179,10 @@ def make_case(case, T):
     # bf16 8-wave MMA core as v2_hk_expert_gemm: dequant fp8->bf16 (preamble) then GEMM.  No IRIS.
     if case == "B0":
         try:
-            import harness_kernel as hk
+            import tk_kernel as hk
         except ImportError as e:
             raise NotImplementedError(
-                "B0 needs the harness_kernel pybind module (build harness_kernels.cpp). "
+                "B0 needs the harness tk_kernel pybind module (build harness_kernels.cpp). "
                 f"[NEEDS-NODE] import failed: {e}")
         bm, bn, bk = 256, 256, 64
         meta = dict(schedule="v2/8wave-pingpong/local", bm=bm, bn=bn, bk=bk, nsub=1,
@@ -200,10 +200,10 @@ def make_case(case, T):
     #   phase C (compute) : the SAME local V2 GEMM as B0 over the now-local fp8 buffer.
     if case == "B1":
         try:
-            import harness_kernel as hk
+            import tk_kernel as hk
         except ImportError as e:
             raise NotImplementedError(
-                "B1 needs the harness_kernel pybind module (build harness_kernels.cpp). "
+                "B1 needs the harness tk_kernel pybind module (build harness_kernels.cpp). "
                 f"[NEEDS-NODE] import failed: {e}")
         import torch
         # Local destination fp8 buffer (NOT on the symmetric heap — it's the gathered copy).
@@ -267,24 +267,33 @@ def run_case(case, iris, rank, world):
                     meta["nsub"], meta["grid_blocks"], notes="")
     row["ranks"] = world
 
+    # IMPORTANT: every rank must execute the SAME number of sync_fn()/iris.barrier() calls,
+    # or the consumer will deadlock on a barrier the producer never reaches. So ALL ranks run
+    # the timing loops (run_fn is a no-op on the producer, but sync_fn's barrier is not).
+    # Only the consumer computes correctness, records the row, and prints/emits.
+    chk = None
     if is_consumer:
         chk = hc.correctness(T.A_ref, T.B, T.C, T.local_a_max(), tol=TOL)
         row["rms_rel"] = round(chk["rms_rel"], 6)
         row["zero_sentinel"] = chk["zero_sentinel"]
-        timing = hc.timed(run_fn, sync_fn, iters=ITERS, warmup=WARMUP)
+
+    timing = hc.timed(run_fn, sync_fn, iters=ITERS, warmup=WARMUP)   # all ranks (barrier symmetry)
+
+    # B1 split timers (transfer vs compute) — all ranks run them so barriers stay balanced.
+    tT = tC = None
+    if case == "B1" and "phase_T" in handle:
+        tT = hc.timed(handle["phase_T"], sync_fn, iters=ITERS, warmup=WARMUP)
+        tC = hc.timed(handle["phase_C"], sync_fn, iters=ITERS, warmup=WARMUP)
+
+    if is_consumer:
         row["lat_us"] = round(timing["lat_us"], 3)
         row["p50"] = round(timing["p50"], 3)
         row["p95"] = round(timing["p95"], 3)
         row["p99"] = round(timing["p99"], 3)
         row["TFLOPs"] = round(hc.tflops(M, N, K, timing["lat_us"]), 2)
-
-        # B1 split timers (transfer vs compute) -> noted in 'notes' for the strong baseline.
-        if case == "B1" and "phase_T" in handle:
-            tT = hc.timed(handle["phase_T"], sync_fn, iters=ITERS, warmup=WARMUP)
-            tC = hc.timed(handle["phase_C"], sync_fn, iters=ITERS, warmup=WARMUP)
+        if tT is not None:
             row["notes"] = (f"transfer={tT['lat_us']:.1f}us compute={tC['lat_us']:.1f}us "
                             f"(dispatch-once); combined above")
-
         print(f"[{case}] M={M} N={N} K={K} M_label={M_LABEL} route={ROUTE}  "
               f"lat={row['lat_us']}us  TFLOPs={row['TFLOPs']}  rms_rel={row['rms_rel']}  "
               f"zero_sentinel={row['zero_sentinel']}  "
