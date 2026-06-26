@@ -102,12 +102,15 @@ def make_fp8_iris_tensor(M, K):
     fp8_view  = view_as("|u1", (M, K), torch.float8_e4m3fn)
     return bf16_view, fp8_view
 
-# allocate in identical order on both ranks
-A_fp8_bf16, A_fp8 = make_fp8_iris_tensor(Mpacked, K)     # packed activations (padded)
-A_sc   = make_iris_tensor([Mpacked, NG], "float32")
-B      = make_iris_tensor([E * N, K], "bfloat16")        # expert-major weights B[E*N, K]
-C      = make_iris_tensor([Mpacked, N], "bfloat16")
-TASKS  = make_iris_tensor([num_tasks, BT.TASK_W], "int32")
+# allocate in identical order on both ranks.
+# ONLY A (gathered remotely) needs the IRIS symmetric heap. B (weights) and C (output) are LOCAL to
+# the consumer rank -> plain torch tensors (putting 3GB of B on the 512MB heap OOMs and is pointless;
+# the kernel reads B/C via a gl built from any device pointer).
+A_fp8_bf16, A_fp8 = make_fp8_iris_tensor(Mpacked, K)     # packed activations (padded) - IRIS heap
+A_sc   = make_iris_tensor([Mpacked, NG], "float32")      # scales - IRIS heap
+B      = torch.zeros(E * N, K, dtype=torch.bfloat16, device='cuda')   # LOCAL weights B[E*N, K]
+C      = torch.zeros(Mpacked, N, dtype=torch.bfloat16, device='cuda') # LOCAL output
+TASKS  = torch.zeros(num_tasks, BT.TASK_W, dtype=torch.int32, device='cuda')  # LOCAL task list (consumer-only; IRIS has no int32)
 TASKS.copy_(torch.from_numpy(tasks_np).to('cuda'))
 
 # ---- build reference data on the host (numpy/torch CPU+GPU), pack with BM padding ----
