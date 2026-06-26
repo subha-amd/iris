@@ -158,8 +158,31 @@ already shows that moving A ONCE (135us) is far cheaper than B3/B4's repeated pu
 traffic). So P1/P2 = (copy-once like B1) + (overlap like B5's mechanism) is exactly the right combine;
 neither the V4 reuse rework nor the direct-pull dataflow is worth keeping. [VERIFIED]
 
+## Agent 10 bounded LDS diagnostic (v4_bsingle_buffer) — REFUTED, one pass only
+Static resource (compile): fused 244 VGPR / occ 2 / 160B scratch / 0 spill (LDS dynamic -> static
+pass shows 0; runtime LDS ~82KB by Agent 10's formula). Run M1024/N2048/K7168:
+- FUSED **FAILED correctness** (RMS_rel=1.16, max_rel 1e6) — single-buffering B introduced a race
+  (consumer reads B subtiles while producer overwrites them; B needs its buffering or a barrier).
+- Timing (ignoring the bug): fused 671.7us vs V4 676.6us = within noise. **No throughput gain.**
+VERDICT [REFUTED]: reducing LDS via B-single-buffer did NOT restore GEMM throughput AND broke
+correctness. Per the one-pass rule, NOT pursued further. (Confirms the real V4 limiter is the
+direct-pull dataflow/overlap mechanism, not LDS occupancy — consistent with B3/B4/B5 showing the win
+is overlap, not reuse.) Occupancy was already 2 in stock V4; lifting it didn't help because the
+kernel is comm-latency-bound, not compute-occupancy-bound, at these shapes.
+
+## P1 / P2 copy-once overlap candidates (Agent 11) — first bring-up, BOTH BROKEN
+_status: IN PROGRESS — fixer agent spawned 2026-06-26_
+- P1 tile-inbox: compiled+ran (after fixing example.py int32->float32-backed IRIS alloc) but FAILED:
+  RMS_rel=1.15 (wrong numerics) AND 4172us/iter (14x SLOWER than B1's 291, vs goal <291). Two bugs:
+  (a) consumer reads inbox before/while producer fills it (flag wait wrong, or band-coverage mismatch);
+  (b) catastrophic perf => kernels not actually overlapping (consumer likely spin-stalls; or producer
+  grid too small / serialized). NOT yet a useful result.
+- P2 expert-pipeline: does NOT COMPILE (gl<bf16> constructor error kernel.cpp:308). 
+- Both handed to a fixer agent with this exact failure data. Schedule variants (04/05/07/08) stay
+  PARKED until a copy-once pipeline actually beats B1.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
-_status: PENDING_
+_status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
 ## Phase D — grouped 32-expert, np=2 (uniform/Zipf/hot/empty)
 _status: PENDING_
