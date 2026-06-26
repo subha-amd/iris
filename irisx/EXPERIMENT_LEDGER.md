@@ -289,6 +289,25 @@ it re-reads K*N/BN bytes from HBM and runs at ~32 TFLOP/s, far below B0's 183). 
 per-tile A re-read with a copy-once-into-LDS local grouped GEMM (B0-class) so T_gemm approaches the B0
 ceiling. Then B1-dispatch total should approach T_gather + (B0-class grouped GEMM). Compare vs B1-copy.
 
+## B1-dispatch V1 — fused A-stationary phase2 (2026-06-26) — 2.1x over V0, correct all 5 routes
+Ported v5's micro_tk (A-stationary: gather A once per K-tile, reuse across NSUB) into b1_dispatch;
+dispatch branches on g.fused; example FUSED=1. Phase1 unchanged (RMS 0.000000 all routes).
+
+| route | V0 T_total us | V1 T_total us | V1 TFLOPs(e2e) | RMS_rel |
+|---|---|---|---|---|
+| uniform | 7641 | 3684 | 65.3 | 0.0037 |
+| zipf | (n/a) | 4602 | 52.3 | 0.0037 |
+| one_hot | (n/a) | 3310 | 72.7 | 0.0037 |
+| several_hot | (n/a) | 3386 | 71.0 | 0.0037 |
+| many_empty | (n/a) | 4640 | 51.8 | 0.0037 |
+
+uniform breakdown: T_gather 216us + T_gemm 3462us (69 TFLOP/s, was 32). The A-stationary fusion gave
+~2.1x on the GEMM. All routes correct. [VERIFIED]
+STILL below B0's 183 TFLOP/s: the GEMM reads A from HBM via ctx.load per K-tile (not the clean B0
+LDS-resident path) and is LDS-bound at occ-2 (the V4 family limit). The gather (216us) is now a small
+fraction of total. NEXT (V2, if pursued): an LDS-resident B0-class grouped GEMM over the packed buffer
+to push TFLOP/s toward 183 — but note B1-dispatch is already a CORRECT production-shaped EP8 pipeline.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
