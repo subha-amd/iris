@@ -170,16 +170,29 @@ direct-pull dataflow/overlap mechanism, not LDS occupancy — consistent with B3
 is overlap, not reuse.) Occupancy was already 2 in stock V4; lifting it didn't help because the
 kernel is comm-latency-bound, not compute-occupancy-bound, at these shapes.
 
-## P1 / P2 copy-once overlap candidates (Agent 11) — first bring-up, BOTH BROKEN
-_status: IN PROGRESS — fixer agent spawned 2026-06-26_
-- P1 tile-inbox: compiled+ran (after fixing example.py int32->float32-backed IRIS alloc) but FAILED:
-  RMS_rel=1.15 (wrong numerics) AND 4172us/iter (14x SLOWER than B1's 291, vs goal <291). Two bugs:
-  (a) consumer reads inbox before/while producer fills it (flag wait wrong, or band-coverage mismatch);
-  (b) catastrophic perf => kernels not actually overlapping (consumer likely spin-stalls; or producer
-  grid too small / serialized). NOT yet a useful result.
-- P2 expert-pipeline: does NOT COMPILE (gl<bf16> constructor error kernel.cpp:308). 
-- Both handed to a fixer agent with this exact failure data. Schedule variants (04/05/07/08) stay
-  PARKED until a copy-once pipeline actually beats B1.
+## P1 / P2 copy-once overlap candidates (Agent 11) — BOTH FAIL, architecture suspect
+_status: BLOCKED 2026-06-26 — stopping blind iteration per redirection's correctness-failure rule_
+Two bring-up rounds + one focused fixer agent. Both candidates share a two-kernel cross-stream
+producer/consumer-flag architecture and BOTH fail with the SAME signature:
+- P1 tile-inbox: RMS_rel=inf (was 1.15), 4434us/iter (~15x SLOWER than B1's 291; goal <291).
+- P2 expert-pipeline: RMS_rel=inf, 37568us/iter (E=32 TOTAL_M=8192 uniform).
+- Fixes already tried (did NOT work): example int32->float32 IRIS alloc (real, needed); P1
+  system-acquire fence + LDS scale-hoist; P2 host-side gl (compile fix, needed). Numerics still inf
+  and perf still catastrophic on BOTH.
+- DIAGNOSIS: the shared flaw is the two-kernel cross-stream flag handshake itself, NOT a local bug:
+  (1) the producer materializes bands/experts with very few resident blocks while many consumer
+  blocks spin-wait -> NO real overlap, effectively serialized + huge spin waste (explains 15-100x
+  slowdown); (2) RMS=inf means the consumer GEMM reads inbox memory that is never correctly published
+  for its tiles (flag/visibility or band<->row mapping wrong). Same family on P1 and P2 => design bug.
+- DECISION: do NOT spawn a 3rd blind fixer into the same architecture. Two cleaner paths to evaluate
+  next (see report): (A) a SINGLE-kernel persistent producer/consumer (no cross-stream, no flag spin
+  -- in-block double-buffer like V4/B5 but consuming a LOCAL once-copied tile), or (B) accept B1's
+  bulk-synchronous copy-then-GEMM as the dataflow and just SPEED UP the copy (it's only 56 GB/s of
+  128 avail) -- per the decision rule, if overlap can't beat B1, bulk dispatch+local GEMM wins.
+- Note from data: B5(V4) ALREADY achieves real in-kernel overlap (the 1.82x over B3 was ALL overlap).
+  The working overlap mechanism is V4's in-block producer/consumer warps, NOT a two-kernel handshake.
+  => Path A (single-kernel, copy-once into LOCAL tile, V4-style in-block overlap) is the most promising
+  and reuses a MECHANISM WE KNOW WORKS. Schedule variants (04/05/07/08) stay PARKED.
 
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
