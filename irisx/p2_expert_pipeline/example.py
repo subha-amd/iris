@@ -131,7 +131,11 @@ if rank != SRC_RANK:
 
 # ---- IRIS symmetric-heap tensors (identical allocation ORDER on both ranks) ----
 def make_iris(shape, dtype):
-    t = iris.empty(shape, dtype=dtype)
+    # IRIS python iris.empty supports bfloat16/float32 but NOT int32. int32 and float32 are both
+    # 4 bytes -> back int32 buffers with a float32 IRIS alloc + int32 view (device gl<int> only needs
+    # the symmetric-heap byte pointer; storage dtype is irrelevant).
+    alloc_dtype = "float32" if dtype == "int32" else dtype
+    t = iris.empty(shape, dtype=alloc_dtype)
     dmap = {"bfloat16": (torch.bfloat16, "<u2"), "float32": (torch.float32, "<f4"),
             "int32": (torch.int32, "<i4")}
     td, ts = dmap[dtype]
