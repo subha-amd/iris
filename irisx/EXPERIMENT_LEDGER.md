@@ -10,14 +10,20 @@ tracked). **Record negative results too — never keep only the best number.**
 BM, BN, BK, NSUB, schedule, grid_blocks, VGPR, AGPR, SGPR, LDS, scratch, lat_us, p50, p95, p99,
 TFLOPs, rms_rel, zero_sentinel, spd_vs_B1, spd_vs_B2, spd_vs_B3, notes`
 
-## Baseline definitions (Agent 01)
-- **B0** local V2 HK GEMM, no comm — compute ceiling.
-- **B1** IRISX dispatch-pack-quant A ONCE into local fp8+scale buffer, then local V2 GEMM — the
-  STRONG unfused baseline. Headline speedups must cite this.
-- **B2** production MORI dispatch/pack/quant + AITER/CK fmoe — production baseline.
-- **B3** V3 direct-pull, no overlap — historic weak baseline (refetches A per N tile).
-- **B4** A-stationary remote pull, no overlap — isolates reuse from overlap.
-- **B5** V4 A-stationary + overlap.
+## Baseline definitions (canonical names — enforced 2026-06-26 after Gate 1)
+- **B0** local V2 HK GEMM, no comm — compute ceiling (~164us / 183 TFLOP/s @ M1024).
+- **B1-copy** one remote copy of A (+scales) into a local buffer, then exact local B0 GEMM — the
+  strong copy-once baseline. **Headline speedups must cite B1-copy (or B1-dispatch), never B3.**
+- **B1-dispatch** route-aware dispatch/pack/quant + local GROUPED GEMM (the real EP baseline once
+  grouped lands). No candidate is a production winner until it beats B1-dispatch.
+- **B2** MORI/ATOM dispatch + AITER/CK fmoe — production baseline (must be compared, not just beaten).
+- **B3** repeated-direct-pull serial baseline (refetches A per N-tile, ~32x). NOT "production/strong".
+- **B4** A-stationary remote pull, SERIAL (no overlap) — isolates reuse from overlap.
+- **B5** A-stationary remote pull + overlap = the V4 "direct-pull A-stationary mechanism proof".
+- **P1** copy-once tile-inbox overlap (producer copies A 1x + ready flag; consumer = B0 GEMM).
+- **P2** expert-granular double-buffer overlap (gather expert e+1 while GEMM computes e).
+Decision: P1/P2 < B1 -> continue tile-overlap research; ~= B1 -> abstraction useful, perf weak;
+> B1 -> bulk dispatch+local GEMM is the preferred dataflow (optimize dispatch, not a fused GEMM).
 
 ## Decision gates (no claim crosses a gate unmet)
 - G1 baseline validity: V4 compared to B1 + B2 before any headline.
@@ -58,25 +64,33 @@ never reached; fixed so all ranks run the timing loops symmetrically).
 | case | what | M | N | K | lat_us | TFLOPs | rms_rel | sentinel |
 |---|---|---|---|---|---|---|---|---|
 | B0 | local GEMM, NO comm (compute ceiling) | 1024 | 2048 | 7168 | 164.2 | 183.1 | 0.00331 | n/a |
-| B1 | gather-once + local GEMM (STRONG baseline) | 1024 | 2048 | 7168 | 291.4 | 103.2 | 0.00331 | True |
-| B1 split | transfer=143.5us + compute=162.1us (serial two-phase) | | | | ~291 | | | |
-| V4 | fused (from Phase A) | 1024 | 2048 | 7168 | 678.0 | 44.2 | 0.00331 | True |
+| B1-copy | one remote copy + exact local B0 GEMM | 1024 | 2048 | 7168 | 291.4 | 103.2 (end-to-end) | 0.00331 | True |
+| B5 (V4) | direct-pull A-stationary mechanism proof (fused) | 1024 | 2048 | 7168 | 678.0 | 44.2 (end-to-end) | 0.00331 | True |
+
+CORRECTIONS (per redirection 2026-06-26):
+- TFLOP/s columns for B1-copy (103) and B5 (44) are END-TO-END EFFECTIVE throughput, NOT GEMM
+  efficiency. B1-copy's COMPUTE PHASE (~162us) is ~185 TFLOP/s = matches B0's 183. So B1's GEMM is
+  B0-class; the 103 number is dragged down by the serial 143us transfer. Do NOT say "B1 GEMM = 103".
+- 291 (T_total) vs 143+162=305 (separate timed() medians): these are NOT a verified same-iteration
+  serial decomposition — they are medians from SEPARATE timed() loops, each of which re-runs the
+  full run_fn (the split timers call phase_T and phase_C as independent run_fns, so each carries its
+  own warmup/launch/sync overhead -> their sum overcounts vs the single combined loop). Marked
+  STILL-UNKNOWN until same-iteration cuda-event instrumentation (task #44) confirms the split.
+- NAMING (enforced from here): B3 = "repeated-direct-pull serial baseline" (NOT production/strong).
+  V4 = "direct-pull A-stationary mechanism proof" = B5 (NOT production fused winner).
 
 *** GATE 1 RESULT (reverses the headline) ***
-- vs the WEAK V3 baseline (refetch A 32x): V4 = 1.82x FASTER.
-- vs the STRONG B1 baseline (gather A once, then local GEMM): V4 = 291/678 = **0.43x — i.e. V4 is
-  ~2.3x SLOWER than gather-once+local-GEMM at M=1024.**
-WHY: V4's A-stationary still refetches A 4x (NSUB=8 -> N/(NSUB*BN)=2 superblocks... measured win was
-vs 32x). B1 moves A exactly ONCE (143us transfer) then runs a clean 162us local GEMM at 103 TFLOP/s.
-V4's fused kernel runs at only 44 TFLOP/s (occupancy 1-2, LDS-bound) AND still re-crosses XGMI.
-So the real lesson: the fusion/overlap does NOT beat simply not-refetching. B1 is the bar to clear.
-B0 shows the compute ceiling is 164us/183 TFLOP/s, so B1's 162us compute phase is near-optimal;
-the only thing fusion can attack is B1's 143us transfer (overlap it under compute). Upper bound if
-transfer were FULLY hidden under the 162us compute: ~164us => best case ~1.78x over B1, NOT more.
-
-IMPLICATION: V4 as-is is NOT the design to carry forward. The target is "B1 + overlap transfer under
-compute" at high occupancy (=Agent 10 B-single-buffer to lift TFLOP/s, + cache-once so A crosses 1x).
-TODO: B1 small-M sweep (M={128,256,512}); B1 at N=4096; then re-rank all schedule candidates vs B1.
+- vs the repeated-direct-pull serial baseline B3 (refetch A 32x): V4/B5 = 1.82x FASTER.
+- vs the strong copy-once baseline B1-copy: V4/B5 = 291/678 = **0.43x (V4 is ~2.33x SLOWER).**
+WHY: B5 still re-crosses XGMI for A (~4x at NSUB=8) AND runs at only 44 TFLOP/s end-to-end (LDS-bound,
+occ 1-2). B1-copy moves A once then runs a B0-class GEMM. Fusion/overlap does NOT beat not-refetching.
+DECISION RULE (M1024/N2048/K7168): perfect-overlap floor = max(T_copy,T_gemm)=max(143,162)=162us;
+B1 total 291us => theoretical MAX speedup over B1 ~= 291/162 ~= 1.80x (a CEILING, not a target).
+NEW DIRECTION: a competitive design needs simultaneously (1) ~1x remote A traffic, (2) B0-class GEMM
+efficiency, (3) comm/compute overlap. That is the copy-once tile-inbox pipeline (P1) or expert-
+granular double-buffer (P2), NOT V4-as-written. V4 is now a schedule ablation, not the main line.
+B1 transfer = 7,569,408 B / 143us ~= 53 GB/s (payload-only) -- check if B1 transfer itself can go
+faster; a faster B1 raises the bar and shrinks the overlap headroom.
 
 ## Phase B — strong baselines (B0/B1/B2) + recomputed V4 speedup
 _status: PENDING_
