@@ -43,7 +43,10 @@ assert world == 8, f"EP8 probe expects np=8, got world={world}"
 torch.cuda.set_device(rank)
 
 def make_iris(shape, dtype):
-    t = iris.empty(shape, dtype=dtype)
+    # IRIS python iris.empty supports bfloat16/float32 but NOT int32. int32==float32 size (4B) -> back
+    # int32 buffers with a float32 IRIS alloc + int32 view (device gl<int> only needs the heap pointer).
+    alloc_dtype = "float32" if dtype == "int32" else dtype
+    t = iris.empty(shape, dtype=alloc_dtype)
     dmap = {"bfloat16": (torch.bfloat16, "<u2"), "float32": (torch.float32, "<f4"),
             "int32": (torch.int32, "<i4")}
     td, ts = dmap[dtype]
