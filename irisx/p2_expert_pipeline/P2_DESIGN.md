@@ -73,3 +73,22 @@ granularity, A moved exactly once, GEMM at B0 efficiency.
   ~serial (that expert's gather can't hide behind a tiny neighbor). Expected; report it.
 - `arrive[e]` counts DOWN from tiles_of_e; host MUST reset it each generation (done in example.py).
 - `ep8_gather_BM` (=64) must match between kernel.cpp and example.py (GBM).
+
+## Fixes applied (Agent 11 — compile-error fix)
+- **Compile error (kernel.cpp:308, no matching gl<bf16> ctor / "call to __host__ function from
+  __global__"):** the consumer built a per-slot sub-gl `gl<bf16,...> A_slot(slot_base,1,1,slot_rows,K)`
+  INSIDE the `__global__` consumer. The 5-arg gl constructor (gl.cuh:61) is `__host__`-only, so it is
+  illegal on device. **Fix:** removed the in-kernel gl construction entirely. The consumer now uses the
+  HOST-built `g.slots` gl (a `[2*slot_rows, K]` gl passed by value via pyutils make_gl) and OFFSETS the
+  B0G::load row-tile coordinate by the slot's base tile: `slot_row_tile0 = slot*slot_rows/(B0_BM/2)`,
+  and loads with `{0,0, slot_row_tile0 + m_tile*2 + warp_m, k}`. Because `g.slots.cols()==K` gives the
+  same row stride a `[slot_rows,K]` sub-gl would and `B0G::load` recomputes `&src[unit_coord]` from the
+  coordinate, an offset coordinate into `g.slots` is byte-identical to coordinate-0 into the sub-gl.
+  `slot_rows` is a multiple of `B0_BM` (host pad) so the slot base is an exact multiple of the ST_A
+  row-tile height (`B0_BM/2`). `prefill_swizzled_offsets` is likewise now done on `g.slots`. Audited the
+  whole kernel: this was the ONLY in-kernel gl construction (the producer uses raw-pointer indexing).
+- **Producer scale loads:** hoisted the per-128-group scale load out of the 16-wide `j` loop (a 16-byte
+  chunk never straddles a 128-group, 16|128), cutting remote scalar scale loads 16x.
+- **Consumer visibility:** added a system-scope acquire fence after the `ready[e]` spin, before the
+  slot read, to pair with the producer's release fence (the B0 inbox read uses buffer_load_lds on the
+  cache_all path, a different address than the flag).

@@ -230,15 +230,17 @@ void p2_producer(p2_globals g) {
                     }
                     const fp8_t* bytes = reinterpret_cast<const fp8_t*>(&packed);
                     const float* sc_row = sc_base + (size_t)src_row * NG;
+                    // ONE scale load per chunk (a 16-byte chunk never straddles a 128-group: 16|128),
+                    // not one per fp8 element. Removes the 16x-redundant REMOTE scalar loads that made
+                    // the producer pathologically slow (same fix as P1).
+                    float scale = 1.0f;
+                    if (valid && src_row < g.Msrc) {
+                        const float* sp = sc_row + (k / QGROUP);
+                        scale = (src_rank == local_rank) ? *sp : ctx.load(sp, src_rank);
+                    }
                     #pragma unroll
                     for (int j = 0; j < 16; ++j) {
-                        const int kk = k + j;
-                        float scale = 1.0f;
-                        if (valid && src_row < g.Msrc) {
-                            const float* sp = sc_row + (kk / QGROUP);
-                            scale = (src_rank == local_rank) ? *sp : ctx.load(sp, src_rank);
-                        }
-                        o_row[kk] = __float2bfloat16(fp8_to_f32(bytes[j]) * scale);
+                        o_row[k + j] = __float2bfloat16(fp8_to_f32(bytes[j]) * scale);
                     }
                 }
             }
@@ -301,11 +303,23 @@ void p2_consumer(p2_globals g) {
         }
     }
     __syncthreads();
+    // System-scope acquire fence before the slot read (B0 uses buffer_load_lds on the cache_all path;
+    // the ready[e] acquire is on a different address, so this fence pairs with the producer's
+    // fence<system>(release) to guarantee the slot bytes are visible to the DMA read). Same hazard/fix
+    // as P1.
+    ctx.fence<iris::memory_scope_system>(iris::memory_order_acquire);
 
-    // ---- view slot e%2 as a [slot_rows, K] gl so B0G::load addresses tiles within it ----
+    // ---- address slot e%2 WITHIN the host-built g.slots gl (NO in-kernel gl construction) ----
+    // The 5-arg gl ctor (gl.cuh:61) is __host__-only; building gl<bf16>(...) inside a __global__ is the
+    // P2 compile error (kernel.cpp:308 "call to __host__ function from __global__"). g.slots is the
+    // [2*slot_rows, K] gl already built HOST-SIDE (pyutils make_gl) and passed by value. We never
+    // construct a sub-gl on device: instead we OFFSET the B0G::load row-tile coordinate by the slot's
+    // base tile. g.slots.cols()==K gives the same row stride a [slot_rows,K] sub-gl would, and
+    // B0G::load recomputes &src[unit_coord] from the coordinate, so an offset coordinate into g.slots
+    // is byte-identical to coordinate-0 into the sub-gl. slot_rows is a multiple of B0_BM (host pad),
+    // so the slot base is an exact multiple of the ST_A row-tile height (B0_BM/2).
     const int slot = e & 1;
-    bf16* slot_base = &g.slots[{0, 0, 0, 0}] + (size_t)slot * (size_t)slot_rows * K;
-    gl<bf16, -1, -1, -1, -1> A_slot(slot_base, 1, 1, slot_rows, K);
+    const int slot_row_tile0 = (slot * slot_rows) / (B0_BM / 2);   // slot base in ST_A-row units
 
     rt_bf<REG_M, B0_BK, row_l, rt_16x32_s> a;
     rt_bf<REG_N, B0_BK, row_l, rt_16x32_s> b0;
@@ -313,15 +327,15 @@ void p2_consumer(p2_globals g) {
     zero(cacc);
 
     uint32_t soA[64], soB[64];
-    B0G::prefill_swizzled_offsets(As[0], A_slot, soA);
+    B0G::prefill_swizzled_offsets(As[0], g.slots, soA);
     B0G::prefill_swizzled_offsets(Bs[0], g.b, soB);
 
     const int b_tile_row0 = (e * N) / B0_BN;   // B is expert-major [E*N, K]
 
     int tic = 0;
     for (int k = 0; k < k_iters; ++k, tic ^= 1) {
-        B0G::load(As[tic], A_slot, {0, 0, m_tile * 2 + warp_m, k}, soA);
-        B0G::load(Bs[tic], g.b,    {0, 0, b_tile_row0 + n_tile * 2 + warp_n, k}, soB);
+        B0G::load(As[tic], g.slots, {0, 0, slot_row_tile0 + m_tile * 2 + warp_m, k}, soA);
+        B0G::load(Bs[tic], g.b,     {0, 0, b_tile_row0 + n_tile * 2 + warp_n, k}, soB);
         __builtin_amdgcn_s_barrier();
         asm volatile("s_waitcnt lgkmcnt(0)");
         auto as = kittens::subtile_inplace<REG_M, B0_BK>(As[tic], {0, 0});

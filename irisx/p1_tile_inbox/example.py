@@ -58,7 +58,11 @@ torch.cuda.set_device(rank)
 SRC_RANK = 0
 
 def make_iris_tensor(shape, dtype):
-    t = iris.empty(shape, dtype=dtype)
+    # IRIS python iris.empty supports bfloat16/float32 but NOT int32. int32 and float32 are both
+    # 4 bytes, so back int32 flag buffers with a float32 IRIS allocation and expose an int32 view
+    # (the device-side gl<int> just needs the symmetric-heap byte pointer; storage dtype is irrelevant).
+    alloc_dtype = "float32" if dtype == "int32" else dtype
+    t = iris.empty(shape, dtype=alloc_dtype)
     dmap = {"bfloat16": (torch.bfloat16, "<u2"), "float32": (torch.float32, "<f4"),
             "int32": (torch.int32, "<i4")}
     td, ts = dmap[dtype]

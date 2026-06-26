@@ -64,3 +64,28 @@ A from this local buffer. No swizzle reinterpretation, no ABI drift between prod
 - If `PROD_BLOCKS` is too large it competes with consumer CUs; if too small the producer can't keep
   up with the consumer. Sweep PROD_BLOCKS in {8,16,32}.
 - Tuning knob `BM_PROD` MUST match between kernel.cpp (`#define BM_PROD`) and example.py.
+
+## Fixes applied (Agent 11 — runtime correctness + perf)
+Static audit confirmed the inbox WRITE layout (producer: row-major bf16 `o_row[kk]`, dequant
+`fp8_to_f32 * scale[kk/128]`) is byte-identical to B0's `dequant_a_dense` output, and the consumer READ
+path (`prefill_swizzled_offsets(.., g.inbox)` + `B0G::load(.., {0,0,block_row*2+warp_m,k})`) is
+identical to verified B0; the band->row map (`band_lo=row_base/BM_PROD`,
+`band_hi=ceil((row_base+B0_BM)/BM_PROD)`) exactly covers each consumer block's 256 rows. So the data
+path is NOT the bug. Two fixes:
+
+- **(a) Correctness (RMS_rel~1.15, C nonzero):** most-likely cause is a cross-stream / cross-cache-path
+  visibility race. The producer publishes inbox with plain stores + `fence<system>(release)` + a
+  system-release on `ready[band]`; the consumer system-acquires `ready[band]` (a DIFFERENT address)
+  then reads the inbox via `buffer_load_lds` (a global->LDS DMA on the `cache_all` path). The per-band
+  acquire does not necessarily invalidate the consumer CU's vector cache for the inbox lines, so the DMA
+  can read stale (pre-fill / zeroed) data even though the flag is observed set. **Fix:** added an
+  explicit `ctx.fence<system>(acquire)` (= `__threadfence_system`) in the consumer after the spin /
+  `__syncthreads()`, before the GEMM, pairing with the producer's release fence. (Best-identified fix;
+  needs GPU confirmation since the layout/handshake are otherwise provably B0-identical.)
+- **(b) Perf (4172us/iter):** the producer loaded the per-128-group scale REMOTELY once per fp8 ELEMENT
+  (`ctx.load(sc_row + kk/QGROUP)` inside the 16-wide `j` loop) = ~M*K = 7.3M serialized remote scalar
+  loads, which dominated and (with the no-sync 32-block consumer flooding CUs) starved the producer.
+  **Fix:** cache each row's NG (=56) scales ONCE in LDS (`extern __shared__ float s_scales[]`, sized
+  `NG*4` B, passed as producer dynamic shared in `dispatch_p1`); one remote uint4 per chunk + one remote
+  scale per 128-group-per-row, reused for all 16 chunk elements (a chunk never straddles a 128-group).
+  Producer is now lean enough to overlap the B0 consumer instead of being starved.

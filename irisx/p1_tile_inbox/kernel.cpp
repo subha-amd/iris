@@ -134,6 +134,10 @@ void p1_producer(p1_globals g) {
 
     __shared__ int s_band;
     __shared__ bool s_won;
+    // Per-row scale cache: NG (=K/128) fp32 scales fetched ONCE per row from src_rank, reused for all
+    // K columns. NG=56 for K=7168 -> 224 B of LDS. This removes the original 16x-per-chunk (one per
+    // fp8 element) redundant REMOTE scalar scale loads that made the producer ~10-100x too slow.
+    extern __shared__ float s_scales[];   // [NG]
 
     while (true) {
         if (tid == 0) {
@@ -156,22 +160,29 @@ void p1_producer(p1_globals g) {
         const int row1 = (row0 + BM_PROD < M) ? (row0 + BM_PROD) : M;
 
         // gather + dequant all K columns of rows [row0,row1) ONCE -> local inbox row-major bf16.
+        // One REMOTE uint4 load (16 fp8 bytes) per chunk; one REMOTE scale load per 128-group per row
+        // (cached in LDS). A 16-byte chunk never straddles a 128-group boundary (16 | 128), so a chunk
+        // uses exactly one cached scale (kk/QGROUP == k/QGROUP for all 16 elements).
         const int chunks_per_row = K / 16;                 // 16 fp8 bytes (uint4) per chunk
         for (int row = row0; row < row1; ++row) {
             const fp8_t* a_row = a_base + (size_t)row * K;
             const float* sc_row = sc_base + (size_t)row * NG;
             bf16* o_row = inbox + (size_t)row * K;
+            // Fetch this row's NG scales ONCE (remote) into LDS, shared by the whole block.
+            for (int gi = tid; gi < NG; gi += nthreads)
+                s_scales[gi] = ctx.load(sc_row + gi, g.src_rank);
+            __syncthreads();
             for (int c = tid; c < chunks_per_row; c += nthreads) {
                 const int k = c * 16;
                 uint4 v = ctx.load(reinterpret_cast<const uint4*>(a_row + k), g.src_rank);
                 const fp8_t* bytes = reinterpret_cast<const fp8_t*>(&v);
+                const float scale = s_scales[k / QGROUP];   // constant across the 16 chunk elements
                 #pragma unroll
                 for (int j = 0; j < 16; ++j) {
-                    const int kk = k + j;
-                    float scale = ctx.load(sc_row + (kk / QGROUP), g.src_rank);
-                    o_row[kk] = __float2bfloat16(fp8_to_f32(bytes[j]) * scale);
+                    o_row[k + j] = __float2bfloat16(fp8_to_f32(bytes[j]) * scale);
                 }
             }
+            __syncthreads();   // scale cache reusable for the next row
         }
         __syncthreads();
 
@@ -230,7 +241,14 @@ void p1_consumer(p1_globals g) {
             }
         }
     }
-    __syncthreads();   // establishes happens-before: all threads now see the inbox A bytes.
+    __syncthreads();   // make thread-0's acquired view visible to all threads in the block.
+    // Explicit system-scope ACQUIRE FENCE before reading the inbox. The B0 inbox read uses
+    // buffer_load_lds (a global->LDS DMA on the cache_all path); the per-band atomic acquire above is
+    // on a DIFFERENT address (ready[band]), so without this fence the DMA may read STALE (pre-fill /
+    // zeroed) L1/L2 lines for the inbox even though the flag was observed set. This pairs with the
+    // producer's fence<system>(release) and is the likely fix for the RMS_rel~1.15 garbage-but-nonzero
+    // C (handshake/layout are otherwise byte-identical to the verified B0/B1 path).
+    ctx.fence<iris::memory_scope_system>(iris::memory_order_acquire);
 
     // ---- EXACT B0 inner loop, reading A from the LOCAL inbox gl ----
     rt_bf<REG_M, B0_BK, row_l, rt_16x32_s> a;
@@ -270,11 +288,17 @@ void dispatch_p1(p1_globals g) {
     const size_t sc = g.consumer_shared();
     hipFuncSetAttribute((void*)p1_consumer, hipFuncAttributeMaxDynamicSharedMemorySize, sc);
 
+    // Producer LDS: NG (=K/128) fp32 scales cached per row.
+    const size_t prod_smem = (size_t)(g.K / QGROUP) * sizeof(float) + 16;
+
     hipStream_t prod_stream, cons_stream;
     hipStreamCreateWithFlags(&prod_stream, hipStreamNonBlocking);
     hipStreamCreateWithFlags(&cons_stream, hipStreamNonBlocking);
 
-    p1_producer<<<g.producer_grid(), g.producer_block(), 0, prod_stream>>>(g);
+    // Producer FIRST on its own stream (reserves CUs), consumer immediately after, NO sync between
+    // (overlap). Producer is now fast (1 remote uint4/chunk + 1 remote scale/group/row, cached) so it
+    // is not starved by the consumer grid.
+    p1_producer<<<g.producer_grid(), g.producer_block(), prod_smem, prod_stream>>>(g);
     p1_consumer<<<g.consumer_grid(), g.consumer_block(), sc, cons_stream>>>(g);
 
     hipStreamSynchronize(prod_stream);
