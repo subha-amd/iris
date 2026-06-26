@@ -217,6 +217,28 @@ CORRECTIVE PLAN (do NOT spawn a 4th from-scratch attempt):
   beat B1, the DECISION RULE says bulk-synchronous copy-once + local GEMM (= B1 / B1-dispatch) IS the
   production dataflow and we optimize the COPY (56 GB/s of 128 avail) + the grouped dispatch instead.
 
+## B1-dispatch main line — grouped 32-expert CORRECTNESS (Agent 02 V5) — PASS (2026-06-26)
+CPU self-test (build_tasks.py): all 5 routes OK (uniform/zipf/one_hot/several_hot/many_empty),
+adaptive NSUB=8, no layout contamination. Then np=2 GPU grouped GEMM, E=32 TOTAL_M=8192 N2048 K7168:
+
+| route | Mpacked | tasks | RMS_rel | sentinel | verdict |
+|---|---|---|---|---|---|
+| uniform | 8192 | 512 | 0.00331 | True | PASSED |
+| zipf | 8960 | 560 | 0.00331 | True | PASSED |
+| one_hot | 8192 | 512 | 0.00331 | True | PASSED |
+| several_hot | 8192 | 512 | 0.00331 | True | PASSED |
+| many_empty | 8448 | 528 | 0.00331 | True | PASSED |
+
+GROUPED 32-EXPERT GEMM IS CORRECT for all distributions: no cross-expert contamination, empty
+experts safe, BM-padding works, route-row order preserved, zero-sentinel proves remote gather. This
+is the LOCAL-GROUPED-GEMM half of B1-dispatch. [VERIFIED]
+Test-harness fixes needed (NOT kernel bugs): B/C/TASKS moved off the 512MB IRIS heap to LOCAL torch
+(only gathered A needs the symmetric heap; B was 3GB -> OOM); TASKS int32 local (IRIS has no int32).
+PERF NOTE (expected, not the point of this task): the grouped kernel is still V4's DIRECT-PULL
+A-stationary fused body, so it shows the same ~2x-over-weak-baseline / ~17 TFLOP/s as V4 (fused
+14.5ms vs its own direct-pull baseline 32ms). The low throughput is the direct-pull dataflow, to be
+replaced by copy-once gather when grouped is paired into B1-dispatch. Correctness was the goal here.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
