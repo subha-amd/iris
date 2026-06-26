@@ -95,6 +95,69 @@ faster; a faster B1 raises the bar and shrinks the overlap headroom.
 ## Phase B — strong baselines (B0/B1/B2) + recomputed V4 speedup
 _status: PENDING_
 
+## Phase B sweep + same-iteration event split (2026-06-26, cv350/r1_c4, np=2)
+
+Full B0/B1 sweep. B0 = compute ceiling (no comm), B1-copy = copy-A-once + B0 GEMM (serial).
+All RMS-rel ~0.0033, B1 zero_sentinel=True. M=128 SKIPPED (V2 GEMM requires M>=BM=256; M<256 faults).
+
+| M | N | K | B0 us | B0 TFLOPs | B1 us | B1 TFLOPs(e2e) | transfer (B1-B0) us |
+|---|---|---|---|---|---|---|---|
+| 256 | 2048 | 7168 | 160.9 | 46.7 | 192.6 | 39.0 | ~32 |
+| 512 | 2048 | 7168 | 161.9 | 92.8 | 225.5 | 66.7 | ~64 |
+| 1024 | 2048 | 7168 | 165.6 | 181.5 | 291.1 | 103.3 | ~126 |
+| 256 | 4096 | 7168 | 160.0 | 94.0 | 192.3 | 78.2 | ~32 |
+| 512 | 4096 | 7168 | 162.9 | 184.5 | 225.8 | 133.1 | ~63 |
+| 1024 | 4096 | 7168 | 168.4 | 357.2 | 292.7 | 205.4 | ~124 |
+| 1024 | 7168 | 2048 (W2) | 72.5 | 414.7 | 108.4 | 277.4 | ~36 |
+
+Observations (VERIFIED):
+- B0 latency ~FLAT in M (160-170us) at N=2048 — the 256x256 tile floor dominates; small M wastes the
+  tile (M256=47 TFLOP/s vs M1024=181 at ~same 163us). Small-M is GEMM-fixed-cost-bound, NOT comm-bound.
+  Larger N amortizes (N4096 M1024 = 357 TFLOP/s).
+- B1 transfer (B1-B0) ~LINEAR in M: 32/64/126us for M=256/512/1024; ~independent of N (A doesn't
+  depend on N) — 32us at M256 for both N2048 and N4096.
+- W2 shape (K=2048) cheap: B0=72us, transfer ~36us.
+
+### SAME-ITERATION cuda-event split (B1_EVENTS=1) — resolves 291-vs-305, VERIFIED
+copy + gemm measured around the SAME iteration + one enclosing event:
+
+| M | N | K | copy us | gemm us | total_evt us | copy+gemm | overlap floor | max spd vs B1 |
+|---|---|---|---|---|---|---|---|---|
+| 1024 | 2048 | 7168 | 134.9 | 150.3 | 285.2 | 285.2 (exact) | 150.3 | 1.90x |
+| 512 | 2048 | 7168 | 71.7 | 147.6 | 219.3 | 219.3 (exact) | 147.6 | 1.49x |
+| 256 | 2048 | 7168 | 41.3 | 145.5 | 186.8 | 186.8 (exact) | 145.5 | 1.28x |
+| 1024 | 7168 | 2048 (W2) | 46.0 | 54.0 | 99.9 | 99.9 (exact) | 54.0 | 1.85x |
+
+RESOLUTION of 291 vs 143+162=305: the 143/162 were medians from SEPARATE timed() loops (each carrying
+its own per-iter sync overhead -> overcount). TRUE same-iteration split = copy 135 + gemm 150 = 285
+EXACTLY (sums to the enclosing event). B1 IS literally serial copy-then-compute. [VERIFIED]
+KEY CONSEQUENCE: at M1024 copy(135) < gemm(150) — GEMM is the longer pole. Perfect overlap hides the
+135us copy under the 150us compute => floor 150us => MAX 1.90x over B1 (hard ceiling). At smaller M
+copy shrinks (transfer~linear) while compute stays ~flat, so the overlap ceiling DROPS to 1.28x@M256.
+=> Overlap only pays at LARGE M. At small M, copy is already small vs the fixed GEMM cost, so plain
+copy-once+serial (B1) is near-optimal and overlap buys little. P1/P2 must target large-M to matter.
+
+## B3/B4/B5 reuse-vs-overlap decomposition (2026-06-26, M1024/N2048/K7168) — VERIFIED, SURPRISING
+| code | what | us | TFLOPs |
+|---|---|---|---|
+| B3 | repeated-direct-pull SERIAL (V3 baseline, refetch A per N-tile) | 1235.7 | 24.3 |
+| B4 | A-stationary SERIAL (V4 baseline, no overlap) | 1230.7 | 24.4 |
+| B5 | A-stationary + OVERLAP (V4 fused) | 676.6 | 44.4 |
+
+- reuse gain  B3/B4 = 1235.7/1230.7 = **1.00x**  (A-stationary reuse alone bought ~NOTHING serially!)
+- overlap gain B4/B5 = 1230.7/676.6 = **1.82x**  (the ENTIRE win is comm/compute overlap)
+- combined    B3/B5 = 1.83x
+
+*** OVERTURNS the V4 narrative. *** V4_ASTATIONARY_RESULTS claimed the win came from cutting redundant
+A traffic 32x->4x (reuse). The data says reuse SERIALLY = 1.00x; the whole 1.82x is OVERLAP. Why
+reuse looks free here: B4 still issues the same total remote bytes as B3 in this kernel (the
+"A-stationary" rework changed the loop nest but the serial direct-pull still streams A through the
+same blocking deref latency, so wall-time is unchanged); only when overlap hides that latency under
+MFMA does it help. IMPLICATION for the new direction: the lever that matters is OVERLAP, and B1-copy
+already shows that moving A ONCE (135us) is far cheaper than B3/B4's repeated pulls (~1070us of A
+traffic). So P1/P2 = (copy-once like B1) + (overlap like B5's mechanism) is exactly the right combine;
+neither the V4 reuse rework nor the direct-pull dataflow is worth keeping. [VERIFIED]
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PENDING_
 
