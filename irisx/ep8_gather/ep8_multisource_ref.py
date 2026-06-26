@@ -34,7 +34,14 @@ def quantize_v1(A, K):
     Ag = A.reshape(M, NG, QGROUP).astype(np.float32)
     amax = np.abs(Ag).max(axis=2, keepdims=True)
     scale = np.clip(amax / FP8_MAX, 1e-12, None)            # [M,NG,1]
-    q = (Ag / scale).astype(ml_dtypes.float8_e4m3)          # fp8 e4m3 (OCP)
+    # SATURATE to the e4m3 finite range BEFORE the cast. amax/scale lands exactly at +-448 (the e4m3
+    # max finite), and ml_dtypes rounds the boundary value UP to inf -> inf*scale = inf (the 4135 nans).
+    # torch's .to(float8_e4m3fn) saturates instead; match that so the CPU ref is finite. (Same fp8
+    # saturation hazard exists project-wide; the GPU kernels use saturating casts so they were fine.)
+    # MUST use float8_e4m3fn (OCP "fn" = finite, max 448, saturates) NOT plain float8_e4m3 (which has
+    # inf/nan and encodes 448 as inf -> deq=inf, the 4135 non-finite values). gfx950 + torch use e4m3fn.
+    qf = np.clip(Ag / scale, -FP8_MAX, FP8_MAX)
+    q = qf.astype(ml_dtypes.float8_e4m3fn)                  # fp8 e4m3fn (OCP finite), saturating
     deq = (q.astype(np.float32) * scale).reshape(M, K)
     return (q.view(np.uint8).reshape(M, K),
             scale.reshape(M, NG).astype(np.float32),
@@ -97,14 +104,27 @@ def make_routing(world, Msrc, Mpacked, BM, seed=0, unrouted_frac=0.15, max_seg_r
 def reference_gather(segs, Mpacked, K, deq_per_rank):
     """Build expected dequantized gather output D_ref[Mpacked,K].
     deq_per_rank[r] = the dequantized activation buffer [Msrc,K] for rank r.
-    Unrouted packed rows stay exactly 0 (zero-sentinel)."""
+    Unrouted packed rows stay exactly 0 (zero-sentinel).
+
+    NaN-FIX: every (src_rank, src_row) a segment references MUST resolve to a real, finite source
+    row in deq_per_rank.  Earlier this silently propagated NaN/garbage into D_ref (-> RMS_rel=nan)
+    when a source rank's dequantized A was missing from deq_per_rank or had not been initialized.
+    We now validate the source explicitly so the failure is loud and localized at build time."""
     D = np.zeros((Mpacked, K), dtype=np.float32)
     for s in segs:
-        src = deq_per_rank[s["src_rank"]]
+        sr_rank = s["src_rank"]
+        assert deq_per_rank[sr_rank] is not None, \
+            f"reference_gather: deq_per_rank[{sr_rank}] is None (source rank not gathered)"
+        src = deq_per_rank[sr_rank]
         sr = s["src_row_begin"]
         dr = s["dst_row_begin"]
         rc = s["row_count"]
-        D[dr:dr + rc, :] = src[sr:sr + rc, :]
+        assert sr + rc <= src.shape[0], \
+            f"reference_gather: segment src rows [{sr},{sr+rc}) exceed Msrc={src.shape[0]} on rank {sr_rank}"
+        block = src[sr:sr + rc, :]
+        assert np.isfinite(block).all(), \
+            f"reference_gather: non-finite source rows [{sr},{sr+rc}) on rank {sr_rank}"
+        D[dr:dr + rc, :] = block
     return D
 
 

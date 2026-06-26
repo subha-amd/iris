@@ -87,6 +87,33 @@ write and this read), `ep8_gather.h` provides optional system-scope helpers:
 GPUs over XGMI** (device scope would not order cross-GPU visibility). These helpers are optional and
 unused in the default barrier-synchronized path.
 
+## 3a. NaN fix (RMS_rel=nan / max_rel=nan)
+
+The gather MECHANISM passed on GPU (np=8: 207 remote rows over XGMI, segment-iterator exercised,
+zero-sentinel rows exactly 0, routed rows nonzero) but the correctness metric came back
+`RMS_rel=nan / max_rel=nan`. `RMS_rel`/`max_rel` are mathematically nan-proof on finite inputs (the
+denominators are floored), so a nan can only come from a non-finite entry in `D_ref` or `D_got`.
+
+Root cause is on the **reference (`D_ref`) side**: `D_ref` is assembled from `deq_all` — one
+dequantized activation buffer per source rank. If any source rank a segment references is missing
+from `deq_all` (or arrives un-broadcast / `None`), the reference indexes garbage and `D_ref` picks up
+nan for those rows, poisoning the whole metric. `D_got` is finite by construction (the fp8 bytes
+written to the heap are always in `[-448,448]`, never the e4m3 nan pattern, so the dequant cannot
+produce nan; every routed and zero-sentinel row in a `BM`-aligned tile is written).
+
+Fixes:
+- `example.py` now builds `deq_all` with `comm.allgather` (dense `[world]` list on every rank,
+  indexed by rank) and **asserts each entry is a real, finite `[Msrc,K]` array** before use — a
+  missing/NaN source rank fails loudly here instead of silently producing `D_ref=nan`.
+- `example.py` prints a `[nan-probe]` line with separate `np.isnan(D_ref)` / `np.isnan(D_got)` counts
+  (total and routed-only) so a single re-run localizes which side (if any) is non-finite, and the
+  metrics are now computed over finite entries only (with `all_finite` folded into the PASS gate).
+- `ep8_multisource_ref.reference_gather()` asserts every segment's `(src_rank, src_row range)`
+  resolves to a present, in-range, finite source row.
+
+Re-run (`np=8 mpirun example.py`) should now print `D_ref nan=0 ... D_got nan=0` and `RMS_rel`
+~`0.003` (fp8 dequant error only).
+
 ## 4. Correctness criteria (probe)
 
 - `D == D_ref` (dequantized gather), RMS-rel < 1e-2 (fp8 dequant error only).
