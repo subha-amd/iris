@@ -194,6 +194,29 @@ producer/consumer-flag architecture and BOTH fail with the SAME signature:
   => Path A (single-kernel, copy-once into LOCAL tile, V4-style in-block overlap) is the most promising
   and reuses a MECHANISM WE KNOW WORKS. Schedule variants (04/05/07/08) stay PARKED.
 
+## P3 single-kernel copy-once (Agent 12) — FAILS; reveals the PATTERN across P1/P2/P3
+_status: FAILED 2026-06-26. M1024/N2048/K7168: P3-fused RMS=1.39 / 2535us; its own SERIAL-B1 repro
+RMS=1.37 / 3369us. P3's "overlap" is 1.33x over its OWN broken serial = meaningless.
+
+*** THE PATTERN (now 3/3) ***: P1, P2, P3 each had an AGENT REWRITE the remote fp8 gather + dequant
++ the in-module B1/reference from scratch, and ALL THREE produced RMS ~1.0-1.4 garbage AND 10-25x
+slowdown. The AUTHORITATIVE working gather already exists: harness dispatch_pack_quant_once (B1) =
+RMS 0.0033, copy 135us. P3's serial repro of "the same B1" is 25x slower (3369 vs 135) and wrong
+(1.37 vs 0.0033) => the agents are NOT reproducing the working gather; they re-derive a broken/slow
+one (likely per-element remote scalar scale loads + a scale-layout/transpose bug — the token-major vs
+group-major trap Agent 00 flagged). The OVERLAP idea is not what's failing; the rewritten GATHER is.
+
+CORRECTIVE PLAN (do NOT spawn a 4th from-scratch attempt):
+- Build P4 by COMPOSITION, reusing VERIFIED binaries unchanged: harness dispatch_pack_quant_once
+  (B1 gather, correct+fast) + harness local_gemm (B0, 183 TFLOP/s). First just CALL them back-to-back
+  from one driver to reproduce B1=291us EXACTLY (sanity that composition works). THEN add overlap by
+  the minimal correct means (e.g. tile the gather by m-strip and launch gemm per-strip behind it on
+  the same stream, or a 2-stream dependency on cuda events) WITHOUT touching the gather/gemm internals.
+- Reality check from data: B1 copy(135) < gemm(150) at M1024 => overlap ceiling = 1.90x, and ONLY at
+  large M (1.28x @ M256). B1 already works, is simple, and is correct. If P4 overlap can't clearly
+  beat B1, the DECISION RULE says bulk-synchronous copy-once + local GEMM (= B1 / B1-dispatch) IS the
+  production dataflow and we optimize the COPY (56 GB/s of 128 avail) + the grouped dispatch instead.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
