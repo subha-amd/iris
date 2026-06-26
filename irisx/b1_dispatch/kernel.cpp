@@ -322,9 +322,110 @@ __device__ __forceinline__ void gather_dequant_A_tile(
 }
 
 // ----------------------------------------------------------------------------------------------- [VERBATIM v5]
-// BASELINE kernel (two-phase, NO overlap) — the SERIAL grouped GEMM B1-dispatch V0 uses. One block
-// per task; per K-tile gather A + nsub B subtiles, sync, MFMA. (v5's micro_tk fused path is omitted
-// for V0 — we want the clean grouped GEMM, not the direct-pull overlap.)
+// FUSED kernel (A-stationary, NSTAGE double-buffer) — B1-dispatch V1's phase 2. Gathers A[BM,BK]
+// ONCE per K-tile and reuses it across all nsub N-subtiles (NSUB register accumulators), so A is read
+// from the local packed buffer 1x per K-tile instead of nsub x (the baseline's redundant re-read).
+// COPIED VERBATIM from v5_grouped/kernel.cpp::micro_tk (Agent 02, PASSED all 5 routes). For
+// B1-dispatch the caller passes src_rank=CONSUMER so gather_dequant_A_tile's ctx.load is a LOCAL deref.
+// -----------------------------------------------------------------------------------------------
+__global__ __launch_bounds__(NUM_THREADS, 1)
+void micro_tk(micro_globals g) {
+    const int task = blockIdx.x;
+    if (task >= g.num_tasks) return;
+
+    const int* tk = &g.tasks[{0, 0, task, 0}];
+    const int local_expert    = tk[T_EXPERT];
+    const int m_tile_begin    = tk[T_MBEGIN];
+    const int valid_rows      = tk[T_VALID];
+    const int n_superblock    = tk[T_NSUPER];
+    const int nsub            = tk[T_NSUB];
+    const int expert_row_begin= tk[T_EROWBEG];
+
+    const int block_row = expert_row_begin + m_tile_begin;
+    const int row_limit = block_row + valid_rows;
+    const int block_n0  = n_superblock * (nsub * BN);
+    const int b_row0    = local_expert * g.N;
+    const int n_tile0   = block_n0 / BN;
+
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
+    ST_A (&As)[NSTAGE]       = al.allocate<ST_A, NSTAGE>();
+    ST_B (&Bs)[NSTAGE][NSUB] = al.allocate<ST_B, NSTAGE, NSUB>();
+
+    const int warp_id   = kittens::warpid();
+    const bool is_producer = (warp_id < NUM_PRODUCER_WORKERS);
+    const bool is_consumer = (warp_id >= NUM_PRODUCER_WORKERS);
+    const int  cons_id   = is_consumer ? (warp_id - NUM_PRODUCER_WORKERS) : 0;
+    const int  laneid    = kittens::laneid();
+    const int  src_rank  = g.src_rank;
+    const int  num_tiles = g.K / BK;
+
+    constexpr int bytes_per_thread = st_16x32_s::template bytes_per_thread<bf16>();
+    constexpr int bytes_per_memcpy = bytes_per_thread * NUM_PRODUCER_THREADS;
+    constexpr int memcpy_per_tile  = BN * BK * sizeof(bf16) / bytes_per_memcpy;
+    uint32_t swizzled_offsets_B[memcpy_per_tile > 0 ? memcpy_per_tile : 1];
+    PG::prefill_swizzled_offsets(Bs[0][0], g.b, swizzled_offsets_B);
+    const int b_tile_row0 = b_row0 / BN;
+
+    constexpr int PREFETCH = NSTAGE - 1;
+
+    if (is_producer) {
+        #pragma unroll
+        for (int s = 0; s < PREFETCH; ++s) {
+            if (s < num_tiles) {
+                gather_dequant_A_tile<16>(As[s], s, block_row, row_limit, src_rank, g, warp_id, laneid);
+                for (int sub = 0; sub < nsub; ++sub)
+                    PG::load<2, false>(Bs[s][sub], g.b, {0, 0, b_tile_row0 + n_tile0 + sub, s}, swizzled_offsets_B);
+            }
+        }
+        __builtin_amdgcn_s_waitcnt(0);
+    }
+    __syncthreads();
+
+    constexpr int CONS_N = BN / NUM_CONSUMER_WORKERS;
+    rt_fl<BM, CONS_N, col_l, rt_16x16_s> C_accum[NSUB];
+    if (is_consumer) {
+        for (int sub = 0; sub < nsub; ++sub) zero(C_accum[sub]);
+    }
+
+    for (int tile = 0; tile < num_tiles; ++tile) {
+        const int cur = tile % NSTAGE;
+        const int fetch = tile + PREFETCH;
+        if (is_producer && fetch < num_tiles) {
+            const int slot = fetch % NSTAGE;
+            gather_dequant_A_tile<16>(As[slot], fetch, block_row, row_limit, src_rank, g, warp_id, laneid);
+            for (int sub = 0; sub < nsub; ++sub)
+                PG::load<2, false>(Bs[slot][sub], g.b, {0, 0, b_tile_row0 + n_tile0 + sub, fetch}, swizzled_offsets_B);
+            __builtin_amdgcn_s_waitcnt(0);
+        } else if (is_consumer) {
+            rt_bf<BM, BK, row_l, rt_16x32_s> a_frag;
+            load(a_frag, As[cur]);
+            asm volatile("s_waitcnt lgkmcnt(0)");
+            for (int sub = 0; sub < nsub; ++sub) {
+                rt_bf<CONS_N, BK, row_l, rt_16x32_s> b_frag;
+                auto b_sub = subtile_inplace<CONS_N, BK>(Bs[cur][sub], {cons_id, 0});
+                load(b_frag, b_sub);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                __builtin_amdgcn_s_setprio(1);
+                mma_ABt(C_accum[sub], a_frag, b_frag, C_accum[sub]);
+                __builtin_amdgcn_s_setprio(0);
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+    }
+
+    if (is_consumer) {
+        for (int sub = 0; sub < nsub; ++sub) {
+            const int out_col0 = block_n0 + sub * BN + cons_id * CONS_N;
+            store(g.c, C_accum[sub], {0, 0, block_row / BM, out_col0 / CONS_N});
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------------------------- [VERBATIM v5]
+// BASELINE kernel (two-phase, NO overlap) — the SERIAL grouped GEMM (re-gathers A per N-subtile).
+// Kept as the head-to-head reference; B1-dispatch V1 uses micro_tk (fused) above.
 // -----------------------------------------------------------------------------------------------
 using ST_A_b = st_bf<BM, BK, st_16x32_s>;
 using ST_B_b = st_bf<BN, BK, st_16x32_s>;
@@ -404,9 +505,15 @@ void micro_tk_baseline(micro_globals g) {
 
 void dispatch_grouped_gemm(micro_globals g) {
     if (g.num_tasks <= 0) return;   // empty route -> nothing to launch.
-    const unsigned long mem_size = (unsigned long)(sizeof(ST_A_b) + sizeof(ST_B_b)) + 1024;
-    hipFuncSetAttribute((void*)micro_tk_baseline, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    micro_tk_baseline<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+    if (g.fused) {                  // V1: A-stationary fused (gather A once per K-tile, reuse over NSUB)
+        const unsigned long mem_size = g.dynamic_shared_memory();
+        hipFuncSetAttribute((void*)micro_tk, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+        micro_tk<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+    } else {                        // V0: serial baseline (re-gathers A per N-subtile)
+        const unsigned long mem_size = (unsigned long)(sizeof(ST_A_b) + sizeof(ST_B_b)) + 1024;
+        hipFuncSetAttribute((void*)micro_tk_baseline, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
+        micro_tk_baseline<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+    }
 }
 
 // ================================================================================================

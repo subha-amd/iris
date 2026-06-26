@@ -177,10 +177,12 @@ def phase1_gather_pack():
     tk_kernel.dispatch_gather_pack(A_src_bf16, A_src_sc, A_pk_bf16, A_pk_sc, SEG, TILE, iris_ctx,
                                    MSRC, Mpacked, K, Nseg, Ntile)
 
+FUSED = int(os.environ.get("FUSED", "1"))   # V1: 1 = A-stationary fused (default), 0 = serial baseline
+
 def phase2_grouped_gemm():
     # local grouped GEMM over the packed buffer. src_rank=CONSUMER -> ctx.load is a LOCAL deref.
     tk_kernel.grouped_gemm(A_pk_bf16, A_pk_sc, B, C, TASKS, iris_ctx,
-                           Mpacked, N, K, CONSUMER, num_tasks, NSUB, 0)   # fused=0 (serial path)
+                           Mpacked, N, K, CONSUMER, num_tasks, NSUB, FUSED)
 
 # ---- CPU grouped reference (per-expert dequant(gathered A) @ B^T), incl zero-sentinel ----------
 def build_reference():
