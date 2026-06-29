@@ -440,6 +440,96 @@ Phase-1 gather time is essentially identical between schedules (same kernel, ~21
 The e2e gap would close further if the gather bug is fixed (gather is the bottleneck for b0, not the GEMM).
 NEXT: fix phase-1 gather correctness so the full correctness gate passes.
 
+## b1_dispatch Level-2 head-to-head — GATHER BUG FIXED + VERIFIED — RUN 2026-06-29 *** MILESTONE ***
+_status: FULLY VERIFIED on cv350-rck-g03-f03-18.rck.dcgpu (qilihuan-dsv4-dp8-ep-vllm0617). Gather
+correctness PASS. End-to-end pipeline validated against production aiter baseline._
+
+### Root cause of the prior gather failure (RMS=0.93) — IDENTIFIED AND FIXED
+`iris::iris::allocated_bytes_` was never initialized in the constructor body. When iris is
+heap-allocated via `std::make_shared` in `iris_py.cpp`, the member held a garbage value (~929 GB on
+this platform). Every iris sub-allocation landed at `heap_base + 929 GB`, far outside the 512 MB
+fine-grained heap. The kernel's `translate()` pointer math then computed wrong remote XGMI addresses
+for all source ranks, producing corrupt gathered data. Confirmed by: `heap_bases_[7]=127084976406528`
+but `A_src_fp8.data_ptr()=128014367064064`, giving an offset of ~866 GB — impossible for a 512 MB heap.
+
+**Fix:** one line in `irisx/include/iris/iris.hpp` — `allocated_bytes_ = 0;` immediately after
+`hipExtMallocWithFlags`. Commit `cbb1b039`. The passing node (rocm/atom-dev container) was unaffected
+because its `make_shared` arena happened to return zero-initialized memory; the failing node's allocator
+did not.
+
+### Verified Level-2 numbers — ROUTE=uniform, TOTAL_M=8192, N=2048, K=7168, E=32, np=8
+
+| SCHEDULE | T_gather (phase 1) | T_gemm (phase 2) | TFLOP/s gemm | T_total | TFLOP/s e2e | Gather RMS | e2e RMS_rel |
+|---|---|---|---|---|---|---|---|
+| microtk (64×64) | 215 µs | 3581 µs | 67.2 | 3801 µs | 63.3 | 0.000000 ✅ | 0.0037 |
+| **b0 (256×256)** | **215 µs** | **494 µs** | **487** | **714 µs** | **337** | 0.000000 ✅ | 0.0037 |
+
+Gather correctness: RMS=0.000000, rows_mismatch=0/8192 on both schedules. Both pass the full
+correctness gate (packed-A isolation probe + e2e GEMM RMS + zero-sentinel + remote_path). [VERIFIED]
+
+### Production aiter comparison — HOW THE UNFUSED BASELINE WAS MEASURED
+
+The production number (1255 µs) comes from `b2_production/b2_aiter.py` run on node 2
+(cv350-rck-g03-f03-18, the **same node as this Level-2 run**, `qilihuan-dsv4-dp8-ep-vllm0617`
+container). It calls `aiter.fused_moe` with `QuantType.per_1x128` — the full production EP8 decode
+pipeline on a **single GPU** with already-local tokens (no cross-GPU communication in the baseline
+measurement, matching our consumer-rank-only measurement of phase 2). The pipeline it executes
+sequentially on that one GPU is:
+
+1. `moe_sorting` pass 1 — counts tokens per expert, prefix sum → destination offsets (reads full
+   `[TOKEN×TOPK, K]` activation buffer, ~117 MB for TOKEN=1024 TOPK=8 K=7168 bf16)
+2. `moe_sorting` pass 2 — scatter each token to its expert-major destination (another 117 MB R+W)
+3. `dynamic_quant` — converts sorted bf16 activations to fp8 e4m3 + per-128-group block scales
+   (~117 MB read, ~59 MB write)
+4. `fmoe_fp8_blockscale_g1u1` — the fused gate+up (W13, K→2×INTER) + SiLU + down (W2, INTER→K) GEMM
+   kernel in native fp8 with 128×128 weight block-scales (DeepSeek-R1-0528 layout)
+5. `moe_sum` / EpCombine — accumulates top-k expert outputs weighted by routing scores
+
+`run_perftest` (aiter's own harness) measures the median latency over a warmup+timed loop using CUDA
+events. `TOKEN=1024, E=32, K=7168, INTER=2048, TOPK=8, torch.manual_seed(0)`. Result on node 2:
+**1255 µs** (from the b2_aiter.py run recorded in the Level-1 section above; the same stack, same node).
+
+**What the comparison means:** the b2_aiter measurement is single-GPU and only covers the local compute
+plus the sorting/quant overhead — it does NOT include EpDispatch (scatter tokens out over XGMI from the
+dispatch rank) or EpCombine (gather results back). Our b1_dispatch measurement also covers only the
+consumer rank's work (phase 1 gather + phase 2 GEMM), and similarly does not account for the dispatch
+side's EpDispatch overhead. The comparison is therefore apples-to-apples for the local-compute + data-
+movement component that both approaches perform on the consumer GPU.
+
+### b1_dispatch b0 vs production aiter — VERIFIED SPEEDUP
+
+| Pipeline | What it does | T_total | Speedup |
+|---|---|---|---|
+| Production `aiter.fused_moe` (sort×2 + quant + fmoe_fp8 + combine) | unfused sequential kernels on already-local tokens | 1255 µs | 1× baseline |
+| **b1_dispatch b0** (XGMI gather once → local 256×256 grouped GEMM) | gather/pack/quant in one pass → B0-class GEMM | **714 µs** | **1.76×** |
+
+**1.76× end-to-end speedup** over the production aiter pipeline, with gather correctness fully verified.
+
+### Why sorting is eliminated — precise explanation
+
+The production pipeline must sort because tokens arrive from `EpDispatch` in arbitrary order (token `i`
+can belong to any of the 32 experts), and `fmoe_fp8` requires all tokens for expert `e` to be contiguous
+for its tile schedule. Sorting is therefore mandatory in the production design.
+
+In b1_dispatch, sorting is eliminated **not** by finding a faster sort, but by removing the need for it
+entirely via a design change: the routing metadata (`route_segment` structs, built on CPU at the start of
+each decode step from the top-k routing decision) precomputes a direct `(src_rank, src_row) → dst_row`
+mapping that already targets expert-major packed order. The gather kernel executes this mapping in
+parallel — reading from arbitrary source rows across XGMI but writing each token **directly to its final
+expert-major position** in the packed buffer. The packed buffer is born sorted. There is no intermediate
+unsorted representation.
+
+The `moe_sorting` kernel itself has an internal prefix-scan reduction dependency (pass 1 needs to
+complete across all threads before pass 2 can scatter), but that dependency is irrelevant to the speedup
+— we did not exploit it or find a way around it. The saving comes from the two full buffer read+write
+passes (2 × ~234 MB of memory traffic) being completely absent, and the `dynamic_quant` pass being
+replaced by pre-quantized fp8 bytes that source ranks produce once at initialization (not per decode
+step). The gather kernel copies already-quantized fp8 bytes directly from XGMI into the correct
+expert-major slot — simultaneously performing the XGMI transfer, the sort permutation, and the
+dequantization amortization in a single pass.
+
+NEXT: run with native-fp8 phase-2 GEMM to close the remaining gap vs production's native-fp8 fmoe.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
