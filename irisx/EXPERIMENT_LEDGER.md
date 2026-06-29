@@ -397,6 +397,49 @@ the HK headers. Kernel body untouched.)
 - M_e in these runs is synthetic (harness-generated ragged + uniform-8×1024), NOT the trace
   distribution yet — Level-1 vs production (b2_aiter / trace fmoe) at matched M_e still to do.
 
+## b2_aiter production baseline — ON-DEVICE Level-1 results — RUN 2026-06-29
+_status: RUN on two nodes. Both confirm aiter signature (fused_moe + QuantType.per_1x128). E=32 full
+production shape (weights fit cleanly with no vLLM server running)._
+
+Node 1 (cv350-1e707-b02-2.mkm.dcgpu, r1_c4 container, rocm/atom-dev:vllm-v0.22.0-nightly_20260610):
+  TOKEN=1024 E=32 K=7168 INTER=2048 TOPK=8 → 528.3 TFLOP/s | M_e min=229 max=281 mean=256
+
+Node 2 (cv350-rck-g03-f03-18.rck.dcgpu, qilihuan container, torch 2.11+rocm7.2):
+  TOKEN=1024 E=32 K=7168 INTER=2048 TOPK=8 → 574.8 TFLOP/s | M_e min=229 max=281 mean=256
+
+Same M_e vector on both nodes (torch.manual_seed(0), same routing). Node 2 number is higher —
+likely newer aiter tuning (dsv4/minimax configs in tuned_fmoe.csv). Use node 2 (574.8) as the
+production bar since it's the newer stack.
+
+grouped_b0 vs b2_aiter Level-1 comparison (MATCHED M_e from b2_aiter, N=2048, K=7168):
+  grouped_b0 E=32 b2aiter-matched (real 8192 rows, Mpacked=12288 pad 33%): 420.2 TFLOP/s real / 630.3 padded
+  b2_aiter E=32 production (native fp8, fc1+fc2 fused):                   574.8 TFLOP/s
+  ratio grouped_b0/b2_aiter:  0.73 real-row  /  1.10 padded
+  gap = native-fp8 + fused-fc2 advantage; grouped_b0 is bf16-dequant, fc1-only (not the full g1u1).
+  RMS grouped_b0 correctness: 0.00371 (PASS).
+
+## b1_dispatch Level-2 head-to-head — ON-DEVICE — RUN 2026-06-29
+_status: BUILT and RUN on cv350-rck-g03-f03-18.rck.dcgpu (qilihuan-dsv4-dp8-ep-vllm0617 container).
+HipKittens cloned from github.com/HazyResearch/HipKittens (cdna4 port). iris fetched via CPM from
+ROCm/iris:muhaawd/irisx. Module built clean, no spill._
+
+Route: ROUTE=uniform TOTAL_M=8192 N=2048 K=7168 E=32, np=8.
+Phase-1 gather correctness: FAILED (RMS~0.93) — pre-existing phase-1 multi-source gather bug
+(all 128 tiles are multi-source at this route; known from prior sessions). Phase-2 GEMM timing
+is valid (the gather produces nonzero packed-A; the GEMM runs on it regardless of correctness).
+
+| SCHEDULE | T_gather | T_gemm | TFLOP/s (gemm) | T_total | TFLOP/s (e2e) |
+|---|---|---|---|---|---|
+| microtk | 209.44 µs | 3456.69 µs | 69.58 | 3671.07 µs | 65.52 |
+| b0 | 211.23 µs | 342.09 µs | 703.09 | 558.28 µs | 430.82 |
+
+T_gemm speedup b0 vs microtk: **10.1×**  (703 vs 70 TFLOP/s).
+T_total speedup b0 vs microtk: **6.6×**  (558 vs 3671 µs).
+
+Phase-1 gather time is essentially identical between schedules (same kernel, ~210 µs), as expected.
+The e2e gap would close further if the gather bug is fixed (gather is the bottleneck for b0, not the GEMM).
+NEXT: fix phase-1 gather correctness so the full correctness gate passes.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 

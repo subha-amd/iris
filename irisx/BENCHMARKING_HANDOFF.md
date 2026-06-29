@@ -5,7 +5,7 @@ new `grouped_b0` GEMM and the b1_dispatch pipeline against the production "unfus
 **Author context:** written 2026-06-29 off-node (no GPU, no trace on this machine). Everything here is
 derived from the source-verified ABI docs in this repo; the trace-extraction steps are instructions
 for whoever has the trace.
-
+ssh -i ~/.ssh/muhammad-gpu subvadla@cv350-rck-g03-f03-18.rck.dcgpu
 ---
 
 ## READY TO RUN — what is already written (2026-06-29)
@@ -218,13 +218,17 @@ To do on-node (needs the GPU; provide SSH first):
 - [x] grouped_b0 correctness PASS (RMS≈0.0037 ≪ 0.05, contamination 0) on the ragged case (all shapes)
 - [x] grouped_b0 TFLOP/s recorded — 748 (default) / 840 (fc1) / 709 (fc2) @ 8192 rows vs micro_tk ~69
 - [x] grouped_b0 re-run at fc1 (N=4096) and fc2 (N=7168,K=2048) shapes (synthetic M_e, not trace yet)
-- [ ] b2_aiter.py runs (confirm aiter signature) → production TFLOP/s + M_e distribution
-- [ ] M_e matched to b2_aiter's printed distribution on the grouped_b0 side
-- [ ] LEVEL 1 table {shape, M_e, grouped_b0 TFLOP/s, b2_aiter TFLOP/s, ratio, RMS}
-- [ ] b1_dispatch module rebuilt; `SCHEDULE=microtk` vs `SCHEDULE=b0` T_gemm head-to-head
-- [ ] LEVEL 2 table {ours phase1+phase2 vs production} produced
-- [x] EXPERIMENT_LEDGER.md updated with grouped_b0 Level-1 on-device results (2026-06-29)
+- [x] b2_aiter.py runs (confirm aiter signature) → production TFLOP/s + M_e distribution (2026-06-29)
+     node1: 528.3 TFLOP/s | node2 (newer aiter): 574.8 TFLOP/s | M_e min=229 max=281 mean=256
+- [x] M_e matched to b2_aiter's printed distribution on the grouped_b0 side (E=32, matched driver)
+- [x] LEVEL 1 table: grouped_b0 420.2 TFLOP/s real (630.3 padded) vs b2_aiter 574.8 TFLOP/s; ratio 0.73
+      gap = native-fp8 + fused-fc2 headroom; grouped_b0 is bf16-dequant fc1-half. RMS=0.0037 PASS.
+- [x] b1_dispatch module rebuilt on node2 (HipKittens cdna4, iris via CPM, no spill)
+- [x] SCHEDULE=microtk vs SCHEDULE=b0 T_gemm: 69.6 vs 703 TFLOP/s (10.1× gemm speedup)
+      T_total: 3671 vs 558 µs (6.6× e2e speedup). Phase-1 gather ~210 µs same for both.
+- [x] LEVEL 2 table produced — see EXPERIMENT_LEDGER.md
+- [x] EXPERIMENT_LEDGER.md updated with all Level-1 + Level-2 on-device results (2026-06-29)
 
-> Node sync note: `~/iris` on the node is a stale NON-git copy (Jun 24–25) missing `b1_dispatch/`,
-> `b2_production/`, etc. Only `grouped_b0/` was scp'd for the Level-1 run. The remaining items need
-> those dirs synced + the module rebuilt.
+Outstanding: phase-1 gather correctness FAILS (RMS~0.93) on uniform multi-source route — pre-existing
+bug; GEMM timing is valid but the full correctness gate needs fixing before these numbers can be
+reported as "verified". Fix phase-1 gather as the next step.

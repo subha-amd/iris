@@ -791,12 +791,12 @@ void dispatch_grouped_gemm_b0(b0_globals g) {
         hipMalloc(&d_a_bf16, need * sizeof(bf16));
         cap = need;
     }
-    const fp8_t* a_fp8 = reinterpret_cast<const fp8_t*>(&g.a[{0, 0, 0, 0}]);
-    const float* a_sc  = &g.sc[{0, 0, 0, 0}];
+    const fp8_t* a_fp8 = reinterpret_cast<const fp8_t*>(g.a.raw_ptr);
+    const float* a_sc  = g.sc.raw_ptr;
     dequant_packed_dense<<<g.Mpacked, 256, 0, g.stream>>>(a_fp8, a_sc, d_a_bf16, g.Mpacked, g.K);
 
     gl<bf16, -1, -1, -1, -1> A(d_a_bf16, 1, 1, g.Mpacked, g.K);
-    const int* tasks = &g.tasks[{0, 0, 0, 0}];
+    const int* tasks = g.tasks.raw_ptr;
     const int threads = 8 * 64;
     // compile-time (N,K) so the 8-wave schedule's k_iters is constant; production shapes only.
     if      (g.N == 2048 && g.K == 7168) grouped_b0_gemm<2048, 7168><<<g.num_tasks, threads, 0, g.stream>>>(A, g.b, g.c, tasks, g.num_tasks);
