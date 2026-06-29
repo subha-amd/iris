@@ -8,6 +8,30 @@ for whoever has the trace.
 
 ---
 
+## READY TO RUN — what is already written (2026-06-29)
+
+The harness code is in place. **What the human provides: node SSH/build access** (in
+`NODE_ACCESS.local.md`, gitignored — paste it to the node agent). After that the node agent's job is
+to **build + verify on device**, not to write benchmarks. Scripts:
+
+| piece | file | state |
+|---|---|---|
+| grouped_b0 standalone GEMM (Level 1, ours) | `grouped_b0/grouped_b0.cu` | written; **needs node compile + run** |
+| B0 path wired into b1_dispatch | `b1_dispatch/kernel.cpp` (`grouped_gemm_b0`) | written, additive; **needs module build** |
+| B0 task builder | `b1_dispatch/b0_tasks.py` | **CPU self-test PASSES** (all 5 routes) |
+| in-pipeline head-to-head (b0 vs micro_tk) | `b1_dispatch/example.py` (`SCHEDULE=microtk\|b0`) | written, syntax-checked; **needs run** |
+| production baseline (Level 1, theirs) | `b2_production/b2_aiter.py` | real aiter harness; **needs run (VRAM) + API-version check** |
+
+**On-device verification still required** (cannot be done off-GPU — flagged inline in each file):
+1. `grouped_b0.cu` compiles (the dynamic-gl + template combo) and passes correctness.
+2. `b1_dispatch` module rebuilds with the new `grouped_gemm_b0`.
+3. `b2_aiter.py`'s `aiter.fused_moe(...)` signature matches the installed aiter version (it prints a
+   smoke check; adjust kwargs if the version differs).
+So: "input SSH" is what *starts* the node work; the node agent then builds + runs + checks. No more
+benchmark code needs writing first.
+
+---
+
 ## 0. The two comparisons (the whole job)
 
 ```
@@ -104,10 +128,18 @@ Steps:
    beats micro_tk's ~69 TFLOP/s and approaches B0's ~183 (see `EXPERIMENT_LEDGER.md`).
 2. **Then make it match production fc1/fc2:** edit the `N`/`K` constants (or add cases) to
    `N=4096,K=7168` (fc1) and `N=7168,K=2048` (fc2), and set the `M_e` vector to the trace distribution.
-3. **Compare** grouped_b0's per-call time to the trace's `fmoe...g1u1` duration at the same `M_e`.
-   Record both real-row and padded TFLOP/s (padding waste depends on BM vs M_e — see §7).
+3. **Get the production number** from `b2_production/b2_aiter.py` (preferred — runs the real aiter
+   `fused_moe`, prints TFLOP/s + the per-expert `M_e` distribution it routed):
+   ```bash
+   TOKEN=1024 E=32 K=7168 INTER=2048 TOPK=8 python3 b2_production/b2_aiter.py
+   ```
+   It prints `M_e=[...]` — **feed that same distribution to grouped_b0** (set its `M_e` vector) so both
+   sides route identically. If VRAM-blocked, fall back to the trace's `fmoe` duration (§3, §6).
+4. **Compare** TFLOP/s: grouped_b0 (bf16) vs b2_aiter (native fp8). TFLOP/s is FLOP-normalized, so it
+   is fair regardless of how many GEMMs each fuses. Record grouped_b0's real-row AND padded TFLOP/s
+   (padding waste depends on BM vs M_e — §7).
 
-Deliverable: a table of {shape, M_e, grouped_b0 µs, trace fmoe µs, ratio, RMS}.
+Deliverable: a table of {shape, M_e, grouped_b0 TFLOP/s, b2_aiter TFLOP/s, ratio, RMS}.
 
 ---
 
@@ -120,21 +152,24 @@ tk_kernel.grouped_gemm_b0(a, sc, b, c, tasks_b0, Mpacked, N, K, num_tasks)
 ```
 - `a`,`sc` = the packed fp8 buffer + fp32 scales (phase-1 output) — SAME buffers `grouped_gemm` reads.
 - `b` = bf16 weights `[E*N, K]`, `c` = bf16 out `[Mpacked, N]`.
-- `tasks_b0` = the **B0 task list** (TASK_W=4: `expert, m_tile, n_tile, expert_row_begin`), BM=256.
-  Build it with the helper `b1_dispatch/b0_tasks.py::build_b0_tasks(rows_per_expert, N, BM=256)`.
+- `tasks_b0` = the **B0 task list** (TASK_W=4), built by `b1_dispatch/b0_tasks.py::build_b0_tasks`.
 - The dispatch internally does the **dequant preamble** (packed fp8 → bf16 scratch) then the B0 GEMM,
   switching on `(N,K)` ∈ {(2048,7168),(4096,7168),(7168,2048)}.
 
-**⚠️ Phase-1 padding must match BM=256.** The B0 GEMM needs each expert's packed region 256-aligned,
-but the current phase-1 gather pads to `GP_BM=64`. So for Level 2 you must build the packed buffer
-+ tilemeta with **BM=256** (re-pad the route layout), so `expert_row_begin` is a multiple of 256.
-This is the one remaining integration step (the gather body itself doesn't change — only the host
-route/packing granularity). Until then, run the B0 path on a 256-padded buffer built directly.
-
-Then time, per rank (slowest governs), with the same cuda-event method as `b1_dispatch/example.py`:
-- **ours:** `dispatch_gather_pack` (phase 1) + `grouped_gemm_b0` (phase 2).
-- **production:** the §1 chain (or its trace durations).
-Same routing, same shapes, correctness-gated.
+**The wiring is done** — `example.py` selects the phase-2 path via a `SCHEDULE` env. The BM=256
+padding lives entirely inside `build_b0_tasks`; the phase-1 gather still tiles in `GP_BM=64`-row
+chunks over that 256-padded space, so **no gather rebuild is needed**. Run the head-to-head:
+```bash
+# build the module once (picks up grouped_gemm_b0):
+cd <HK_ROOT>/distributed-kernels && cmake -B build -DDK_BUILD=b1_dispatch && cmake --build build -j16
+# then run BOTH schedules at the SAME route/shape and compare T_gemm / T_total:
+cd b1_dispatch
+ROUTE=uniform TOTAL_M=8192 N=2048 SCHEDULE=microtk mpirun ... -np 8 python3 example.py   # old 64x64
+ROUTE=uniform TOTAL_M=8192 N=2048 SCHEDULE=b0      mpirun ... -np 8 python3 example.py   # new B0
+```
+Both go through the SAME phase-1 gather + the SAME correctness gate (RMS + zero-sentinel); only phase
+2 differs. Compare the printed `T_gemm` (and `T_total`). For the production comparison, set `TOTAL_M`
+/ route so `M_e` matches `b2_aiter.py`'s printed distribution, and use the same shapes.
 
 ---
 
@@ -172,13 +207,19 @@ fresh `aiter.fused_moe` allocating full R1 weights (~3.5 GB) OOMs. Options:
 
 ## 8. Status checklist (update as you go)
 
-- [ ] grouped_b0.cu builds on node (gfx950) — see §4 step 1
-- [ ] grouped_b0 correctness PASS (RMS<0.05, contamination 0) on ragged case
+Already done (off-node):
+- [x] grouped_b0.cu written (`grouped_b0/`)
+- [x] B0 path wired into b1_dispatch (`grouped_gemm_b0`) + `b0_tasks.py` (CPU self-test PASSES)
+- [x] `example.py` head-to-head knob (`SCHEDULE=microtk|b0`)
+- [x] production baseline harness (`b2_production/b2_aiter.py`)
+
+To do on-node (needs the GPU; provide SSH first):
+- [ ] grouped_b0.cu builds on node (gfx950) — §4 step 1
+- [ ] grouped_b0 correctness PASS (RMS<0.05, contamination 0) on the ragged case
 - [ ] grouped_b0 TFLOP/s recorded vs micro_tk ~69 / B0 ~183
-- [ ] grouped_b0 re-run at fc1 (N=4096) and fc2 (N=7168,K=2048) shapes
-- [ ] trace extraction: fmoe + dispatch/sort/quant durations + M_e distribution captured
-- [ ] LEVEL 1 table {shape, M_e, ours µs, trace fmoe µs, ratio} produced
-- [ ] b1_dispatch B0 path built (`grouped_gemm_b0`) + b0_tasks.py task list
-- [ ] phase-1 gather re-padded to BM=256 (Level-2 prerequisite)
-- [ ] LEVEL 2 table {ours phase1+phase2 vs production chain} produced
+- [ ] b2_aiter.py runs (confirm aiter signature) → production TFLOP/s + M_e distribution
+- [ ] grouped_b0 re-run at fc1 (N=4096) and fc2 (N=7168,K=2048) shapes, M_e matched to b2_aiter
+- [ ] LEVEL 1 table {shape, M_e, grouped_b0 TFLOP/s, b2_aiter TFLOP/s, ratio, RMS}
+- [ ] b1_dispatch module rebuilt; `SCHEDULE=microtk` vs `SCHEDULE=b0` T_gemm head-to-head
+- [ ] LEVEL 2 table {ours phase1+phase2 vs production} produced
 - [ ] EXPERIMENT_LEDGER.md updated with all of the above

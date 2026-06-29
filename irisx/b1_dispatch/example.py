@@ -62,6 +62,15 @@ QGROUP  = 128
 assert K % QGROUP == 0
 NG = K // QGROUP
 
+# Phase-2 schedule selector: 'microtk' = v5 64x64 producer/consumer (default, the path that was slow);
+# 'b0' = the B0-class 256x256 8-wave ping-pong GEMM (grouped_gemm_b0). HEAD-TO-HEAD: run this driver
+# once with SCHEDULE=microtk and once with SCHEDULE=b0 at the SAME route/shape and compare T_gemm.
+# The B0 path pads each expert's packed region to 256 (inside build_b0_tasks) so a 256-row tile can't
+# straddle two experts; the phase-1 gather still tiles in GP_BM(=64)-row chunks over that 256-padded
+# space, so NO gather rebuild is needed. (b0 requires N in {2048,4096,7168} — the compiled instances.)
+SCHEDULE = os.environ.get("SCHEDULE", "microtk")
+assert SCHEDULE in ("microtk", "b0"), f"bad SCHEDULE={SCHEDULE}"
+
 iris = iris_py.Iris(heap_size_mb=512, verbose=False)
 rank = iris.rank()
 world = iris.world_size()
@@ -73,14 +82,20 @@ torch.cuda.set_device(rank)
 # (src_rank, src_row) assignment producing route_segments + per-BM-tile metadata (ep8_gather).
 rng = np.random.default_rng(SEED)
 rows_per_expert = BT.ROUTE_BUILDERS[ROUTE](E, TOTAL_M, rng)
-sched = BT.build_grouped_schedule(rows_per_expert, N, BM, BN)
-NSUB             = sched["nsub"]
-tasks_np         = sched["tasks"]
-expert_row_begin = sched["expert_row_begin"]
-padded_rows      = sched["padded_rows"]
-Mpacked          = sched["total_padded_rows"]
-num_tasks        = sched["num_tasks"]
-n_blocks         = sched["n_blocks"]
+if SCHEDULE == "b0":
+    import b0_tasks as B0T               # B0 task builder (TASK_W=4, pads experts to BM=256)
+    tasks_np, expert_row_begin, padded_rows, Mpacked = B0T.build_b0_tasks(rows_per_expert, N)
+    num_tasks = int(tasks_np.shape[0]); NSUB = 1; n_blocks = num_tasks; TASK_COLS = B0T.B0_TASK_W
+else:
+    sched = BT.build_grouped_schedule(rows_per_expert, N, BM, BN)
+    NSUB             = sched["nsub"]
+    tasks_np         = sched["tasks"]
+    expert_row_begin = sched["expert_row_begin"]
+    padded_rows      = sched["padded_rows"]
+    Mpacked          = sched["total_padded_rows"]
+    num_tasks        = sched["num_tasks"]
+    n_blocks         = sched["n_blocks"]
+    TASK_COLS        = BT.TASK_W
 assert Mpacked > 0 and num_tasks > 0, "empty route -- nothing to launch"
 
 # Multi-source segments over the SAME packed layout: each expert's real rows are split into runs
@@ -142,7 +157,7 @@ TILE = make_iris([Ntile, 4], "int32")
 # ---- LOCAL (non-heap) torch tensors: B (weights), C (output), TASKS ---------------------------
 B     = torch.zeros(E * N, K, dtype=torch.bfloat16, device='cuda')     # weights [E*N, K]
 C     = torch.zeros(Mpacked, N, dtype=torch.bfloat16, device='cuda')   # output  [Mpacked, N]
-TASKS = torch.zeros(num_tasks, BT.TASK_W, dtype=torch.int32, device='cuda')
+TASKS = torch.zeros(num_tasks, TASK_COLS, dtype=torch.int32, device='cuda')
 TASKS.copy_(torch.from_numpy(tasks_np).to('cuda'))
 
 # ---- each rank fills its OWN source activations; quantize like V4 (ep8 ref quantize_v1) -------
@@ -181,8 +196,12 @@ FUSED = int(os.environ.get("FUSED", "1"))   # V1: 1 = A-stationary fused (defaul
 
 def phase2_grouped_gemm():
     # local grouped GEMM over the packed buffer. src_rank=CONSUMER -> ctx.load is a LOCAL deref.
-    tk_kernel.grouped_gemm(A_pk_bf16, A_pk_sc, B, C, TASKS, iris_ctx,
-                           Mpacked, N, K, CONSUMER, num_tasks, NSUB, FUSED)
+    if SCHEDULE == "b0":
+        # B0-class 8-wave ping-pong (dequant preamble + 256x256 GEMM). LOCAL only (no iris_ctx).
+        tk_kernel.grouped_gemm_b0(A_pk_bf16, A_pk_sc, B, C, TASKS, Mpacked, N, K, num_tasks)
+    else:
+        tk_kernel.grouped_gemm(A_pk_bf16, A_pk_sc, B, C, TASKS, iris_ctx,
+                               Mpacked, N, K, CONSUMER, num_tasks, NSUB, FUSED)
 
 # ---- CPU grouped reference (per-expert dequant(gathered A) @ B^T), incl zero-sentinel ----------
 def build_reference():

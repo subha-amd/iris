@@ -353,9 +353,19 @@ _status: WRITTEN (additive), NOT built/run on device._
   production kernel list + exact shapes (fc1 K7168/N4096, fc2 K2048/N7168); the rule that the
   perfetto trace is the BASELINE SOURCE (extract fmoe durations + M_e), not the denominator; the
   fairness contract; the N=2048≠fc1 + scale-transpose + BM=256 gotchas; VRAM-blocker workarounds.
-- REMAINING Level-2 integration (documented, not done): phase-1 gather must pack with BM=256 (vs
-  GP_BM=64) so ERB is 256-aligned for the B0 path; then example.py calls grouped_gemm_b0 with a
-  build_b0_tasks list. On-device TODOs unchanged (compile, correctness, TFLOP/s vs micro_tk ~69).
+- example.py: ADDED `SCHEDULE=microtk|b0` knob — phase-2 selects grouped_gemm_b0 (B0) vs micro_tk.
+  The BM=256 padding lives entirely in build_b0_tasks; the gather still tiles GP_BM=64 over the
+  256-padded space, so NO gather rebuild (the earlier "must re-pad gather to 256" worry is resolved).
+  syntax-checked (py_compile). Run twice (SCHEDULE=microtk vs b0), same route/shape, compare T_gemm.
+- b2_production/b2_aiter.py: already a REAL aiter harness (NOT the stub B1_DISPATCH_STATUS claimed) —
+  fused_moe + per_1x128 + weight_per_128x128_quant + run_perftest. ENHANCED to print the per-expert
+  M_e distribution so grouped_b0 can be matched, + comparison framing (production TFLOP/s = the Level-1
+  bar; gap above bf16 grouped_b0 = native-fp8 headroom). Reports full-FFN TFLOP/s (FLOP-normalized,
+  fair vs grouped_b0's per-GEMM TFLOP/s).
+- BENCHMARKING_HANDOFF.md: updated — "READY TO RUN" table (all harness code written; human provides
+  node SSH; agent builds+verifies on device), Level-1 recipe uses b2_aiter.py, Level-2 uses SCHEDULE.
+- ON-DEVICE TODOs (unchanged, only verifiable on GPU): grouped_b0 compiles + correctness + TFLOP/s vs
+  micro_tk ~69 / B0 ~183; b2_aiter aiter-signature check; the two SCHEDULE runs head-to-head.
 
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
