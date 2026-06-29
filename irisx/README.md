@@ -5,6 +5,13 @@
 
 A modern C++ take on RMA/RDMA operations using AMD ROCm HIP. This is the C++ version of [Iris](https://github.com/ROCm/iris), designed for high-performance distributed computing applications with simple, intuitive and modern APIs.
 
+> **Fork note — DeepSeek-R1 MoE expert-GEMM experiments.** This fork layers a HipKittens + IRIS
+> MoE expert-GEMM effort on top of the IRIS library. Map + current state: **`PROJECT_SUMMARY.md`**;
+> authoritative measurements: **`EXPERIMENT_LEDGER.md`**. Active kernel: **`grouped_b0/`** (a
+> B0-class 256×256 8-wave grouped GEMM — the "fix the tile + schedule" replacement for the slow
+> b1_dispatch phase-2 GEMM). Superseded experiments live under `archive/`; the GEMM bodies we build
+> on live under `reference/`. The sections below document the upstream IRIS library itself.
+
 ## Overview
 
 Irisx provides a high-level C++ interface for performing remote memory operations across multiple GPUs in a distributed system.

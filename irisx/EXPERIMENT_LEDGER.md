@@ -308,6 +308,35 @@ LDS-resident path) and is LDS-bound at occ-2 (the V4 family limit). The gather (
 fraction of total. NEXT (V2, if pursued): an LDS-resident B0-class grouped GEMM over the packed buffer
 to push TFLOP/s toward 183 — but note B1-dispatch is already a CORRECT production-shaped EP8 pipeline.
 
+## grouped_b0 — B0-class 8-wave grouped GEMM (the phase-2 tile+schedule fix) — CODE WRITTEN 2026-06-29
+_status: WRITTEN, NOT yet built/run on device (authored off-node). Directory `grouped_b0/`._
+
+Diagnosis behind it: b1_dispatch phase-2 (`micro_tk`, copied from v5_grouped) runs at ~32–69 TFLOP/s
+because it is the V4 64×64 producer/consumer body (only 4/8 waves issue MFMA, occ 1, tiny tile). The
+project's B0 GEMM (harness `local_gemm` / `reference/v2_hk_expert_gemm`) is 256×256×64 8-wave ping-pong
+at ~183 TFLOP/s — ALL 8 waves MFMA. `grouped_b0` = the proven B0 body (`expert_gemm_bf16`) byte-identical,
+with ONLY the per-block tile-base indices remapped to a per-task (expert, m_tile, n_tile, expert_row_begin)
+decode (the grouping idea from v5). No change to the K-loop/waitcnt/barrier schedule.
+
+- Self-contained single-GPU `.cu` (no MPI/IRIS — phase-2 GEMM is local): dequant preamble + grouped GEMM
+  + CPU-fp32 correctness (RMS-rel, padding/contamination guard) + timing. Builds with one hipcc line.
+- BM=256 padding: host pads each expert's packed rows to a multiple of 256 so a block stays in one
+  expert (no cross-expert contamination); zeroed padding rows MFMA to 0 into dead C rows.
+- ON-DEVICE TODO (in priority order): (1) compiles? — the one unproven bit is the dynamic
+  `gl<bf16,-1,-1,-1,-1>` + `template<NN,KK>` combo (fallback: harness `b0_gemm` all-dynamic form);
+  (2) correctness on the ragged case (RMS<0.05, contamination 0) validates the index remap;
+  (3) headline TFLOP/s on perf-8×1024 (8192 rows, 256 tiles) vs micro_tk's ~69 and B0's ~183.
+- FOLLOW-UPS: sweep BM∈{64,128,256} (decode small-M_e ⇒ 256 may lose to tall-skinny; needs a
+  re-derived schedule for BM<256); wire into b1_dispatch harness for a same-process micro_tk
+  head-to-head; native-FP8 grouped GEMM (removes the dequant-to-bf16 2× MMA-rate gap vs AITER fmoe).
+
+## REORG 2026-06-29 (housekeeping, no measurements)
+Superseded experiments moved to `archive/` (v2_1, v3_fused, v4_astationary, p1/p2/p3, sched_4wave/
+8wave/xcd, occ_variants, lds_analysis, cache_first_touch + old V0..V4 `*_RESULTS.md` → archive/results).
+The two GEMM bodies grouped_b0 builds on moved to `reference/` (v2_hk_expert_gemm, v5_grouped). Active
+top-level: grouped_b0, b1_dispatch, ep8_gather, harness, b2_production, abi. IRIS library dirs
+(examples/benchmarks/tests/include/cmake) untouched — they are the only ones CMakeLists.txt builds.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 

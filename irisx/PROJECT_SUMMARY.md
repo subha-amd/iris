@@ -1,9 +1,46 @@
-# DeepSeek-R1 MoE Fusion on 8×MI355X — Project Summary (V0 → V4)
+# DeepSeek-R1 MoE Fusion on 8×MI355X — Project Summary
 
-> One-page map of the whole effort: from profiling the production decode path to a fused
-> tile-level communication+compute kernel that **beats the unfused baseline by 1.82×**.
-> Every result below was built and measured on real 8×MI355X (gfx950) hardware and
-> independently re-verified. Where to look for each piece is listed per stage.
+> **CURRENT STATE (updated 2026-06-29) — read this first.**
+> The "1.82× headline" in the historical section below was **refuted at Gate 1**: V4 beat only a
+> deliberately-weak baseline (B3, refetch-A-32×); against the strong copy-once baseline (B1-copy) V4
+> was ~2.3× *slower*. The whole V4 win was comm/compute *overlap*, not its A-stationary reuse. The
+> project re-centered on the **production-shaped B1-dispatch pipeline** (gather/pack/quant ONCE →
+> local grouped GEMM). See `EXPERIMENT_LEDGER.md` + `B1_DISPATCH_STATUS.md` for the authoritative,
+> corrected record. The historical V0→V4 narrative is kept below for provenance, not as live guidance.
+>
+> **Active focus:** the b1_dispatch **phase-2 grouped GEMM** was slow (~32–69 TFLOP/s) because it
+> reused the V4 64×64 producer/consumer body, NOT the project's proven B0-class GEMM (256×256 8-wave
+> ping-pong, ~183 TFLOP/s). `grouped_b0/` is the fix — see its README.
+
+## Repository layout (reorganized 2026-06-29)
+```
+irisx/
+  grouped_b0/        ← ACTIVE: B0-class 8-wave grouped GEMM (the tile+schedule fix)   [NEW]
+  b1_dispatch/       ← production-shaped EP8 pipeline: gather/pack/quant ONCE → grouped GEMM
+  ep8_gather/        ← verified multi-source EP8 gather (phase-1 component)
+  harness/           ← B0 (compute ceiling) + B1 (strong copy-once baseline) + benchmark methodology
+  b2_production/     ← MORI EpDispatch + AITER/CK fmoe production baseline (wiring, VRAM-blocked)
+  abi/               ← route / packed-layout ABI
+  reference/         ← the two GEMM bodies grouped_b0 builds on (kept for reference)
+      v2_hk_expert_gemm/   B0 256×256 8-wave ping-pong body (fmoe_expert_v2.cu)
+      v5_grouped/          grouped task-list scheduler (micro_tk)
+  archive/           ← superseded experiments (the v1–v4 line + parked schedule ablations)
+      v2_1_iris_gather_gemm/ v3_fused_kernel/ v4_astationary_kernel/
+      p1_tile_inbox/ p2_expert_pipeline/ p3_singlekernel/
+      sched_4wave/ sched_8wave/ sched_xcd/ occ_variants/ lds_analysis/ cache_first_touch/
+      results/             old V0..V4 *_RESULTS.md writeups
+  examples/ benchmarks/ tests/ include/ cmake/   ← IRIS library (built by CMakeLists.txt; untouched)
+```
+Top-level docs kept here: `EXPERIMENT_LEDGER.md` (authoritative measurements), `B1_DISPATCH_STATUS.md`,
+`B1_EXPLAINED.md`, `FMOE_LAYOUT.md`, `V2_HK_ANALYSIS.md` (grouped_b0 design basis), `AGENT_COMMON.md`.
+
+---
+
+## Historical narrative (V0 → V4) — kept for provenance
+> One-page map of the early effort: from profiling the production decode path to a fused
+> tile-level communication+compute kernel. **NOTE:** the "1.82×" framing here is superseded — see the
+> CURRENT STATE banner above. Paths moved in the 2026-06-29 reorg: `v2_hk_expert_gemm/` →
+> `reference/`, and `v2_1_*`, `v3_*`, `v4_*`, plus the `*_RESULTS.md` files → `archive/`.
 
 ## The thesis
 In MoE decode with expert parallelism, tokens must be moved across GPUs to their experts
