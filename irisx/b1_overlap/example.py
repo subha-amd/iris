@@ -25,8 +25,12 @@
 import os
 import sys
 
-sys.path.insert(0, "..")
-sys.path.insert(0, "../b1_dispatch")
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+PARENT_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
+B1_DISPATCH_DIR = os.path.abspath(os.path.join(THIS_DIR, "../b1_dispatch"))
+for path in (PARENT_DIR, B1_DISPATCH_DIR):
+    if path not in sys.path:
+        sys.path.append(path)
 
 import numpy as np
 import torch
