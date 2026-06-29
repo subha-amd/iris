@@ -214,12 +214,17 @@ Already done (off-node):
 - [x] production baseline harness (`b2_production/b2_aiter.py`)
 
 To do on-node (needs the GPU; provide SSH first):
-- [ ] grouped_b0.cu builds on node (gfx950) — §4 step 1
-- [ ] grouped_b0 correctness PASS (RMS<0.05, contamination 0) on the ragged case
-- [ ] grouped_b0 TFLOP/s recorded vs micro_tk ~69 / B0 ~183
+- [x] grouped_b0.cu builds on node (gfx950) — §4 step 1 (2026-06-29; needed N/K→GB0_N/GB0_K macros)
+- [x] grouped_b0 correctness PASS (RMS≈0.0037 ≪ 0.05, contamination 0) on the ragged case (all shapes)
+- [x] grouped_b0 TFLOP/s recorded — 748 (default) / 840 (fc1) / 709 (fc2) @ 8192 rows vs micro_tk ~69
+- [x] grouped_b0 re-run at fc1 (N=4096) and fc2 (N=7168,K=2048) shapes (synthetic M_e, not trace yet)
 - [ ] b2_aiter.py runs (confirm aiter signature) → production TFLOP/s + M_e distribution
-- [ ] grouped_b0 re-run at fc1 (N=4096) and fc2 (N=7168,K=2048) shapes, M_e matched to b2_aiter
+- [ ] M_e matched to b2_aiter's printed distribution on the grouped_b0 side
 - [ ] LEVEL 1 table {shape, M_e, grouped_b0 TFLOP/s, b2_aiter TFLOP/s, ratio, RMS}
 - [ ] b1_dispatch module rebuilt; `SCHEDULE=microtk` vs `SCHEDULE=b0` T_gemm head-to-head
 - [ ] LEVEL 2 table {ours phase1+phase2 vs production} produced
-- [ ] EXPERIMENT_LEDGER.md updated with all of the above
+- [x] EXPERIMENT_LEDGER.md updated with grouped_b0 Level-1 on-device results (2026-06-29)
+
+> Node sync note: `~/iris` on the node is a stale NON-git copy (Jun 24–25) missing `b1_dispatch/`,
+> `b2_production/`, etc. Only `grouped_b0/` was scp'd for the Level-1 run. The remaining items need
+> those dirs synced + the module rebuilt.

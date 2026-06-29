@@ -367,6 +367,36 @@ _status: WRITTEN (additive), NOT built/run on device._
 - ON-DEVICE TODOs (unchanged, only verifiable on GPU): grouped_b0 compiles + correctness + TFLOP/s vs
   micro_tk ~69 / B0 ~183; b2_aiter aiter-signature check; the two SCHEDULE runs head-to-head.
 
+## grouped_b0 Stage B — ON-DEVICE Level-1 results (8×MI355X gfx950) — RUN 2026-06-29
+_status: BUILT + RUN on device (single GPU). Correctness PASS on all shapes. micro_tk/B0 head-to-head
+(Level 2) still pending — node `~/iris` is a stale non-git copy missing b1_dispatch/b2_production; only
+grouped_b0/ was synced for this run._
+
+Environment: node cv350-1e707-b02-2.mkm.dcgpu, 8×gfx950 (MI355x), ROCm/HIP 7.2.53211, hipcc clang 22,
+HK_ROOT=~/HipKittens. Build: `hipcc -DGB0_N=<N> -DGB0_K=<K> -DKITTENS_CDNA4 --offload-arch=gfx950
+-std=c++20 -w -O3 -I~/HipKittens/include -I/opt/rocm/include/hip grouped_b0.cu`. (Source change: N/K
+made overridable via GB0_N/GB0_K macros — plain `-DN`/`-DK` collide with a template param `N` inside
+the HK headers. Kernel body untouched.)
+
+| shape | N | K | case | real_rows | Mpacked | pad% | ms/iter | TFLOP/s real | TFLOP/s padded | rms_rel | contam |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| default | 2048 | 7168 | ragged | 1600 | 2560 | 37.5 | 0.1606 | 292.5 | 468.0 | 0.00371 | 0 |
+| default | 2048 | 7168 | perf-8k | 8192 | 8192 | 0.0 | 0.3214 | 748.2 | 748.2 | 0.00369 | 0 |
+| fc1 | 4096 | 7168 | ragged | 1600 | 2560 | 37.5 | 0.1854 | 506.8 | 810.9 | 0.00370 | 0 |
+| fc1 | 4096 | 7168 | perf-8k | 8192 | 8192 | 0.0 | 0.5727 | 839.9 | 839.9 | 0.00371 | 0 |
+| fc2 | 7168 | 2048 | ragged | 1600 | 2560 | 37.5 | 0.1385 | 339.1 | 542.6 | 0.00371 | 0 |
+| fc2 | 7168 | 2048 | perf-8k | 8192 | 8192 | 0.0 | 0.3395 | 708.5 | 708.5 | 0.00371 | 0 |
+
+- HEADLINE: 708–840 TFLOP/s at full occupancy (8192 rows), far above micro_tk ~69 and the old B0 ~183
+  reference points baked into the source comments. fc1 (real fused g1u1 @ N=4096) is strongest (840).
+  The "~183 ceiling" annotation predates this MI355x/ROCm 7.2 and is stale; correctness passing
+  independently corroborates the new numbers.
+- PADDING TAX: ragged case (1600 real rows, BM=256 ⇒ 37.5% waste) drops real-row throughput to
+  293–507 while padded stays 468–811 — the decode-light penalty BENCHMARKING_HANDOFF §7 flags;
+  motivates a BM sweep if real decode M_e is small.
+- M_e in these runs is synthetic (harness-generated ragged + uniform-8×1024), NOT the trace
+  distribution yet — Level-1 vs production (b2_aiter / trace fmoe) at matched M_e still to do.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 

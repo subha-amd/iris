@@ -56,8 +56,14 @@
 using namespace kittens;
 
 // ---- shapes: DeepSeek-R1 W13 gate/up slice (matches the project's grouped case) ----
-static constexpr int N        = 2048;            // gate/up output cols per expert
-static constexpr int K        = 7168;            // hidden / reduction dim
+#ifndef GB0_N
+#define GB0_N 2048                               // gate/up output cols per expert
+#endif
+#ifndef GB0_K
+#define GB0_K 7168                               // hidden / reduction dim
+#endif
+static constexpr int N        = GB0_N;
+static constexpr int K        = GB0_K;
 static constexpr int GROUP    = 128;             // per-K-group fp8 block-scale span
 static constexpr int N_GROUPS = K / GROUP;       // 56
 static constexpr float FP8_E4M3_MAX = 448.0f;
