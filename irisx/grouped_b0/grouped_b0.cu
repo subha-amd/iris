@@ -337,7 +337,7 @@ static inline void hip_check(hipError_t e, const char* what) {
 // Run one grouped case. `Me` = per-expert real row counts (length E). Pads each expert up to a
 // multiple of BM, builds the packed buffer / task list, runs dequant + grouped GEMM, optionally
 // checks correctness vs a CPU fp32 reference, and times.
-static bool run_case(const char* label, const std::vector<int>& Me, bool full_check) {
+bool run_case(const char* label, const std::vector<int>& Me, bool full_check) {
     const int E = (int)Me.size();
     std::vector<int> padded(E), erb(E);
     int Mpacked = 0;
@@ -480,6 +480,7 @@ static bool run_case(const char* label, const std::vector<int>& Me, bool full_ch
     return pass;
 }
 
+#ifndef GB0_SKIP_MAIN
 int main(int argc, char** argv) {
     printf("grouped_b0 — B0-class 8-wave ping-pong, GROUPED over experts (N=%d, K=%d)\n", N, K);
 
@@ -495,3 +496,4 @@ int main(int argc, char** argv) {
     printf("\nRESULT: %s\n", (ok1 && ok2) ? "PASSED" : "FAILED");
     return (ok1 && ok2) ? 0 : 1;
 }
+#endif // GB0_SKIP_MAIN
