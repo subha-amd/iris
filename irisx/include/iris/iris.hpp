@@ -131,6 +131,7 @@ class iris {
     }
 
     auto heap_base = detail::malloc_fine_grained(heap_size_bytes);
+    allocated_bytes_ = 0;
     bytes_capacity_ = heap_size_bytes;
     IRIS_LOG_DEBUG("Allocated fine-grained heap: size={} MB, base_addr=0x{:x}",
                    heap_size_bytes / (1024 * 1024),
