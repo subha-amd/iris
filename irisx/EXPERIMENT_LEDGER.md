@@ -337,6 +337,26 @@ The two GEMM bodies grouped_b0 builds on moved to `reference/` (v2_hk_expert_gem
 top-level: grouped_b0, b1_dispatch, ep8_gather, harness, b2_production, abi. IRIS library dirs
 (examples/benchmarks/tests/include/cmake) untouched — they are the only ones CMakeLists.txt builds.
 
+## grouped_b0 Stage B — wired into b1_dispatch + benchmarking handoff — WRITTEN 2026-06-29
+_status: WRITTEN (additive), NOT built/run on device._
+
+- b1_dispatch/kernel.cpp: ADDED a second phase-2 path `grouped_gemm_b0` (pybind) alongside the
+  untouched `grouped_gemm`/micro_tk. New code = dequant preamble (`dequant_packed_dense`, packed fp8
+  -> bf16 scratch) + `grouped_b0_gemm<N,K>` (the B0 8-wave body, B0_-prefixed names, no collisions),
+  instantiated for (N,K) in {(2048,7168) fc1-half, (4096,7168) fc1, (7168,2048) fc2}. LOCAL only (no
+  iris_ctx). Brace-balanced, 3 pybind fns. micro_tk path byte-unchanged.
+- b1_dispatch/b0_tasks.py: NEW host builder `build_b0_tasks` (TASK_W=4, BM=256). CPU self-test PASSES
+  all 5 routes (uniform/zipf/one_hot/several_hot/many_empty): empty experts emit 0 tasks, ERB 256-
+  aligned, tiles stay in-expert, task count exact. [VERIFIED on CPU here.]
+- BENCHMARKING_HANDOFF.md: NEW top-level doc for the next (node+trace) agent — Level 1 (GEMM-only:
+  grouped_b0 vs trace's fmoe duration) + Level 2 (b1_dispatch phase1+phase2 vs production chain);
+  production kernel list + exact shapes (fc1 K7168/N4096, fc2 K2048/N7168); the rule that the
+  perfetto trace is the BASELINE SOURCE (extract fmoe durations + M_e), not the denominator; the
+  fairness contract; the N=2048≠fc1 + scale-transpose + BM=256 gotchas; VRAM-blocker workarounds.
+- REMAINING Level-2 integration (documented, not done): phase-1 gather must pack with BM=256 (vs
+  GP_BM=64) so ERB is 256-aligned for the B0 path; then example.py calls grouped_gemm_b0 with a
+  build_b0_tasks list. On-device TODOs unchanged (compile, correctness, TFLOP/s vs micro_tk ~69).
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 

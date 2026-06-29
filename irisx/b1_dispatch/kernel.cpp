@@ -517,6 +517,295 @@ void dispatch_grouped_gemm(micro_globals g) {
 }
 
 // ================================================================================================
+// PHASE 2 (ALT) — B0-class 8-wave ping-pong GROUPED GEMM  [Stage B wiring of grouped_b0]
+//
+// ADDITIVE: nothing above is changed. This is a SECOND phase-2 path the host can select by calling
+// `grouped_gemm_b0(...)` instead of `grouped_gemm(...)`. It replaces micro_tk's 64x64 producer/
+// consumer body (~32-69 TFLOP/s, only 4/8 waves MFMA) with the proven B0 256x256x64 8-wave ping-pong
+// body (all 8 waves MFMA, ~183 TFLOP/s ceiling) from reference/v2_hk_expert_gemm/fmoe_expert_v2.cu.
+//
+// The GEMM body is that B0 kernel VERBATIM, with ONLY the per-block tile-base indices remapped to a
+// per-task (expert, m_tile, n_tile, expert_row_begin) decode (the grouping idea from v5). It is a
+// straight copy of irisx/grouped_b0/grouped_b0.cu::grouped_expert_gemm. All new names are B0_-prefixed
+// so they do not collide with the v5 micro_tk macros/types above.
+//
+// Dataflow vs micro_tk: micro_tk dequants fp8->bf16 inside the producer warps. The B0 body wants bf16
+// A in HBM, so this path runs a DEQUANT PREAMBLE (packed fp8 -> bf16 scratch) first, then the bf16
+// 8-wave GEMM (== exactly how B0/B1-copy work). Both kernels are LOCAL (no IRIS) — the packed buffer
+// is already on this rank from phase 1.
+//
+// REQUIREMENT: each expert's packed region must be padded to a multiple of B0_BM=256 so a 256-row
+// block stays inside one expert (no cross-expert contamination; zero padding rows MFMA to 0). The
+// host builds the matching task list with b1_dispatch/b0_tasks.py::build_b0_tasks(..., BM=256), and
+// phase 1 must pack with BM=256 (vs the current GP_BM=64) — see BENCHMARKING_HANDOFF.md §5.
+// ================================================================================================
+static constexpr int B0_TASK_W = 4;
+enum { B0_T_EXPERT = 0, B0_T_MTILE = 1, B0_T_NTILE = 2, B0_T_EROWBEG = 3 };
+static constexpr int B0_BM = 256;        // packed-row padding granularity for the B0 path
+
+// dequant preamble: packed fp8 [Mpacked,K] (+ sc [Mpacked,NG]) -> bf16 [Mpacked,K]. Padding rows are
+// already 0 in the packed buffer (phase-1 zero-sentinel) so they dequant to 0 with no special-casing.
+__global__ void dequant_packed_dense(const fp8_t* __restrict__ a_fp8,
+                                     const float* __restrict__ a_sc,
+                                     bf16* __restrict__ a_bf16, int Mpacked, int Kdim) {
+    const int row = blockIdx.x;
+    if (row >= Mpacked) return;
+    const int NG = Kdim / QGROUP;
+    const fp8_t* frow = a_fp8 + (size_t)row * Kdim;
+    const float* srow = a_sc  + (size_t)row * NG;
+    bf16* orow = a_bf16 + (size_t)row * Kdim;
+    for (int h = threadIdx.x; h < Kdim; h += blockDim.x)
+        orow[h] = (bf16)(fp8_to_f32(frow[h]) * srow[h / QGROUP]);
+}
+
+using B0G = kittens::group<8>;
+
+template <int NN, int KK>
+__global__ __launch_bounds__(512, 2)
+void grouped_b0_gemm(const gl<bf16, -1, -1, -1, -1> A,   // [Mpacked, K] bf16 (dequanted)
+                     const gl<bf16, -1, -1, -1, -1> B,   // [E*N,     K] bf16 expert-major
+                     const gl<bf16, -1, -1, -1, -1> C,   // [Mpacked, N] bf16
+                     const int* __restrict__ tasks, int num_tasks) {
+    constexpr int WARPS_COL = 4, WARPS_ROW = 2;
+    constexpr int BLOCK_SIZE_ROW = 256, BLOCK_SIZE_COL = 256, BLOCK_K = 64;
+    constexpr int k_iters = KK / BLOCK_K;
+    constexpr int HALF_BLOCK_SIZE_ROW = BLOCK_SIZE_ROW / 2;
+    constexpr int HALF_BLOCK_SIZE_COL = BLOCK_SIZE_COL / 2;
+    constexpr int REG_BLOCK_M = BLOCK_SIZE_ROW / WARPS_ROW / 2;
+    constexpr int REG_BLOCK_N = BLOCK_SIZE_COL / WARPS_COL / 2;
+
+    using B0_ST_A = st_bf<HALF_BLOCK_SIZE_ROW, BLOCK_K, st_16x32_s>;
+    using B0_ST_B = st_bf<HALF_BLOCK_SIZE_COL, BLOCK_K, st_16x32_s>;
+    __shared__ B0_ST_A As[2][2];
+    __shared__ B0_ST_B Bs[2][2];
+
+    using B0_RT_A = rt_bf<REG_BLOCK_M, BLOCK_K, row_l, rt_16x32_s>;
+    using B0_RT_B = rt_bf<REG_BLOCK_N, BLOCK_K, row_l, rt_16x32_s>;
+    using B0_RT_C = rt_fl<REG_BLOCK_M, REG_BLOCK_N, col_l, rt_16x16_s>;
+    B0_RT_A a;
+    B0_RT_B b0, b1;
+    B0_RT_C cA, cB, cC, cD;
+
+    const int task = blockIdx.x;
+    if (task >= num_tasks) return;
+    const int* tk = tasks + (size_t)task * B0_TASK_W;
+    const int e   = tk[B0_T_EXPERT];
+    const int mt  = tk[B0_T_MTILE];
+    const int nt  = tk[B0_T_NTILE];
+    const int ERB = tk[B0_T_EROWBEG];                 // multiple of B0_BM=256
+
+    const int a_row_tile = ERB / 128 + mt * 2;        // 128-row A half-tile base
+    const int b_row_tile = (e * NN) / 128 + nt * 2;   // 128-row B half-tile base (expert-major)
+    const int c_row_tile = ERB / 64 + mt * 4;         // 64-row  C reg-tile base
+    const int c_col_tile = nt * 8;                    // 32-col  C reg-tile base
+
+    int warp_m = (warpid() / WARPS_COL);
+    int warp_n = (warpid() % WARPS_COL);
+    int tic = 0, toc = 1;
+
+    uint32_t swizzled_offsets_A[64];
+    uint32_t swizzled_offsets_B[64];
+    B0G::prefill_swizzled_offsets(As[tic][0], A, swizzled_offsets_A);
+    B0G::prefill_swizzled_offsets(Bs[tic][0], B, swizzled_offsets_B);
+
+    zero(cA); zero(cB); zero(cC); zero(cD);
+
+    B0G::load(Bs[tic][0], B, {0, 0, b_row_tile,     0}, swizzled_offsets_B);
+    B0G::load(As[tic][0], A, {0, 0, a_row_tile,     0}, swizzled_offsets_A);
+    B0G::load(Bs[tic][1], B, {0, 0, b_row_tile + 1, 0}, swizzled_offsets_B);
+    B0G::load(As[tic][1], A, {0, 0, a_row_tile + 1, 0}, swizzled_offsets_A);
+
+    if (warp_m == 1) { __builtin_amdgcn_s_barrier(); }
+    asm volatile("s_waitcnt vmcnt(4)");
+    __builtin_amdgcn_s_barrier();
+
+    B0G::load(Bs[toc][0], B, {0, 0, b_row_tile,     1}, swizzled_offsets_B);
+    B0G::load(As[toc][0], A, {0, 0, a_row_tile,     1}, swizzled_offsets_A);
+    B0G::load(Bs[toc][1], B, {0, 0, b_row_tile + 1, 1}, swizzled_offsets_B);
+
+    asm volatile("s_waitcnt vmcnt(6)");
+    __builtin_amdgcn_s_barrier();
+
+    #pragma unroll 2
+    for (int k = 0; k < k_iters - 2; k++, tic ^= 1, toc ^= 1) {
+        auto bs0 = kittens::subtile_inplace<REG_BLOCK_N, BLOCK_K>(Bs[tic][0], {warp_n, 0});
+        load(b0, bs0);
+        auto as0 = kittens::subtile_inplace<REG_BLOCK_M, BLOCK_K>(As[tic][0], {warp_m, 0});
+        load(a, as0);
+        B0G::load(As[toc][1], A, {0, 0, a_row_tile + 1, k + 1}, swizzled_offsets_A);
+        asm volatile("s_waitcnt lgkmcnt(8)");
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cA, a, b0, cA);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        auto bs1 = kittens::subtile_inplace<REG_BLOCK_N, BLOCK_K>(Bs[tic][1], {warp_n, 0});
+        load(b1, bs1);
+        B0G::load(Bs[tic][0], B, {0, 0, b_row_tile, k + 2}, swizzled_offsets_B);
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cB, a, b1, cB);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+
+        auto as1 = kittens::subtile_inplace<REG_BLOCK_M, BLOCK_K>(As[tic][1], {warp_m, 0});
+        load(a, as1);
+        B0G::load(As[tic][0], A, {0, 0, a_row_tile, k + 2}, swizzled_offsets_A);
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cC, a, b0, cC);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        B0G::load(Bs[tic][1], B, {0, 0, b_row_tile + 1, k + 2}, swizzled_offsets_B);
+        asm volatile("s_waitcnt vmcnt(6)");
+        __builtin_amdgcn_s_barrier();
+
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cD, a, b1, cD);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+    }
+
+    {
+        constexpr int k = k_iters - 2;
+        auto bs0 = kittens::subtile_inplace<REG_BLOCK_N, BLOCK_K>(Bs[tic][0], {warp_n, 0});
+        load(b0, bs0);
+        auto as0 = kittens::subtile_inplace<REG_BLOCK_M, BLOCK_K>(As[tic][0], {warp_m, 0});
+        load(a, as0);
+        B0G::load(As[toc][1], A, {0, 0, a_row_tile + 1, k + 1}, swizzled_offsets_A);
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cA, a, b0, cA);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        auto bs1 = kittens::subtile_inplace<REG_BLOCK_N, BLOCK_K>(Bs[tic][1], {warp_n, 0});
+        load(b1, bs1);
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cB, a, b1, cB);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+
+        auto as1 = kittens::subtile_inplace<REG_BLOCK_M, BLOCK_K>(As[tic][1], {warp_m, 0});
+        load(a, as1);
+        asm volatile("s_waitcnt vmcnt(4)");
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cC, a, b0, cC);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+
+        bs0 = kittens::subtile_inplace<REG_BLOCK_N, BLOCK_K>(Bs[toc][0], {warp_n, 0});
+        load(b0, bs0);
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cD, a, b1, cD);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        tic ^= 1, toc ^= 1;
+    }
+
+    {
+        auto as0 = kittens::subtile_inplace<REG_BLOCK_M, BLOCK_K>(As[tic][0], {warp_m, 0});
+        load(a, as0);
+        asm volatile("s_waitcnt vmcnt(0)");
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cA, a, b0, cA);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+
+        auto bs1 = kittens::subtile_inplace<REG_BLOCK_N, BLOCK_K>(Bs[tic][1], {warp_n, 0});
+        load(b1, bs1);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cB, a, b1, cB);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+
+        auto as1 = kittens::subtile_inplace<REG_BLOCK_M, BLOCK_K>(As[tic][1], {warp_m, 0});
+        load(a, as1);
+        __builtin_amdgcn_s_barrier();
+
+        asm volatile("s_waitcnt lgkmcnt(0)");
+        __builtin_amdgcn_s_setprio(1);
+        mma_ABt(cC, a, b0, cC);
+        mma_ABt(cD, a, b1, cD);
+        __builtin_amdgcn_s_setprio(0);
+        __builtin_amdgcn_s_barrier();
+    }
+
+    if (warp_m == 0) { __builtin_amdgcn_s_barrier(); }
+
+    store(C, cA, {0, 0, c_row_tile + warp_m,             c_col_tile + warp_n});
+    store(C, cB, {0, 0, c_row_tile + warp_m,             c_col_tile + WARPS_COL + warp_n});
+    store(C, cC, {0, 0, c_row_tile + WARPS_ROW + warp_m, c_col_tile + warp_n});
+    store(C, cD, {0, 0, c_row_tile + WARPS_ROW + warp_m, c_col_tile + WARPS_COL + warp_n});
+}
+
+struct b0_globals {
+    gl<bf16,  -1, -1, -1, -1> a;       // [Mpacked, K/2] packed fp8-as-bf16 (phase-1 output, LOCAL)
+    gl<float, -1, -1, -1, -1> sc;      // [Mpacked, K/128] fp32 scales
+    gl<bf16,  -1, -1, -1, -1> b, c;    // B[E*N, K] bf16 expert-major, C[Mpacked, N] bf16
+    gl<int,   -1, -1, -1, -1> tasks;   // [num_tasks, B0_TASK_W] B0 task list (BM=256)
+    int Mpacked, N, K, num_tasks;
+    hipStream_t stream;
+};
+
+// dequant preamble (packed fp8 -> bf16 scratch) then the B0 8-wave grouped GEMM. Both LOCAL.
+void dispatch_grouped_gemm_b0(b0_globals g) {
+    if (g.num_tasks <= 0) return;
+    // bf16 scratch for the dequanted A, cached across calls (== harness local_gemm pattern).
+    static bf16* d_a_bf16 = nullptr;
+    static size_t cap = 0;
+    const size_t need = (size_t)g.Mpacked * g.K;
+    if (need > cap) {
+        if (d_a_bf16) hipFree(d_a_bf16);
+        hipMalloc(&d_a_bf16, need * sizeof(bf16));
+        cap = need;
+    }
+    const fp8_t* a_fp8 = reinterpret_cast<const fp8_t*>(&g.a[{0, 0, 0, 0}]);
+    const float* a_sc  = &g.sc[{0, 0, 0, 0}];
+    dequant_packed_dense<<<g.Mpacked, 256, 0, g.stream>>>(a_fp8, a_sc, d_a_bf16, g.Mpacked, g.K);
+
+    gl<bf16, -1, -1, -1, -1> A(d_a_bf16, 1, 1, g.Mpacked, g.K);
+    const int* tasks = &g.tasks[{0, 0, 0, 0}];
+    const int threads = 8 * 64;
+    // compile-time (N,K) so the 8-wave schedule's k_iters is constant; production shapes only.
+    if      (g.N == 2048 && g.K == 7168) grouped_b0_gemm<2048, 7168><<<g.num_tasks, threads, 0, g.stream>>>(A, g.b, g.c, tasks, g.num_tasks);
+    else if (g.N == 4096 && g.K == 7168) grouped_b0_gemm<4096, 7168><<<g.num_tasks, threads, 0, g.stream>>>(A, g.b, g.c, tasks, g.num_tasks);
+    else if (g.N == 7168 && g.K == 2048) grouped_b0_gemm<7168, 2048><<<g.num_tasks, threads, 0, g.stream>>>(A, g.b, g.c, tasks, g.num_tasks);
+    else printf("grouped_gemm_b0: unsupported (N=%d,K=%d) — add an instantiation in dispatch_grouped_gemm_b0\n", g.N, g.K);
+}
+
+// ================================================================================================
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "b1_dispatch V0: EP8 multi-source gather/pack ONCE (phase1) + local grouped GEMM (phase2)";
     // PHASE 1: multi-source gather/pack/quant once -> local expert-major packed fp8 + scales.
@@ -549,5 +838,18 @@ PYBIND11_MODULE(tk_kernel, m) {
         &micro_globals::num_tasks,
         &micro_globals::nsub,
         &micro_globals::fused
+    );
+    // PHASE 2 (ALT): B0-class 8-wave grouped GEMM (dequant preamble + 256x256 ping-pong). LOCAL only
+    // (no iris_ctx). Consumes the SAME packed a/sc as grouped_gemm + a B0 task list (b0_tasks.py).
+    py::bind_function<dispatch_grouped_gemm_b0>(m, "grouped_gemm_b0",
+        &b0_globals::a,
+        &b0_globals::sc,
+        &b0_globals::b,
+        &b0_globals::c,
+        &b0_globals::tasks,
+        &b0_globals::Mpacked,
+        &b0_globals::N,
+        &b0_globals::K,
+        &b0_globals::num_tasks
     );
 }
