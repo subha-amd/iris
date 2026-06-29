@@ -1,10 +1,39 @@
 # BUG: b1_dispatch phase-1 gather produces wrong values for all remote (XGMI) rows
 
-**Status:** Open — root cause not yet identified despite extensive investigation.
+**Status:** RESOLVED — root cause found and fixed. Fix commit: `cbb1b039`.
 **Severity:** Blocks verified end-to-end Level-2 benchmark (gather timing measurements are
 real, but gathered data is wrong, so results cannot be reported as verified).
 **Last known good:** commit `1dca7c0e` ("B1-dispatch V0 PASSES all 5 routes") on node
 `cv350-1e707-b02-2.mkm.dcgpu` inside container `r1_c4` (`rocm/atom-dev:vllm-v0.22.0-nightly_20260610`).
+
+---
+
+## 0. Resolution
+
+**Root cause:** `allocated_bytes_` was never initialized in the `iris::iris` constructor.
+When iris is heap-allocated via `std::make_shared` (as done in `iris_py.cpp`), the member
+holds a garbage value. On this node it was ~929 GB, causing iris's bump allocator to issue
+pointers at `heap_base + 929GB` — far outside the 512 MB fine-grained heap. The `translate()`
+pointer math then computed completely wrong remote addresses, producing the RMS=0.93 failure.
+
+**Fix:** Added `allocated_bytes_ = 0;` immediately after the `hipExtMallocWithFlags` call in
+`irisx/include/iris/iris.hpp`. One line. Committed as `cbb1b039`.
+
+**Confirmed by:** heap_bases_[7]=127084976406528 but A_src_fp8.data_ptr()=128014367064064,
+giving offset=929390657536 (~866 GB) — impossible for a 512 MB heap.
+
+**Why it passed on the old node:** The passing build (`rocm/atom-dev:vllm-v0.22.0-nightly`)
+used a different memory allocator (or the `make_shared` landing zone happened to contain zeros
+on that platform), so `allocated_bytes_` was incidentally zero.
+
+**Verified Level-2 numbers on cv350-rck-g03-f03-18 (8× MI355X), ROUTE=uniform, M=8192, N=2048, K=7168:**
+
+| SCHEDULE | T_gather | T_gemm | TFLOP/s (gemm) | T_total | TFLOP/s (e2e) | gather RMS |
+|---|---|---|---|---|---|---|
+| microtk (64×64) | 215 µs | 3581 µs | 67.2 | 3801 µs | 63.3 | 0.000000 ✅ |
+| **b0 (256×256)** | **215 µs** | **494 µs** | **487** | **714 µs** | **337** | 0.000000 ✅ |
+
+Gather correctness: RMS=0.000000, rows_mismatch=0/8192 on both schedules. ✅
 
 ---
 
