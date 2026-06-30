@@ -12,6 +12,15 @@ A modern C++ take on RMA/RDMA operations using AMD ROCm HIP. This is the C++ ver
 > b1_dispatch phase-2 GEMM). Superseded experiments live under `archive/`; the GEMM bodies we build
 > on live under `reference/`. The sections below document the upstream IRIS library itself.
 >
+> **Complete expert region (2026-06-29).** `b1_dispatch/` now runs the FULL MoE expert region, not
+> just gather + one projection: `FFN=full` chains `grouped_gemm_b0` twice — **fc1 g1u1** (N=4096,
+> K=7168) → `SiLU(gate)*up` + fp8 intermediate re-quant → **fc2 down** (N=7168, K=2048) — and
+> `COMBINE=1` adds an IRIS scatter-back (`combine_scatter`, the EpCombine equivalent: per-row
+> `acc[src_token] += route_weight * out` over origin ranks). The timed region is then
+> **gather → fc1 → act → fc2 → combine**, head-to-head against the production unfused region in
+> `b2_production/b3_ep8_unfused.py` (dispatch / fmoe / combine). Recipe: `b1_dispatch/B1_DISPATCH.md`
+> §"Complete region". All additive — `FFN=single` is the original verified single-GEMM path.
+>
 > **Benchmarking the fused MoE kernel fairly (C4 = TP4/DP2+EP).** The 714µs-vs-1255µs result in the
 > ledger compares mismatched regions at a prefill-like operating point. The fair-baseline toolkit:
 > **`BENCHMARKING_METHODOLOGY.md`** (region-not-kernels rule + the 3-tier baseline recipe + how

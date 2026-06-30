@@ -123,6 +123,77 @@ def tiles_to_int_array(tiles):
                      for t in tiles], dtype=np.int32)
 
 
+# ================================================================================================
+# COMBINE (EpCombine) reverse map. route_reverse[packed_row] = (src_rank, src_token, topk_slot,
+# route_weight)  (PRODUCTION_ABI.md §3.2/§5). This is the INVERSE of the gather: phase-1 pulled
+# packed row `dst` FROM (src_rank, src_row); combine scatters it BACK to that origin token. We derive
+# it directly from the SAME `segs` so the pipeline is internally coherent (we scatter back to exactly
+# the rank+token we gathered from). topk_slot is synthesized from the expert id (the synthetic route
+# has no real router, see HONESTY note); route_weight is a deterministic per-row weight so the CPU
+# reference matches the kernel byte-for-byte.
+#
+# HONESTY / accumulation: in the default coherent map each (src_rank, src_token) is referenced AT
+# MOST ONCE (build_multisource_route advances each rank's source cursor monotonically), so combine is
+# a weighted SCATTER and the top-k accumulation (`+=`) never actually collides — the kernel still
+# uses atomic-add so it is correct if it did. To genuinely EXERCISE accumulation, pass Tlocal smaller
+# than the per-rank token span: src_token is then folded mod Tlocal, so several packed rows land on
+# the same (src_rank, src_token) and acc[token] += w*out really reduces. The CPU reference applies
+# the identical fold, so correctness stays checkable. This synthetic fold stands in for "one token
+# routed to several local experts"; a real top-k router would produce the collisions naturally.
+# ================================================================================================
+def build_route_reverse(segs, Mpacked, world, Tlocal=None, weight_seed=2024):
+    """Build the packed-row -> origin reverse map for combine.
+
+    Returns (rev[Mpacked,3] int32 = (src_rank, src_token, topk_slot),
+             wgt[Mpacked]  float32 = route_weight,
+             Tlocal int = accumulator token-dim (same on every rank for symmetric-heap alloc)).
+    Unrouted/padding packed rows get src_rank=-1, src_token=-1 (combine skips them).
+    """
+    rev = np.full((Mpacked, 3), -1, dtype=np.int32)
+    wgt = np.zeros((Mpacked,), dtype=np.float32)
+    max_tok = -1
+    for s in segs:
+        sr, srb, drb, rc, e = (int(s["src_rank"]), int(s["src_row_begin"]),
+                               int(s["dst_row_begin"]), int(s["row_count"]), int(s["expert_id"]))
+        for i in range(rc):
+            dst = drb + i
+            tok = srb + i
+            rev[dst, 0] = sr
+            rev[dst, 1] = tok                 # folded below if Tlocal is given
+            rev[dst, 2] = e % 8               # synthetic topk_slot (top-k = 8)
+            if tok > max_tok:
+                max_tok = tok
+
+    if Tlocal is None:
+        Tlocal = max_tok + 1 if max_tok >= 0 else 1
+    else:
+        routed = rev[:, 1] >= 0
+        rev[routed, 1] = rev[routed, 1] % Tlocal   # fold to force top-k collisions (accumulation test)
+
+    # deterministic route weights in (0.1, 1.0) for routed rows, filled in packed-row order so the
+    # GPU (reads `wgt`) and the CPU reference (reads the SAME `wgt`) agree exactly.
+    rng = np.random.default_rng(weight_seed)
+    routed = rev[:, 1] >= 0
+    wgt[routed] = (rng.random(int(routed.sum())) * 0.9 + 0.1).astype(np.float32)
+    return rev, wgt, int(Tlocal)
+
+
+def combine_reference(C2, rev, wgt, world, Tlocal, H):
+    """CPU reference for combine: acc_ref[src_rank][src_token] += route_weight * C2[packed_row].
+
+    C2 is the (GPU) fc2 output [Mpacked, H] as float32 — pass the SAME C2 the kernel scattered so this
+    isolates the combine's scatter/weight/accumulate from the FFN numerics. Returns [world,Tlocal,H].
+    """
+    acc = np.zeros((world, Tlocal, H), dtype=np.float32)
+    Mpacked = C2.shape[0]
+    for row in range(Mpacked):
+        sr = int(rev[row, 0]); tok = int(rev[row, 1])
+        if sr < 0 or tok < 0 or tok >= Tlocal:
+            continue
+        acc[sr, tok] += wgt[row] * C2[row]
+    return acc
+
+
 if __name__ == "__main__":
     # pure-CPU self-test of the routing invariants (no GPU) across all 5 route distributions.
     import build_tasks as BT
@@ -152,6 +223,26 @@ if __name__ == "__main__":
         # Invariant 4: both gather paths exercised on a non-degenerate route.
         n_single = sum(1 for t in tiles if t["seg_count"] == 1)
         n_multi  = sum(1 for t in tiles if t["seg_count"]  > 1)
+
+        # Invariant 5: route_reverse covers exactly the routed rows, and a CPU combine reference of a
+        #   synthetic C2 reproduces the weighted scatter (coherent) AND the folded accumulation.
+        Mpacked = int(sched["total_padded_rows"])
+        rev, wgt, Tloc = build_route_reverse(segs, Mpacked, world)        # coherent (no fold)
+        n_routed = int((rev[:, 1] >= 0).sum())
+        assert n_routed == covered, f"{route}: route_reverse routed {n_routed} != covered {covered}"
+        H = 8
+        C2 = np.arange(Mpacked * H, dtype=np.float32).reshape(Mpacked, H) % 7 - 3.0
+        acc = combine_reference(C2, rev, wgt, world, Tloc, H)
+        # coherent map: each (rank,token) written once -> acc cell == wgt*C2 for its single packed row
+        nz_cells = int((np.abs(acc).sum(axis=2) > 0).sum())
+        assert nz_cells == n_routed, f"{route}: coherent combine collided ({nz_cells} != {n_routed})"
+        # folded map: force collisions and check the reference still sums them
+        rev2, wgt2, Tloc2 = build_route_reverse(segs, Mpacked, world, Tlocal=max(1, n_routed // (world * 4)))
+        acc2 = combine_reference(C2, rev2, wgt2, world, Tloc2, H)
+        tot_ref = sum(float(wgt2[r]) * C2[r].sum() for r in range(Mpacked) if rev2[r, 1] >= 0)
+        assert abs(acc2.sum() - tot_ref) < 1e-2 * (abs(tot_ref) + 1.0), f"{route}: folded combine sum mismatch"
+
         print(f"  {route:<12} segs={len(segs):4d} covered={covered:5d} "
-              f"single_tiles={n_single:4d} multi_tiles={n_multi:4d}  OK")
+              f"single_tiles={n_single:4d} multi_tiles={n_multi:4d} "
+              f"rev_routed={n_routed} Tlocal={Tloc}  OK")
     print("b1_dispatch_route self-test: ALL INVARIANTS PASSED")

@@ -806,6 +806,76 @@ void dispatch_grouped_gemm_b0(b0_globals g) {
 }
 
 // ================================================================================================
+// COMBINE (the EpCombine equivalent) — scatter the fc2 output back to origin tokens over IRIS.
+//
+// ADDITIVE: nothing above changes. This is the REVERSE of phase-1 gather. Phase-1 gather read REMOTE
+// source rows -> LOCAL packed buffer; combine writes LOCAL packed (fc2 output) rows -> REMOTE
+// per-origin-rank accumulators, scaling each row by its route_weight and ACCUMULATING the top-k
+// contributions:  acc[src_token] += route_weight * out[packed_row]   (PRODUCTION_ABI.md §5).
+//
+// route_reverse[packed_row] = (src_rank, src_token, topk_slot, route_weight) is split here into an
+// int map `rev`[Mpacked,3] (src_rank, src_token, topk_slot) + a float `wgt`[Mpacked] (route_weight),
+// purely so both can ride the int32/float32 IRIS-heap views cleanly; it is the same ABI data.
+//
+// Grid = one block per packed/output row; the block's 256 threads stream the H-wide row, each element
+// scatter-added into acc[src_token*H + h] on the row's ORIGIN rank (src_rank) via IRIS. A row with
+// src_token < 0 is an unrouted/padding row (the phase-1 zero-sentinel) and is skipped. `atomic`=1
+// uses IRIS fetch_add (correct under top-k collisions, i.e. real accumulation); `atomic`=0 uses a
+// plain IRIS store (only correct when each (src_rank,src_token) is written exactly once — the
+// collision-free "coherent" route). Cross-rank visibility of the scattered writes is established by
+// the HOST iris.barrier() AFTER this kernel (hipDeviceSynchronize + MPI_Barrier = system fence), the
+// same happens-before the gather's read side relies on, so relaxed atomics suffice in-kernel.
+//
+// acc MUST live on the IRIS symmetric heap (it is the remote scatter target — ctx.fetch_add/store
+// translate by symmetric offset). c2 / rev / wgt are only ever dereferenced LOCALLY on the consumer,
+// so they can be ordinary local tensors. Mirrors gather_pack_kernel's structure (kernel.cpp:100).
+// ================================================================================================
+struct combine_globals {
+    gl<bf16,  -1, -1, -1, -1> c2;    // [Mpacked, H] LOCAL fc2 output on the consumer (bf16)
+    gl<float, -1, -1, -1, -1> acc;   // [Tlocal, H] fp32 accumulator on EACH rank's IRIS heap
+    gl<int,   -1, -1, -1, -1> rev;   // [Mpacked, 3] route_reverse ints: src_rank, src_token, topk_slot
+    gl<float, -1, -1, -1, -1> wgt;   // [Mpacked, 1] route_weight (fp32), one per packed row
+    iris::iris_device_view iris_ctx;
+    int Mpacked, H, Tlocal, atomic;
+    hipStream_t stream;
+    dim3 grid()  { return dim3(Mpacked > 0 ? Mpacked : 1); }
+    dim3 block() { return dim3(256); }
+};
+
+__global__ __launch_bounds__(256, 1)
+void combine_scatter_kernel(combine_globals g) {
+    const int row = blockIdx.x;
+    if (row >= g.Mpacked) return;
+
+    const int src_rank  = g.rev[{0, 0, row, 0}];
+    const int src_token = g.rev[{0, 0, row, 1}];
+    // const int topk_slot = g.rev[{0,0,row,2}];   // carried in the ABI; not needed for the scatter math
+    if (src_rank < 0 || src_token < 0 || src_token >= g.Tlocal) return;   // unrouted/padding -> skip
+
+    const float w = g.wgt[{0, 0, row, 0}];
+    const int   H = g.H;
+    iris::iris_device_view ctx = g.iris_ctx;
+
+    const bf16* crow     = &g.c2[{0, 0, row, 0}];          // LOCAL fc2 row on the consumer
+    float*      acc_base = &g.acc[{0, 0, 0, 0}];           // consumer's own acc heap base (symmetric)
+    float*      acc_row  = acc_base + (size_t)src_token * H;
+
+    for (int h = threadIdx.x; h < H; h += blockDim.x) {
+        const float val = w * (float)crow[h];
+        float* dst = acc_row + h;                          // symmetric-heap offset -> origin rank
+        if (g.atomic)
+            ctx.fetch_add<float, iris::memory_scope_system>(dst, val, src_rank, iris::memory_order_relaxed);
+        else
+            ctx.store(dst, val, src_rank);
+    }
+}
+
+void dispatch_combine_scatter(combine_globals g) {
+    if (g.Mpacked <= 0) return;
+    combine_scatter_kernel<<<g.grid(), g.block(), 0, g.stream>>>(g);
+}
+
+// ================================================================================================
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "b1_dispatch V0: EP8 multi-source gather/pack ONCE (phase1) + local grouped GEMM (phase2)";
     // PHASE 1: multi-source gather/pack/quant once -> local expert-major packed fp8 + scales.
@@ -851,5 +921,19 @@ PYBIND11_MODULE(tk_kernel, m) {
         &b0_globals::N,
         &b0_globals::K,
         &b0_globals::num_tasks
+    );
+    // COMBINE (EpCombine equivalent): scatter fc2 output [Mpacked,H] back to acc[Tlocal,H] on each
+    // origin rank over IRIS, weighted by route_weight, accumulating top-k contributions. c2/rev/wgt
+    // are LOCAL (consumer); acc is on the IRIS symmetric heap (the remote scatter target).
+    py::bind_function<dispatch_combine_scatter>(m, "combine_scatter",
+        &combine_globals::c2,
+        &combine_globals::acc,
+        &combine_globals::rev,
+        &combine_globals::wgt,
+        &combine_globals::iris_ctx,
+        &combine_globals::Mpacked,
+        &combine_globals::H,
+        &combine_globals::Tlocal,
+        &combine_globals::atomic
     );
 }

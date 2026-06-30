@@ -80,3 +80,55 @@ production gather cost; T_gemm is the grouped-GEMM cost. Per the project decisio
 overlapped design cannot clearly beat this serial B1-dispatch, bulk gather-once + local grouped GEMM
 IS the production dataflow and we optimize the gather (currently ~56 GB/s of ~128 available) and the
 grouped schedule, not a fused GEMM.
+
+## Complete region — full FFN (fc1 g1u1 + SiLU + fc2) + combine (EpCombine)
+
+The single-GEMM path above is a *partial* region (gather + one projection). For a head-to-head vs the
+production unfused region (`b2_production/b3_ep8_unfused.py`: dispatch / fmoe / combine), `example.py`
+also runs the **complete** expert region, gated by env, all ADDITIVE (defaults reproduce the original
+single-GEMM path):
+
+```
+FFN=full   : gather -> fc1 (g1u1, N=4096 K=7168) -> SiLU(gate)*up + fp8 re-quant -> fc2 (N=7168 K=2048)
+             both projections via grouped_gemm_b0 (already compiled for both (N,K)); requires SCHEDULE=b0.
+COMBINE=1  : after fc2, scatter the output back to origin tokens over IRIS (combine_scatter): per row,
+             acc[src_token] += route_weight * out[row], accumulating top-k contributions on origin ranks.
+```
+
+The intermediate `SiLU(gate)*up` + fp8 per-128-group re-quant (the production `dynamic_quant`) is a
+torch op between the two GEMMs and is timed as **T_act** so the quant cost is accounted honestly.
+
+**Build the module** (on the node, inside the HK checkout):
+```bash
+cd /tmp/HipKittens/distributed-kernels
+cmake -B build -DGPU_TARGET=CDNA4 -DDK_BUILD=b1_dispatch
+cmake --build build -j16 --target b1_dispatch && cmake --build build -j16 --target iris_py
+```
+
+**Run the complete region** (8× MI350, gfx950; prints T_gather / T_fc1 / T_act / T_fc2 / T_combine / T_total):
+```bash
+cd /tmp/HipKittens/distributed-kernels/b1_dispatch
+ROUTE=uniform TOTAL_M=8192 SCHEDULE=b0 FFN=full COMBINE=1 \
+  mpirun --allow-run-as-root --mca pml ob1 --mca btl self,vader -np 8 \
+    -x HSA_XNACK=1 -x MORI_GPU_ARCHS=gfx950 -x PYTHONPATH=/tmp/HipKittens/distributed-kernels \
+    python3 example.py
+```
+
+Two correctness gates print: **FFN** (C2 vs a CPU fc1→SiLU→requant→fc2 reference; tol 0.05 for the
+two fp8-A GEMMs + intermediate quant) and **COMBINE** (the GPU-scattered accumulator vs a CPU scatter
+of the SAME fc2 output; tol 0.02 — isolates the scatter/weight/accumulate from the FFN numerics).
+
+New pieces (all additive; single-GEMM path untouched):
+- `kernel.cpp::combine_scatter` — the IRIS scatter-back kernel (mirror of phase-1 gather, reversed),
+  bound as `tk_kernel.combine_scatter(c2, acc, rev, wgt, iris_ctx, Mpacked, H, Tlocal, atomic)`.
+- `b1_dispatch_route.py::build_route_reverse` / `combine_reference` — the host reverse-map builder +
+  CPU combine reference. `route_reverse` is derived from the SAME segments (coherent with the gather).
+- `example.py` — `FFN`/`COMBINE`/`COMBINE_ATOMIC`/`COMBINE_TLOCAL` knobs, the two-GEMM FFN chain with
+  the SiLU+re-quant epilogue, and the per-stage timing.
+
+HONESTY / accumulation: the synthetic route advances each source rank's cursor monotonically, so by
+default each (src_rank, src_token) is referenced once — combine is a weighted SCATTER and the top-k
+`+=` never collides (the kernel still uses atomic-add, so it is correct if it did). Set
+`COMBINE_TLOCAL=N` (< per-rank token span) to FOLD src_token and force real accumulation; the CPU
+reference applies the identical fold so correctness stays checkable. A real top-k router would produce
+those collisions naturally — see the note in `b1_dispatch_route.py::build_route_reverse`.
