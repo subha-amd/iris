@@ -804,7 +804,29 @@ viable HK-compatible trick: store B as fp8 bytes but LOAD them as a HALF-width b
 bf16 global→register path, then UNPACK fp8→bf16 in-register (per-N-row scale) and do bf16×bf16 mma — keeps
 A bf16/per-block (RMS≈0.018, no requant), halves B HBM. Win math: fc1 0.94GB@4.25TB/s≈221µs + fc2≈110µs =
 331 GEMM + gather 42 + act 25 + combine 46 ≈ **444µs < 533 = WIN ~17%** IF the in-register byte-unpack is
-fragment-layout-clean. [in progress / feasibility under investigation.]
+fragment-layout-clean.
+
+FEASIBILITY (research subagent over the HK headers, 2026-06-30): the bf16-load-unpack IS implementable and
+CLEAN (per-lane, zero runtime shuffles) **provided the fp8 weights are PRE-SWIZZLED offline** to the HK
+bf16 global→register fragment order; with naive row-major fp8 it is NEEDS-SHUFFLE (HK's own column-doubling
+`swap_layout_inplace` uses cross-lane `v_permlane16_swap`, proving the 2× column expansion crosses lanes).
+Recipe: declare a `gl<bf16>` over the fp8 HBM buffer with HALF the K cols → `kittens::load` into
+`rt_bf<32,BLOCK_K/2>` (the bf16 load is a verified raw byte copy; only the *register* tile dtype is checked,
+bf16 passes) → per lane `bit_cast<fp8e4m3_4>` the 32-bit reg → `convertor<float4,fp8e4m3_4>` → ×per-N-row
+scale (a per-lane scalar; each lane owns a fixed row) → `convertor<bf16_2,float2>` (one v_cvt_pk_bf16_f32)
+→ write the right `tiles[i][j].data[idx]` → `mma_ABt` bf16×bf16. NO direct fp8→bf16 convertor exists (go via
+float4). No mixed bf16×fp8 MFMA on this gfx950 build (every mma static_asserts (bf16,bf16)|(half,half)|
+(fp8,fp8)), so the bf16-mma + unpack is the only A-stays-bf16 path. Files: cdna4/.../global_to_register.cuh,
+cdna4/common/base_types.cuh:401-430 (convertors), types/register/rt_base.cuh + rt_shape.cuh (fragment
+formula: lane L = row(L%16) + 16·colblock owns a contiguous run of `stride` cols), ops/.../assembly/
+conversions.cuh:28 (the permlane column-doubling proof).
+
+STATUS / HANDOFF: the b1_dispatch REGION INTEGRATION for fp8 decode is COMPLETE and committed — DECODE_FP8
+wiring, BM=16 task list, host per-N-row fp8 B quant, row_expert map, scale_c, and the dispatch are all in
+place and gated. The ONLY remaining piece is the inner kernel: replace `grouped_b0_gemm_decode_fp8`'s
+LDS-staged body with the saturating pre-swizzled bf16-load-unpack body (and drop the per-row A requant since
+A stays bf16/per-block → also fixes RMS back to ~0.018). This is GEMM-kernel authoring (Agent A's domain);
+the region will consume it unchanged. Until then the gated, CORRECT decode default is bf16 BM=16 (874µs).
 
 PREFILL (TOTAL_M=8192, re-measured on THIS node, no regression — DECODE=0 path untouched):
 b1 1259µs (RMS 0.018 PASS; fc1 964 TFLOP/s, fc2 763) vs b3 1941µs (tok/rank=1024) = **b1 WINS 1.54×**
