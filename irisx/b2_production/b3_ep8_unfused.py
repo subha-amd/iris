@@ -43,12 +43,16 @@ E_GLOBAL = int(os.environ.get("E", "256"))          # global experts (32/rank @ 
 HID   = int(os.environ.get("HID", "7168"))
 IDIM  = int(os.environ.get("IDIM", "2048"))
 TOPK  = int(os.environ.get("TOPK", "8"))
-QUANT = os.environ.get("QUANT", "per_128x128")
+QUANT = os.environ.get("QUANT", "per_1x128")          # C4/ATOM production = per_1x128
+# DISPATCH=bf16 mirrors the C4 trace: MORI moves bf16 tokens (EpDispatchIntraNodeKernel_bf16),
+#   then dynamic_quant runs IN-region inside fused_moe. DISPATCH=fp8 = the cheaper pre-quant variant.
+DISPATCH = os.environ.get("DISPATCH", "bf16")
 NWARM = int(os.environ.get("NWARM", "10"))
 NITER = int(os.environ.get("NITER", "50"))
 
 def qtype():
-    return {"per_128x128": aiter.QuantType.per_128x128,
+    return {"per_1x128":   aiter.QuantType.per_1x128,
+            "per_128x128": aiter.QuantType.per_128x128,
             "per_Token":   aiter.QuantType.per_Token,
             "No":          aiter.QuantType.No}[QUANT]
 
@@ -77,8 +81,8 @@ def worker(rankID, tokens_per_rank):
     # this rank's 32 local experts' weights (fp8 + 128x128 block-scale, preshuffled)
     w1 = torch.randn((Eloc, 2*IDIM, HID), dtype=dtypes.bf16, device=dev) / (HID**0.5)
     w2 = torch.randn((Eloc, HID, IDIM), dtype=dtypes.bf16, device=dev) / (IDIM**0.5)
-    if qt == aiter.QuantType.per_128x128:
-        w1_qt, w1_scale = weight_per_128x128_quant(w1, dtypes.fp8)
+    if qt in (aiter.QuantType.per_128x128, aiter.QuantType.per_1x128):
+        w1_qt, w1_scale = weight_per_128x128_quant(w1, dtypes.fp8)   # weights are 128x128-block
         w2_qt, w2_scale = weight_per_128x128_quant(w2, dtypes.fp8)
     else:
         qf = aiter.get_torch_quant(qt)
@@ -86,18 +90,23 @@ def worker(rankID, tokens_per_rank):
         w2_qt, w2_scale = qf(w2, quant_dtype=dtypes.fp8)
     w1_qt = shuffle_weight(w1_qt); w2_qt = shuffle_weight(w2_qt)
 
-    # quantize activations (fp8 dispatch payload) + per-1x128 block scales
-    aq = get_hip_quant(qt if qt != aiter.QuantType.per_128x128 else aiter.QuantType.per_1x128)
-    tokens_qt, scale = aq(tokens, quant_dtype=dtypes.fp8)
+    # --- DISPATCH dtype selects the pipeline shape ---
+    # bf16 (C4 trace): MORI moves bf16 tokens (no scales); dynamic_quant runs IN-region inside
+    #   fused_moe (a1_scale=None). This is the faithful EpDispatch_bf16 -> sort -> quant -> fmoe path.
+    # fp8: pre-quant before dispatch (cheaper movement), fused_moe uses the dispatched scale.
+    if DISPATCH == "bf16":
+        disp_inp, disp_scale_in, scdim, scsz, use_a1 = tokens, None, 0, 0, False
+    else:
+        aq = get_hip_quant(aiter.QuantType.per_1x128)
+        tokens_qt, scale = aq(tokens, quant_dtype=dtypes.fp8)
+        disp_inp, disp_scale_in, scdim, scsz, use_a1 = tokens_qt, scale, scale.shape[-1], scale.dtype.itemsize, True
 
-    # MORI shmem from the torch process group (the known-good init from the MORI test)
     wg = torch.distributed.group.WORLD
     torch._C._distributed_c10d._register_process_group("default", wg)
     mori.shmem.shmem_torch_process_group_init("default")
     cfg = mori.ops.EpDispatchCombineConfig(
-        data_type=tokens_qt.dtype, rank=rankID, world_size=WORLD, hidden_dim=HID,
-        scale_dim=scale.shape[-1] if scale is not None else 0,
-        scale_type_size=scale.dtype.itemsize if scale is not None else 0,
+        data_type=disp_inp.dtype, rank=rankID, world_size=WORLD, hidden_dim=HID,
+        scale_dim=scdim, scale_type_size=scsz,
         max_token_type_size=dtypes.bf16.itemsize,
         max_num_inp_token_per_rank=max(8192, tokens_per_rank * 4),
         num_experts_per_rank=Eloc, num_experts_per_token=TOPK,
@@ -107,13 +116,13 @@ def worker(rankID, tokens_per_rank):
     expert_mask[Eloc*rankID : Eloc*(rankID+1)] = 1
 
     def do_dispatch():
-        return op.dispatch(tokens_qt, topk_weights, scale, topk_ids)
+        return op.dispatch(disp_inp, topk_weights, disp_scale_in, topk_ids)
     def do_fmoe(do_, dw_, ds_, di_, drn_):
         return fused_moe(do_, w1_qt, w2_qt, dw_, di_, expert_mask,
                          num_local_tokens=drn_, w1_scale=w1_scale, w2_scale=w2_scale,
-                         a1_scale=ds_, quant_type=qt, dtype=dtypes.bf16)
+                         a1_scale=(ds_ if use_a1 else None), quant_type=qt, dtype=dtypes.bf16)
     def region():
-        do_, dw_, ds_, di_, drn_ = op.dispatch(tokens_qt, topk_weights, scale, topk_ids)
+        do_, dw_, ds_, di_, drn_ = op.dispatch(disp_inp, topk_weights, disp_scale_in, topk_ids)
         out_ = do_fmoe(do_, dw_, ds_, di_, drn_)
         return op.combine(out_, topk_weights, topk_ids)
 
@@ -126,7 +135,7 @@ def worker(rankID, tokens_per_rank):
     def timed_iter():
         e = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         e[0].record()
-        do_, dw_, ds_, di_, drn_ = op.dispatch(tokens_qt, topk_weights, scale, topk_ids)
+        do_, dw_, ds_, di_, drn_ = op.dispatch(disp_inp, topk_weights, disp_scale_in, topk_ids)
         e[1].record()
         out_ = do_fmoe(do_, dw_, ds_, di_, drn_)
         e[2].record()
@@ -135,7 +144,7 @@ def worker(rankID, tokens_per_rank):
         torch.cuda.synchronize()
         return (e[0].elapsed_time(e[1]), e[1].elapsed_time(e[2]), e[2].elapsed_time(e[3]))
 
-    do, dw, ds, di, drn = op.dispatch(tokens_qt, topk_weights, scale, topk_ids)
+    do, dw, ds, di, drn = do_dispatch()
     recv = int(drn.item()) if hasattr(drn, "item") else int(drn)
     for _ in range(NWARM):
         timed_iter()
@@ -164,7 +173,7 @@ def run_point(tokens_per_rank):
     av = lambda j: sum(r[j] for r in rows)/len(rows)
     recv_mean = sum(r[1] for r in rows)/len(rows)
     print(f"\n### per-rank tokens={tokens_per_rank}  recv/rank≈{recv_mean:.0f}  "
-          f"(world={WORLD}, E={E_GLOBAL}, topk={TOPK}, {QUANT}) ###")
+          f"(world={WORLD}, E={E_GLOBAL}, topk={TOPK}, {QUANT}, dispatch={DISPATCH}) ###")
     print(f"{'stage':12} {'MAX us':>9} {'mean us':>9}   (MAX over ranks = the production denominator)")
     for nm, j in [("dispatch",2),("fmoe(local)",3),("combine",4),("REGION(d+f+c)",5)]:
         print(f"{nm:12} {mx(j):>9.2f} {av(j):>9.2f}")

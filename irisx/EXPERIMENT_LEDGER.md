@@ -583,8 +583,25 @@ grouped_b0). Needed MORI_GPU_ARCHS=gfx950 (container defaulted gfx942-first → 
 | 64   | 335  | 25.1 µs | 312.4 µs | 18.1 µs | **353 µs**  | 12% |
 | 256  | 1355 | 110.0 µs| 672.4 µs | 273.3 µs| **909 µs**  | 42% |
 | 1024 | 5410 | 234.6 µs| 1412.9 µs| 378.1 µs| **1991 µs** | 31% |
-MORI dispatch+combine confirm the C4 trace (24+18≈trace's 30.7+23.2). At DECODE the all-to-all is only
-~13% of the region (fmoe weight-wall ~90%); at large batch it grows to 31–42% (BW-bound movement).
+MORI dispatch+combine confirm the C4 trace (24+18≈trace's 30.7+23.2). [NOTE: this table is the
+fp8-PRE-dispatch variant — quant before dispatch, cheaper movement. See the C4-FAITHFUL table below.]
+
+### C4-FAITHFUL variant (DISPATCH=bf16 + per_1x128 + in-region quant) — the robust denominator (2026-06-29)
+Mirrors the C4 trace exactly: MORI moves **bf16** tokens (EpDispatchIntraNodeKernel_bf16), then
+`dynamic_quant` runs IN-region inside fused_moe (sort→quant→fmoe→sum), per_1x128. `DISPATCH=bf16` in
+`b3_ep8_unfused.py`. This is HEAVIER than the fp8-pre-dispatch variant and is the denominator to beat.
+
+| tok/rank | recv | dispatch (bf16 a2a) | fmoe (sort+quant+gemm) | combine | REGION | all-to-all % |
+|---|---|---|---|---|---|---|
+| 16  | 84   | 49.1 µs | 363.9 µs | 43.3 µs | **448 µs** | 21% |
+| 64  | 335  | 49.2 µs | 379.1 µs | 54.3 µs | **471 µs** | 22% |
+| 256 | 1355 | 111.1 µs| 596.0 µs | 153.6 µs| **825 µs** | 32% |
+bf16 dispatch is ~2× the fp8 variant's (49 vs 25 µs at decode — 2× the bytes), and the in-region quant
+lifts fmoe. So the true C4 decode denominator is ~448–471 µs and the all-to-all is ~21% (not 13%). The
+region is still fmoe/weight-wall-dominated (~80%). Caveat: still EAGER (graph mode would trim launch
+overhead) and pure-EP8/DP8 topology (the MoE EP region is EP8 in TP4/DP2 too, but per-rank token counts
+were swept, not matched to a captured C4 decode M_e). This is the most robust single-node baseline short
+of a Tier-3 in-server TPOT drop-in.
 
 ### FUSED b1_dispatch (np=8, SCHEDULE=b0, N=2048 = ONE projection, single consumer rank, NO combine)
 | TOTAL_M | M_e | T_gather | T_gemm | T_total | GEMM TFLOP/s | Mpacked | gather RMS |
