@@ -683,3 +683,30 @@ _status: PENDING_
 
 ## Phase H — ATOM integration (TPOT/TTFT/throughput)
 _status: PENDING_
+
+## *** MILESTONE: PREFILL PRODUCTION-GATE WIN — fused region 1.25x faster than unfused (2026-06-30, Rainier 8-physical MI355X) ***
+_status: ACHIEVED overnight by the auto-gpu-kernel /optimize agents, correctness-gated. First time the
+COMPLETE fused region beats the unfused production baseline._
+
+Rainier cluster, 8 PHYSICAL MI355X (DPX pin HIP_VISIBLE_DEVICES=0,2,4,6,8,10,12,14), TOTAL_M=8192 (prefill):
+
+| region | µs | vs b3 | gate |
+|---|---|---|---|
+| UNFUSED b3 (MORI dispatch + aiter full-FFN fmoe + MORI combine) | 3246 | 1.00x | — |
+| FUSED b1_dispatch FFN=full COMBINE=1 (gather+fc1+act+fc2+combine) | **2600** | **1.25x FASTER** | RMS 0.0183 PASS |
+
+HOW (all FUSION advantages the unfused serial-kernel chain structurally cannot match):
+- Fused g1u1 act+requant kernel replacing the unfused torch SiLU+quant: T_act 471 -> 127 -> 38.6us (exp8/9).
+- Free in-register dequant folded into the XGMI gather shadow: gather+dequant 321 -> 162us (exp7); the
+  serial gather->GEMM alone dropped 845 -> 633us = 1.32x.
+- Agent A's faster grouped_b0 GEMM.
+
+REMAINING LEVERS (for a bigger / all-regime win):
+- T_combine = 789us vs b3's MORI EpCombine 398us (2x SLOWER) — the IRIS per-element fp32 ctx.fetch_add
+  scatter is the #1 bottleneck; needs a staged/reduce-scatter combine (research-grade).
+- T_fc1 = 1001us (Agent A's GEMM, improving). T_fc2 = 493.
+- DECODE regime not yet won (weight-wall + BM=256 padding) — Agent A's BM=16 decode tile (exp_2) in progress.
+- Host-stream overlap conclusively DEAD (concurrent -12us); the win is FUSION, not stream-overlap. In-kernel
+  HipKittens warp-level overlap remains the deeper thesis target.
+Caveat: 8 DPX-half GPUs (clean for the relative fused-vs-unfused comparison). SPX full-GPU + the decode
+regime + the combine rewrite are the path to a larger, all-regime, production-faithful win.
