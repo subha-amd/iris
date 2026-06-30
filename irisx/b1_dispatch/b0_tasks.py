@@ -59,6 +59,45 @@ def build_b0_tasks(rows_per_expert, N, BM=B0_BM, BN=B0_BN):
             int(total))
 
 
+B0_DEC_BM = 16   # decode m-tile height (MFMA min M); keep in sync with kernel.cpp grouped_b0_gemm_decode
+
+
+def build_b0_tasks_decode(rows_per_expert, N, PAD=B0_BM, TILE=B0_DEC_BM, BN=B0_BN):
+    """DECODE task list: BM=16-tiled GEMM over the SAME 256-padded packed layout.
+
+    The packed buffer stays PAD=256-padded so expert_row_begin is 256-aligned and the phase-1 gather /
+    activation / combine / route metadata are UNCHANGED (same Mpacked as build_b0_tasks). Only the GEMM
+    tiles at TILE=16 rows: emit ceil(M_e/16) m-tiles per expert at the SAME 256-aligned begin[e]. The
+    kernel writes rows [begin[e]+mt*16, +16) -> real rows + <=15 zero-pad rows, all inside the expert's
+    256-region; the rest of the 256-region is never written (stays 0 -> skipped by combine).
+
+    Returns (tasks[num_tasks,4] int32, expert_row_begin[E] int32, padded_rows[E] int32, total int).
+    """
+    assert N % BN == 0, f"N={N} must be a multiple of B0 tile width {BN}"
+    E = len(rows_per_expert)
+    begin, padded, total = build_packed_layout(rows_per_expert, PAD)   # PAD=256 -> same layout as build_b0_tasks
+    n_n_tiles = N // BN
+
+    tasks = []
+    for e in range(E):
+        m_e = int(rows_per_expert[e])
+        if m_e <= 0:
+            continue
+        n_m_tiles = ceil_div(m_e, TILE)        # 16-row tiles (incl the tail tile, padded to zero)
+        for mt in range(n_m_tiles):
+            for nt in range(n_n_tiles):
+                tasks.append((e, mt, nt, begin[e]))
+
+    if len(tasks) == 0:
+        tasks_np = np.zeros((0, B0_TASK_W), dtype=np.int32)
+    else:
+        tasks_np = np.asarray(tasks, dtype=np.int32)
+    return (tasks_np,
+            np.asarray(begin, dtype=np.int32),
+            np.asarray(padded, dtype=np.int32),
+            int(total))
+
+
 def _selftest():
     """Pure-CPU self-test of the B0 task-list invariants (NO GPU)."""
     import build_tasks as bt

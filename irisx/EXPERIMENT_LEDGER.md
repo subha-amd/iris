@@ -763,3 +763,49 @@ correctness/schedule. A GEMM-level beat needs sub-16 M granularity (unavailable 
 => The DECODE REGION win does NOT need a GEMM beat: swapping b1_dispatch's BM=256 -> A's BM=16 fp8 kills the
 region's 98% padding (Mpacked 8192 -> ~500), a ~10x lever. Agent B is wiring it into b1_dispatch + gating vs
 b3 830us now (sched_barrier MUST be preserved in the port). A's kernel: grouped_b0.cu ~line 419, build GREEN.
+
+
+## *** DECODE REGIME: BM=16 padding fix integrated (Agent B, 2026-06-30, Rainier mi355x-dlc-pollara-4) ***
+_status: BM=16 decode GEMM wired into the b1_dispatch region (additive: same 256-padded packed layout,
+so phase1/act/combine UNCHANGED; only the GEMM tiles at 16 rows). Node config NOTE: this node exposes 8
+HIP logical devices (not the 16-logical DPX config the old "1974/3246" prefill numbers used), so absolute
+µs differ from prior runs; ALL b1 vs b3 numbers below are re-measured on THIS node so the RATIOS are
+internally consistent. Natural 8-GPU mapping (no 0,2,..,14 pin — that pin needs a 16-logical node)._
+
+DECODE (TOTAL_M=512 = 16 rows/expert × 32 experts, FFN=full COMBINE=1 pull, ROUTE=uniform):
+
+| variant | T_total | fc1 | act | fc2 | gather | combine | RMS | gate |
+|---|---|---|---|---|---|---|---|---|
+| b3 unfused (MORI disp + aiter fmoe + MORI comb), tok/rank=64 | **533** | fmoe 453 | — | — | disp 41 | comb 50 | — | (recv≈335/rank) |
+| b1 BM=256 (pre-fix) | 916 | 491 | 24 | 313 | 42 | 47 | 0.018 PASS | padding-killed |
+| b1 BM=16 bf16 (NEW, padding fix) | **874** | 478 | 25 | 282 | 42 | 46 | 0.018 PASS | correct |
+| b1 BM=16 fp8 (A's decode_fp8 port) | 850 | 430 | 23 | 308 | 45 | 45 | 0.073 FAIL | see below |
+
+VERDICT: **decode still LOSES (b1 BM=16 bf16 874µs vs b3 533µs = 1.64× slower).** The padding fix works
+and is correct (RMS preserved at 0.018, combine PASS) and shaves 916→874, but it CANNOT close the gap:
+- At uniform M_e=16 the BM=16 and BM=256 task lists emit the SAME 256 tasks (1 m-tile/expert either way),
+  so B-weight streaming is identical; BM=16 only removes the wasted A-row mma. The GEMM is WEIGHT-stream-
+  bound: fc1 478µs streams 1.88GB bf16 (≈3.9 TB/s), fc2 282µs streams 0.94GB (≈3.3 TB/s). The bf16
+  weight-byte FLOOR (2.82GB) is ≈564µs even at ~5TB/s peak → region floor ≈677µs > b3's 533. **bf16 cannot
+  win decode; only fp8 weights (half the bytes → GEMM floor ≈282µs → region ≈440) can.**
+- fp8 attempt (Agent A's grouped_expert_gemm_decode_fp8 ported verbatim incl. the sched_barrier): FAILS on
+  TWO axes. (a) CORRECTNESS RMS 0.073 > 0.05: A's kernel does unscaled fp8×fp8 + post-scale s_A[m]·s_B,
+  which needs a single per-ROW A scale — but our A is per-128-K-block; requanting per-block→per-row
+  COARSENS A (the 0.018 A-error grows). Per-N-row B quant didn't help (uniform data → e4m3 mantissa error
+  is scale-granularity-independent). FIX = in-loop per-128-K-block A scaling (BLOCK_K=128=QGROUP aligned).
+  (b) PERF: A's fp8 kernel runs ≈2.6 TB/s (LDS-staged, barrier-bound) vs the bf16 simple kernel's ≈4.25
+  TB/s, so it does NOT realize the weight-halving — fp8 region 850 ≈ bf16 874. ROOT CAUSE: HipKittens
+  EXPLICITLY forbids fp8 global→register load (`static_assert(...!=fp8e4m3,"Unsupported type for load")` in
+  cdna4/.../global_to_register.cuh), forcing the slow LDS-staged path; the saturating bf16 schedule can't
+  be reused for fp8.
+
+PATH TO THE DECODE WIN (identified, the kernel work remaining): a HBM-SATURATING fp8 BM=16 GEMM. The one
+viable HK-compatible trick: store B as fp8 bytes but LOAD them as a HALF-width bf16 tile via the saturating
+bf16 global→register path, then UNPACK fp8→bf16 in-register (per-N-row scale) and do bf16×bf16 mma — keeps
+A bf16/per-block (RMS≈0.018, no requant), halves B HBM. Win math: fc1 0.94GB@4.25TB/s≈221µs + fc2≈110µs =
+331 GEMM + gather 42 + act 25 + combine 46 ≈ **444µs < 533 = WIN ~17%** IF the in-register byte-unpack is
+fragment-layout-clean. [in progress / feasibility under investigation.]
+
+PREFILL (TOTAL_M=8192, re-measured on THIS node, no regression — DECODE=0 path untouched):
+b1 1259µs (RMS 0.018 PASS; fc1 964 TFLOP/s, fc2 763) vs b3 1941µs (tok/rank=1024) = **b1 WINS 1.54×**
+(b1 processes 8192 rows vs b3 recv≈5410 — more work, faster). Prefill remains the won regime.

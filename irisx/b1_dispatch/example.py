@@ -81,6 +81,15 @@ FFN          = os.environ.get("FFN", "single")
 COMBINE      = int(os.environ.get("COMBINE", "0"))
 COMBINE_ATOMIC = int(os.environ.get("COMBINE_ATOMIC", "1"))    # 1=fetch_add (accumulates), 0=store
 COMBINE_TLOCAL = int(os.environ.get("COMBINE_TLOCAL", "0"))    # >0 folds src_token (forces accumulate)
+COMBINE_MODE = os.environ.get("COMBINE_MODE", "scatter")       # scatter (fp32 atomic) | pull (bf16 gather-reduce)
+assert COMBINE_MODE in ("scatter", "pull"), f"bad COMBINE_MODE={COMBINE_MODE}"
+COMBINE_GRAN = int(os.environ.get("COMBINE_GRAN", "8"))        # pull store width: 1=bf16(2B) 2=bf16_2(4B) 8=uint4(16B); 8 best
+# DECODE=1: route the fc1/fc2 grouped GEMM through the BM=16 skinny-tile path (kills the BM=256 padding
+# tax at low M_e). Same 256-padded packed layout (build_b0_tasks_decode) so phase1/act/combine UNCHANGED.
+DECODE       = int(os.environ.get("DECODE", "0"))
+DECODE_FP8   = int(os.environ.get("DECODE_FP8", "0"))          # 1 = native-fp8 BM=16 decode (halves weight stream)
+if DECODE_FP8:
+    DECODE = 1                                                 # fp8 decode uses the BM=16 task layout
 assert FFN in ("single", "full"), f"bad FFN={FFN}"
 if FFN == "full":
     assert SCHEDULE == "b0", "FFN=full chains grouped_gemm_b0 twice -> requires SCHEDULE=b0"
@@ -122,8 +131,10 @@ assert Mpacked > 0 and num_tasks > 0, "empty route -- nothing to launch"
 # expert_row_begin as above — only the N-tile count differs per GEMM).
 if FFN == "full":
     import b0_tasks as B0T
-    tasks_fc1_np, erb_fc1, _, Mpacked_fc1 = B0T.build_b0_tasks(rows_per_expert, N_FC1)
-    tasks_fc2_np, erb_fc2, _, Mpacked_fc2 = B0T.build_b0_tasks(rows_per_expert, N_FC2)
+    # DECODE: BM=16-tiled task list (same 256-padded Mpacked/erb); else the BM=256 task list.
+    _build_ffn_tasks = B0T.build_b0_tasks_decode if DECODE else B0T.build_b0_tasks
+    tasks_fc1_np, erb_fc1, _, Mpacked_fc1 = _build_ffn_tasks(rows_per_expert, N_FC1)
+    tasks_fc2_np, erb_fc2, _, Mpacked_fc2 = _build_ffn_tasks(rows_per_expert, N_FC2)
     assert Mpacked_fc1 == Mpacked == Mpacked_fc2, "fc1/fc2 packed layout must match phase-1"
     num_tasks_fc1 = int(tasks_fc1_np.shape[0])
     num_tasks_fc2 = int(tasks_fc2_np.shape[0])
@@ -188,10 +199,57 @@ TILE = make_iris([Ntile, 4], "int32")
 #      so it must be allocated on EVERY rank in the SAME order (symmetric offsets). route_reverse is
 #      deterministic from segs (identical on every rank) so Tlocal agrees with no MPI. -------------
 H_COMB = N_FC2 if FFN == "full" else N           # combine width = last GEMM's N (production H=7168)
+
+def build_combine_pull(rev, world, interleave=True):
+    """PULL/gather-reduce CSR from route_reverse[Mpacked,3]=(src_rank,src_token,slot): group routed
+    packed rows by destination cell (src_rank,src_token). Built once on host (NOT timed) — it is the
+    transpose of the per-row reverse map, the same routing metadata MORI's EpCombine precomputes.
+    Returns cell_dst[num_cells,2]=(dst_rank,dst_token), cell_ptr[num_cells+1] CSR offsets,
+    cell_rows[total_routed]=packed-row idx, num_cells.
+    interleave=True ROUND-ROBINS cells across dst_rank so any window of consecutive blocks (which run
+    concurrently) spreads its remote stores over all `world` XGMI links — sorted-by-rank order hammers
+    one link at a time (measured ~2.4x slower per byte than the scatter's naturally-random dst order)."""
+    Mp = rev.shape[0]
+    groups = {}
+    for row in range(Mp):
+        sr = int(rev[row, 0]); tok = int(rev[row, 1])
+        if sr < 0 or tok < 0:
+            continue
+        groups.setdefault((sr, tok), []).append(row)
+    if interleave:
+        per_rank = [[] for _ in range(world)]
+        for (sr, tok) in sorted(groups.keys()):
+            per_rank[sr].append((sr, tok))
+        keys = []
+        idx = [0] * world
+        remaining = sum(len(p) for p in per_rank)
+        while remaining > 0:
+            for r in range(world):
+                if idx[r] < len(per_rank[r]):
+                    keys.append(per_rank[r][idx[r]]); idx[r] += 1; remaining -= 1
+    else:
+        keys = sorted(groups.keys())
+    nC = len(keys)
+    cell_dst = np.zeros((max(nC, 1), 2), dtype=np.int32)
+    cell_ptr = np.zeros((nC + 1,), dtype=np.int32)
+    rows_list = []
+    for i, (sr, tok) in enumerate(keys):
+        cell_dst[i, 0] = sr; cell_dst[i, 1] = tok
+        rws = groups[(sr, tok)]
+        rows_list.extend(rws)
+        cell_ptr[i + 1] = cell_ptr[i] + len(rws)
+    cell_rows = np.array(rows_list, dtype=np.int32) if rows_list else np.zeros((1,), dtype=np.int32)
+    return cell_dst, cell_ptr, cell_rows, nC
+
 if COMBINE:
     rev_np, wgt_np, Tlocal = RT.build_route_reverse(segs, Mpacked, world,
                                                     Tlocal=(COMBINE_TLOCAL or None))
-    ACC = make_iris([Tlocal, H_COMB], "float32")  # [Tlocal, H] fp32 accumulator (IRIS heap, all ranks)
+    if COMBINE_MODE == "pull":
+        cell_dst_np, cell_ptr_np, cell_rows_np, NUM_CELLS = build_combine_pull(
+            rev_np, world, interleave=bool(int(os.environ.get("COMBINE_INTERLEAVE", "1"))))
+        ACC = make_iris([Tlocal, H_COMB], "bfloat16")  # bf16 accumulator (pull reduces fp32, stores bf16)
+    else:
+        ACC = make_iris([Tlocal, H_COMB], "float32")  # [Tlocal, H] fp32 accumulator (IRIS heap, all ranks)
 
 # ---- LOCAL (non-heap) torch tensors: B (weights), C (output), TASKS ---------------------------
 B     = torch.zeros(E * N, K, dtype=torch.bfloat16, device='cuda')     # weights [E*N, K]
@@ -217,12 +275,35 @@ if FFN == "full":
     A2_sc = torch.zeros(Mpacked, K_FC2 // QGROUP, dtype=torch.float32, device='cuda')
     TASKS_fc1 = torch.from_numpy(tasks_fc1_np).to('cuda')
     TASKS_fc2 = torch.from_numpy(tasks_fc2_np).to('cuda')
+    if DECODE_FP8:
+        # native-fp8 decode: per-expert fp8 weights + scale, and a row->expert map (for scale_c).
+        def _quant_b_perrow(Bw, Ne):
+            # PER-N-ROW fp8: scale per output channel (per B-row n) = max|.|/448 over K. Finer than
+            # per-expert -> e4m3 error ~ the per-block A level. Factors out per output column in scale_c.
+            Bv = Bw.view(E, Ne, Bw.shape[1]).float()
+            sB = (Bv.abs().amax(dim=2) / 448.0).clamp(min=1e-12)                  # [E, Ne]
+            q  = (Bv / sB[:, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+            return q.reshape(E * Ne, Bw.shape[1]).contiguous(), sB.to(torch.float32).reshape(E, Ne).contiguous()
+        # allocated on all ranks; filled (quantized) only on the consumer after the bf16 B fill below.
+        B_fc1_fp8 = torch.zeros(E * N_FC1, K_FC1, dtype=torch.float8_e4m3fn, device='cuda')
+        B_fc2_fp8 = torch.zeros(E * N_FC2, K_FC2, dtype=torch.float8_e4m3fn, device='cuda')
+        sB_fc1 = torch.ones(E, N_FC1, dtype=torch.float32, device='cuda')
+        sB_fc2 = torch.ones(E, N_FC2, dtype=torch.float32, device='cuda')
+        # row_expert[Mpacked]: every packed row -> its expert (whole 256-padded region); -1 if none.
+        _rowe = np.full((Mpacked, 1), -1, dtype=np.int32)
+        for _e in range(E):
+            _rowe[int(expert_row_begin[_e]):int(expert_row_begin[_e]) + int(padded_rows[_e])] = _e
+        ROW_EXPERT = torch.from_numpy(_rowe).to('cuda')
 
 # COMBINE reverse map (LOCAL on the consumer — read locally by the combine kernel; acc is the only
 # combine buffer that must be on the IRIS heap). REV ints + WGT float mirror the route_reverse ABI.
 if COMBINE:
     REV = torch.zeros(Mpacked, 3, dtype=torch.int32, device='cuda')
     WGT = torch.zeros(Mpacked, 1, dtype=torch.float32, device='cuda')
+    if COMBINE_MODE == "pull":
+        CELL_DST  = torch.from_numpy(cell_dst_np).to('cuda')              # [num_cells,2] (dst_rank,dst_token)
+        CELL_PTR  = torch.from_numpy(cell_ptr_np.reshape(-1, 1)).to('cuda')   # [num_cells+1,1]
+        CELL_ROWS = torch.from_numpy(cell_rows_np.reshape(-1, 1)).to('cuda')  # [total_routed,1]
 
 # ---- each rank fills its OWN source activations; quantize like V4 (ep8 ref quantize_v1) -------
 gnp = np.random.default_rng(1000 + rank)
@@ -244,6 +325,9 @@ B.copy_(Bfull)
 if FFN == "full" and rank == CONSUMER:
     torch.manual_seed(778); B_fc1.copy_(torch.randn(E * N_FC1, K_FC1, dtype=torch.bfloat16, device='cuda') / 8.0)
     torch.manual_seed(779); B_fc2.copy_(torch.randn(E * N_FC2, K_FC2, dtype=torch.bfloat16, device='cuda') / 8.0)
+    if DECODE_FP8:
+        _q1, _s1 = _quant_b_perrow(B_fc1, N_FC1); B_fc1_fp8.copy_(_q1); sB_fc1.copy_(_s1)
+        _q2, _s2 = _quant_b_perrow(B_fc2, N_FC2); B_fc2_fp8.copy_(_q2); sB_fc2.copy_(_s2)
 
 if rank == CONSUMER:
     SEG.copy_(torch.from_numpy(seg_arr).cuda())
@@ -295,23 +379,42 @@ def silu_and_quant(C1_tensor):
     deq  = (q.float() * scale).view(h.shape[0], INTER)
     return q.view(h.shape[0], INTER), scale.view(h.shape[0], NG2), deq
 
+_gemm_b0 = (tk_kernel.grouped_gemm_b0_decode if DECODE else tk_kernel.grouped_gemm_b0)
+
 def phase_fc1():
     # fc1: packed A [Mpacked,7168] fp8 -> C1 [Mpacked,4096] bf16 (gate||up fused, g1u1).
-    tk_kernel.grouped_gemm_b0(A_pk_bf16, A_pk_sc, B_fc1, C1, TASKS_fc1, Mpacked, N_FC1, K_FC1, num_tasks_fc1)
+    if DECODE_FP8:
+        tk_kernel.grouped_gemm_b0_decode_fp8(A_pk_bf16, A_pk_sc, B_fc1_fp8.view(torch.bfloat16), sB_fc1,
+                                             C1, TASKS_fc1, ROW_EXPERT, Mpacked, N_FC1, K_FC1, num_tasks_fc1, E)
+    else:
+        _gemm_b0(A_pk_bf16, A_pk_sc, B_fc1, C1, TASKS_fc1, Mpacked, N_FC1, K_FC1, num_tasks_fc1)
 
 def phase_act_quant():
     # SiLU(gate)*up + fp8 re-quant of the intermediate -> A2 (fc2's fp8 input). The honest dynamic-quant.
-    q, sc, _ = silu_and_quant(C1)
-    A2_fp8.copy_(q); A2_sc.copy_(sc)
+    if int(os.environ.get("ACT_KERNEL", "1")):
+        # fused HipKittens kernel: one C1 read -> fp8 A2 + per-128 scale (replaces PyTorch eager).
+        tk_kernel.silu_quant(C1, A2_bf16, A2_sc, Mpacked, N_FC1, INTER)
+    else:
+        q, sc, _ = silu_and_quant(C1)
+        A2_fp8.copy_(q); A2_sc.copy_(sc)
 
 def phase_fc2():
     # fc2: packed A2 [Mpacked,2048] fp8 -> C2 [Mpacked,7168] bf16 (down projection).
-    tk_kernel.grouped_gemm_b0(A2_bf16, A2_sc, B_fc2, C2, TASKS_fc2, Mpacked, N_FC2, K_FC2, num_tasks_fc2)
+    if DECODE_FP8:
+        tk_kernel.grouped_gemm_b0_decode_fp8(A2_bf16, A2_sc, B_fc2_fp8.view(torch.bfloat16), sB_fc2,
+                                             C2, TASKS_fc2, ROW_EXPERT, Mpacked, N_FC2, K_FC2, num_tasks_fc2, E)
+    else:
+        _gemm_b0(A2_bf16, A2_sc, B_fc2, C2, TASKS_fc2, Mpacked, N_FC2, K_FC2, num_tasks_fc2)
 
 def phase_combine():
-    # EpCombine: scatter the fc2 output back to origin tokens over IRIS, weighted, accumulating top-k.
+    # EpCombine: combine the fc2 output back to origin tokens over IRIS, weighted, accumulating top-k.
     out = C2 if FFN == "full" else C
-    tk_kernel.combine_scatter(out, ACC, REV, WGT, iris_ctx, Mpacked, H_COMB, Tlocal, COMBINE_ATOMIC)
+    if COMBINE_MODE == "pull":
+        # PULL/gather-reduce: dst cells gather their <=k rows, reduce fp32, ONE bf16 remote store.
+        tk_kernel.combine_pull(out, ACC, WGT, CELL_DST, CELL_PTR, CELL_ROWS, iris_ctx,
+                               NUM_CELLS, H_COMB, Tlocal, COMBINE_GRAN)
+    else:
+        tk_kernel.combine_scatter(out, ACC, REV, WGT, iris_ctx, Mpacked, H_COMB, Tlocal, COMBINE_ATOMIC)
 
 # ---- CPU grouped reference (per-expert dequant(gathered A) @ B^T), incl zero-sentinel ----------
 def build_reference(with_gemm=True):
@@ -451,7 +554,7 @@ if rank == CONSUMER:
         n_collide = int((rev_np[:, 1] >= 0).sum()) - n_cells           # >0 means real accumulation tested
         comb_nonzero = bool(np.abs(acc_got).max() > 0.0)
         comb_ok = (comb_rms < 0.02 and comb_nonzero)
-        print(f"  [combine] dst_cells={n_cells} collisions(accumulated)={n_collide} "
+        print(f"  [combine] mode={COMBINE_MODE} dst_cells={n_cells} collisions(accumulated)={n_collide} "
               f"atomic={COMBINE_ATOMIC} Tlocal={Tlocal}", flush=True)
         print(f"  [combine] acc RMS_rel={comb_rms:.6f}  acc_nonzero={comb_nonzero}  "
               f"-> COMBINE {'PASSED' if comb_ok else 'FAILED'}", flush=True)
