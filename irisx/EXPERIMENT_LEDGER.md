@@ -742,3 +742,24 @@ direction (needs the GEMM rewrite).
 
 DECODE region still LOSES: fused 1515us vs b3 830us (BM=256 padding -> Mpacked 8192 at low M). Gated on
 Agent A's BM=16 decode GEMM (in progress). PREFILL is the won regime; once A's BM=16 lands, decode integrates.
+
+## DECODE GEMM (Agent A) — fp8 BM=16 grouped GEMM: correctness blocker SOLVED, at aiter PARITY (2026-06-30)
+A's `grouped_expert_gemm_decode_fp8` is now CORRECT (RMS 0.0037) + hang-free, at aiter PARITY:
+decode-tiny 49.1 vs aiter 49.7 (tie -1.4%); decode 171.3 vs 171.6 (tie -0.2%). A single HipKittens grouped
+GEMM matching aiter's FULL fused fp8 FFN efficiency.
+ROOT CAUSE of the multi-hour RMS=0.71 + >512-block "hang" (14 instrumented experiments): a COMPILER
+SCHEDULING HAZARD, not swizzle/barrier/layout (those were all red herrings, ruled out exp_5-10). The fp8
+shared->reg read (`load_st_to_rt` = inline `ds_read_b128`) is async (data lands per lgkmcnt), but the
+inline-asm `=v` output made the dest VGPRs look register-ready, so the compiler HOISTED the first `mma_ABt`
+above `s_waitcnt lgkmcnt(0)` -> first mma ran on not-yet-landed operands (output cols 0-15 garbage) while the
+second ran after they landed (cols 16-31 correct) = the stable RMS~0.71 (1/sqrt2). The same garbage read also
+computed OOB ds_read/store addresses -> infinite XNACK page-retry = the "hang". FIX (one line):
+`asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory"); __builtin_amdgcn_sched_barrier(0);` before the mma.
+WHY PARITY, not a beat: HBM-bound at ~190 padded TFLOP/s (~6.2 TB/s, a hard ceiling across single/double-buf,
+4-blocks/CU, BLOCK_K=256). real = padded x fill; BM=16 forces 25.8% fill at M_e~4 (16 = fp8 MFMA min M), so
+real caps near aiter; aiter processes exact rows with no 16-row min -> that padding is the STRUCTURAL gap, not
+correctness/schedule. A GEMM-level beat needs sub-16 M granularity (unavailable in fp8 MFMA) or pre-packing B
+(both larger changes). LDS double-buffer (exp_12) lifted decode 168->171 + small grids ~47%.
+=> The DECODE REGION win does NOT need a GEMM beat: swapping b1_dispatch's BM=256 -> A's BM=16 fp8 kills the
+region's 98% padding (Mpacked 8192 -> ~500), a ~10x lever. Agent B is wiring it into b1_dispatch + gating vs
+b3 830us now (sched_barrier MUST be preserved in the port). A's kernel: grouped_b0.cu ~line 419, build GREEN.
