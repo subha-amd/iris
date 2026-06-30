@@ -5,12 +5,14 @@
 
 A modern C++ take on RMA/RDMA operations using AMD ROCm HIP. This is the C++ version of [Iris](https://github.com/ROCm/iris), designed for high-performance distributed computing applications with simple, intuitive and modern APIs.
 
-> **Fork note — DeepSeek-R1 MoE expert-GEMM experiments.** This fork layers a HipKittens + IRIS
-> MoE expert-GEMM effort on top of the IRIS library. Map + current state: **`PROJECT_SUMMARY.md`**;
-> authoritative measurements: **`EXPERIMENT_LEDGER.md`**. Active kernel: **`grouped_b0/`** (a
-> B0-class 256×256 8-wave grouped GEMM — the "fix the tile + schedule" replacement for the slow
-> b1_dispatch phase-2 GEMM). Superseded experiments live under `archive/`; the GEMM bodies we build
-> on live under `reference/`. The sections below document the upstream IRIS library itself.
+> **Fork note — DeepSeek-R1 MoE expert region (HipKittens + IRIS).** This fork layers a fused MoE
+> expert-region effort on top of the IRIS library. **➜ START AT [`../MASTER_HANDOFF.md`](../MASTER_HANDOFF.md)**
+> — goal, results, cluster setup, and how to resume. The final, usable kernel is **`fused_moe/`** (prefill
+> **1.56×** over the unfused baseline; decode ~2–3% at matched fp8 precision); the unfused baseline is
+> **`baselines/`**; archived dev kernels + infra are in **`development/`**; authoritative measurements are in
+> **[`EXPERIMENT_LEDGER.md`](EXPERIMENT_LEDGER.md)**. The detailed notes below are **historical** (they predate
+> the 2026-06-30 reorg: `b1_dispatch/` → `fused_moe/`, `b2_production/` → `baselines/`, dev → `development/`);
+> the upstream IRIS library docs follow them.
 >
 > **Complete expert region (2026-06-29).** `b1_dispatch/` now runs the FULL MoE expert region, not
 > just gather + one projection: `FFN=full` chains `grouped_gemm_b0` twice — **fc1 g1u1** (N=4096,
