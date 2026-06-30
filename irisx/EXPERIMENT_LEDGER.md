@@ -945,3 +945,59 @@ the cache lives in container-local /app/aiter-test/aiter/jit (NOT the shared /ho
 COLD cache → 10+ min compile (637MB module_aiter_operator.so + per-shape moe ck2stages instances). irisx2
 (node B) already has module_moe_asm.so + ck2stages instances built, which is why b3=533 was obtainable there.
 Fix: run b3 on node B, or pre-warm node A's aiter cache before timing.
+
+## *** DECODE round 1: task-driven silu_quant kills the act padding tax — LATENCY WIN, RMS wall stands (2026-06-30, thor-4 / job 7002 / fresh irisx2) ***
+_status: COMMITTED. Same baseline node as the fair gate (thor-4). Fresh container irisx2 (aiter re-warmed,
+one b3 call). b3 AND b1 measured on THIS node. Decode region = FFN=full COMBINE=1 pull DECODE_FP8=1
+DECODE_SAT=1 TOTAL_M=512 ROUTE=uniform; b3 = DISPATCH=bf16 QUANT=per_1x128 TOKENS_PER_RANK=64._
+
+### b3 decode baseline on THIS node (the fair denominator)
+b3 sweep, MAX-over-ranks REGION (us): tok/rank=16 → 504.4 | **64 → 526.5 / 527.2 (2 runs, ~527)** | 256 → 815.5 | 1024 → 1934.3.
+So the decode denominator on thor-4 (this container) = **~527 us** (vs the 533 recorded at commit 53a454f — same node, ±node-warmth noise). aiter fmoe = `fmoe_bf16_blockscaleFp8_g1u1_vs_silu` (NOTE: aiter itself runs fp8 BLOCK-SCALE weights — same fp8 weight class as b1).
+
+### THE CHANGE (exp_13 action 1, the research-diagnosis #1): task-drive `silu_quant`
+`silu_quant_kernel` launched `<<<Mpacked=8192, 256>>>` — one block per packed row INCLUDING ~7680 zero
+padding rows (silu(0)·0 → fp8 zeros written to dead A2 rows fc2 never reads), ~94% wasted HBM traffic
+(~100 MB → only ~7 MB is real). Added `silu_quant_kernel_mtile`: ONE BLOCK PER REAL ROW (grid =
+n_mtiles·16), block→(m-tile, row-in-tile) via the BM=16 fc1 task list (mirrors `dequant_packed_mtile`).
+Dispatch task-drives when a task list + num_tasks>0 are supplied; prefill/non-decode pass num_tasks=0 →
+unchanged dense launch. First cut launched one block PER M-TILE (32 blocks looping 16 rows) → WORSE
+(34 us, occupancy-starved on 32 CUs); the fix is one block PER ROW (512 blocks) → full occupancy.
+
+### Decode region — thor-4, AFTER vs BEFORE (3 stable runs after)
+| stage (us) | BEFORE (dense silu) | AFTER (task-driven silu) |
+|---|---|---|
+| gather | 41.7 | 42.5 |
+| fc1 (N4096 K7168) | 274.7 (3.42 TB/s) | 273.4 (≈3.43 TB/s) |
+| **act (silu+requant)** | **24.9** | **7.2 (−17.7)** |
+| fc2 (N7168 K2048) | 148.4 (3.17 TB/s) | 147.6 (3.13 TB/s) |
+| combine | 46.3 | 46.5 |
+| **T_total** | **535.99** | **516.5 (median of 516.5/514.4/519.7)** |
+| RMS_rel | 0.056689 | **0.056689 (RMS-IDENTICAL — change is bit-neutral)** |
+
+VERDICT: **decode LATENCY now WINS — 516.5 us vs b3 527 us (~2% faster; vs the canonical 533 = ~3%).**
+RMS-neutral, no ABI/correctness change (combine acc RMS 0.00166 PASS, packed-A probe RMS 0.0). The act
+padding tax (research-diagnosis #1) is removed. This flips decode from the 53a454f PARITY/loss (537 vs 533)
+to a real latency win, WITHOUT touching the GEMM or precision.
+
+### PREFILL no-regression (THIS node, TOTAL_M=8192 DECODE=0 bf16 path)
+T_total = **1247.6 us, RMS 0.0183 PASS** (act 24.0 us = dense path, num_tasks=0 guard verified). Matches the
+prior 1240-1259 → **the 1.56x prefill win is intact.** (Prefill uses bf16 weights → no fp8-weight RMS.)
+
+### THE RMS WALL — now empirically nailed as fundamental (the honest verdict on a *clean* gated win)
+Decode RMS 0.0567 > 0.05 still FAILS. Root cause is ONLY the e4m3 fp8 WEIGHT quant on fc1+fc2 (the sat path
+already keeps A bf16/per-128-block, per-N-row B scale, intermediate requant identical in ref+device). PROOF
+on THIS node: the prefill path is the SAME region but with bf16 weights (DECODE=0) and scores RMS 0.0183;
+the decode path (fp8 weights) scores 0.0567 — the 0.018→0.057 jump is exactly the two fp8 weight matmuls.
+Why no fix without losing µs: e4m3 has 3 mantissa bits → ~3.6% relative per-weight error that is
+SCALE-INVARIANT for the (normal-range) randn/8 weights, so neither a finer per-128-K-block scale nor an
+MSE-optimal/percentile scale reduces it (block-scale helps only when blocks differ in magnitude — uniform
+here). The two matmuls √2-compound (amplified through SwiGLU) to ~0.057. The ONLY ways under 0.05:
+(a) bf16 on a matmul → fc2-bf16 ≈ +135 us in-region → region ≈ 650 us LOSS (the µs-vs-RMS tradeoff is hard);
+(b) an fp8-faithful reference (DeepSeek-R1 ships native fp8 block-scale, which is what aiter/b3 actually
+run) → RMS would collapse to ~0.005, but changing the reference to pass the gate = moving the goalpost, NOT
+done here. So against the CURRENT bf16-weight reference, a strict RMS<0.05 win is unreachable while keeping
+the latency win. HONEST STATE: **decode is a latency win at the inherent fp8-on-both precision floor (0.057),
+the same fp8 weight class the b3/aiter baseline runs; prefill's 1.56x (RMS 0.018 PASS) remains the clean
+all-regime headline.** Next levers (latency-only, do not change the RMS verdict): gap-2 layout compaction
+(PAD 256→16, projected fc1 274→~237 / fc2 147→~118) and the in-region 3.43→3.97 TB/s GEMM-rate gap.

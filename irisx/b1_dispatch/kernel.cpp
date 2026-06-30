@@ -667,11 +667,62 @@ __global__ void silu_quant_kernel(const bf16* __restrict__ c1,   // [Mpacked, N_
     }
 }
 
+// DECODE variant: task-driven silu+quant over ONLY the real BM=16 m-tiles (mirrors dequant_packed_mtile).
+// At low M_e (uniform decode) the dense <<<Mpacked,...>>> launch wastes ~94% of its blocks on zero
+// padding rows (silu(0)*0=0 written to dead A2 rows fc2 never reads). Here one block == one m-tile == 16
+// rows; only num_tasks/ntiles blocks run. The fully-padding rows are simply never written (fc2 reads only
+// these same m-tiles via TASKS_fc2). RMS-identical, ~16x fewer rows of HBM traffic at low M_e.
+// ONE BLOCK PER REAL ROW (grid = n_mtiles*16). block b -> m-tile (b/16), row-in-tile (b%16). Keeps the
+// dense per-row body + full CU occupancy, but only launches the ~512 real rows (vs 8192). Identical math.
+__global__ void silu_quant_kernel_mtile(const bf16* __restrict__ c1, fp8_t* __restrict__ a2,
+                                        float* __restrict__ a2_sc, const int* __restrict__ tasks,
+                                        int ntiles, int N_FC1, int INTER) {
+    const int mtile = blockIdx.x >> 4;        // / 16
+    const int rr    = blockIdx.x & 15;        // % 16
+    const int* tk   = tasks + (size_t)((size_t)mtile * ntiles) * B0_TASK_W;   // first task (nt=0) of this m-tile
+    const int row   = tk[B0_T_EROWBEG] + tk[B0_T_MTILE] * 16 + rr;
+    const int tid   = threadIdx.x;
+    const int NG2   = INTER / QGROUP;
+    extern __shared__ float sh[];             // [INTER] h-values  ++  [NG2] amax  ++  [NG2] scale
+    float* samax  = sh + INTER;
+    float* sscale = samax + NG2;
+    const int ELEMS = INTER / blockDim.x;
+    const int e0    = tid * ELEMS;
+    const bf16* gate_row = c1 + (size_t)row * N_FC1;
+    const bf16* up_row   = gate_row + INTER;
+    if (tid < NG2) samax[tid] = 0.0f;
+    float lamax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < ELEMS; j++) {
+        const int e  = e0 + j;
+        const float gv = (float)gate_row[e];
+        const float uv = (float)up_row[e];
+        const float hv = (gv / (1.0f + __expf(-gv))) * uv;   // silu(gate)*up
+        sh[e] = hv;
+        lamax = fmaxf(lamax, fabsf(hv));
+    }
+    __syncthreads();
+    atomicMax((int*)&samax[e0 >> 7], __float_as_int(lamax));
+    __syncthreads();
+    if (tid < NG2) {
+        const float scv = fmaxf(samax[tid] / 448.0f, 1e-12f);
+        sscale[tid] = scv;
+        a2_sc[(size_t)row * NG2 + tid] = scv;
+    }
+    __syncthreads();
+    fp8_t* orow = a2 + (size_t)row * INTER;
+    for (int e = tid; e < INTER; e += blockDim.x) {
+        const float qv = fminf(fmaxf(sh[e] / sscale[e >> 7], -448.0f), 448.0f);
+        orow[e] = __hip_cvt_float_to_fp8(qv, __HIP_SATFINITE, __HIP_E4M3);
+    }
+}
+
 struct silu_quant_globals {
     gl<bf16,  -1, -1, -1, -1> c1;     // [Mpacked, N_FC1] gate||up (fc1 output)
     gl<bf16,  -1, -1, -1, -1> a2;     // [Mpacked, INTER/2] bf16-view of packed fp8 output
     gl<float, -1, -1, -1, -1> a2_sc;  // [Mpacked, INTER/128] scales
-    int Mpacked, N_FC1, INTER;
+    gl<int,   -1, -1, -1, -1> tasks;  // [num_tasks, 4] BM=16 fc1 task list (decode path only)
+    int Mpacked, N_FC1, INTER, num_tasks;
     hipStream_t stream;
 };
 
@@ -681,7 +732,15 @@ void dispatch_silu_quant(silu_quant_globals g) {
     fp8_t*      a2   = reinterpret_cast<fp8_t*>(g.a2.raw_ptr);
     float*      a2sc = g.a2_sc.raw_ptr;
     const size_t shmem = (size_t)(g.INTER + 2 * (g.INTER / QGROUP)) * sizeof(float);
-    silu_quant_kernel<<<g.Mpacked, 256, shmem, g.stream>>>(c1, a2, a2sc, g.Mpacked, g.N_FC1, g.INTER);
+    // DECODE: task-drive over real BM=16 m-tiles when a valid task list is supplied (ntiles = N_FC1/256
+    // divides num_tasks, the (e,mt,nt) grouping). Else dense <<<Mpacked,...>>> (prefill / non-decode).
+    const int ntiles = (g.N_FC1 >= 256) ? (g.N_FC1 / 256) : 0;
+    if (g.tasks.raw_ptr != nullptr && g.num_tasks > 0 && ntiles > 0 && g.num_tasks % ntiles == 0) {
+        silu_quant_kernel_mtile<<<(g.num_tasks / ntiles) * 16, 256, shmem, g.stream>>>(
+            c1, a2, a2sc, g.tasks.raw_ptr, ntiles, g.N_FC1, g.INTER);
+    } else {
+        silu_quant_kernel<<<g.Mpacked, 256, shmem, g.stream>>>(c1, a2, a2sc, g.Mpacked, g.N_FC1, g.INTER);
+    }
 }
 
 using B0G = kittens::group<8>;
@@ -1670,8 +1729,10 @@ PYBIND11_MODULE(tk_kernel, m) {
         &silu_quant_globals::c1,
         &silu_quant_globals::a2,
         &silu_quant_globals::a2_sc,
+        &silu_quant_globals::tasks,
         &silu_quant_globals::Mpacked,
         &silu_quant_globals::N_FC1,
-        &silu_quant_globals::INTER
+        &silu_quant_globals::INTER,
+        &silu_quant_globals::num_tasks
     );
 }

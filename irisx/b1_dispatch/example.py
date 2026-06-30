@@ -393,7 +393,10 @@ def phase_act_quant():
     # SiLU(gate)*up + fp8 re-quant of the intermediate -> A2 (fc2's fp8 input). The honest dynamic-quant.
     if int(os.environ.get("ACT_KERNEL", "1")):
         # fused HipKittens kernel: one C1 read -> fp8 A2 + per-128 scale (replaces PyTorch eager).
-        tk_kernel.silu_quant(C1, A2_bf16, A2_sc, Mpacked, N_FC1, INTER)
+        # DECODE: task-drive over the real BM=16 m-tiles (num_tasks>0) so silu_quant skips the ~94% zero
+        # padding rows; non-decode passes num_tasks=0 to force the dense <<<Mpacked,...>>> launch.
+        _act_ntasks = num_tasks_fc1 if DECODE else 0
+        tk_kernel.silu_quant(C1, A2_bf16, A2_sc, TASKS_fc1, Mpacked, N_FC1, INTER, _act_ntasks)
     else:
         q, sc, _ = silu_and_quant(C1)
         A2_fp8.copy_(q); A2_sc.copy_(sc)
