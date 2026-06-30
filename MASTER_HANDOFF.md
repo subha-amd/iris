@@ -167,7 +167,7 @@ docker exec -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 -e MORI_GPU_ARCHS=gfx950 -e H
 
 ## 9. The optimizer — `auto-gpu-kernel` (how to drive iteration + spawn subagents)
 
-Located at **`/Users/subha/repos/auto-gpu-kernel/`** (a fork of Dogacel/auto-gpu-kernel — **committed locally only, NOT pushable**). It is a self-improving kernel-optimization harness. We retooled it for this project.
+Located at **`/Users/subha/repos/auto-gpu-kernel/`**, and **backed up to your private fork `github.com/subha-v/auto-gpu-kernel`** (git remote **`mine`**, branch `main`) — clone that to resume the optimizer. (It's a fork of Dogacel/auto-gpu-kernel; `origin` points at Dogacel and is read-only for you — **push to `mine`**, not `origin`.) It is a self-improving kernel-optimization harness we retooled for this project.
 
 ```
 auto-gpu-kernel/
