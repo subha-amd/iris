@@ -11,6 +11,16 @@ A modern C++ take on RMA/RDMA operations using AMD ROCm HIP. This is the C++ ver
 > B0-class 256×256 8-wave grouped GEMM — the "fix the tile + schedule" replacement for the slow
 > b1_dispatch phase-2 GEMM). Superseded experiments live under `archive/`; the GEMM bodies we build
 > on live under `reference/`. The sections below document the upstream IRIS library itself.
+>
+> **Benchmarking the fused MoE kernel fairly (C4 = TP4/DP2+EP).** The 714µs-vs-1255µs result in the
+> ledger compares mismatched regions at a prefill-like operating point. The fair-baseline toolkit:
+> **`BENCHMARKING_METHODOLOGY.md`** (region-not-kernels rule + the 3-tier baseline recipe + how
+> people benchmark multi-GPU fused-vs-unfused), **`b2_production/b2_unfused_region.py`** (Tier-2
+> replay harness: runs the exact stock aiter sort→quant→fmoe chain in sequence + the trace's
+> EpDispatch/EpCombine terms, sweeps `M_e`), **`b2_production/moe_cost_model.py`** (analytic
+> roofline — predicts the decode regime is comm/overhead-bound and the fusion ceiling), and
+> **`C4_RESULTS_DECK.html`** (mentor-facing deck of the C4 results + benchmarking plan). Prior
+> baseline analysis: `UNFUSED_FUSED_BASELINE_FINDINGS.md`.
 
 ## Overview
 

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>C4 EP Gather/Scatter — Results & Benchmarking Plan</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Arial,sans-serif;background:#eef0f3;margin:0;padding:28px;color:#1a1a1a;}
+  .slide{background:#fff;border:1px solid #d8d8de;border-radius:8px;max-width:1080px;margin:0 auto 26px;
+         padding:26px 32px;box-shadow:0 1px 4px rgba(0,0,0,.06);}
+  h1{font-size:23px;margin:0 0 2px;} h2{font-size:18px;margin:0 0 4px;} h3{font-size:14px;margin:18px 0 6px;color:#333;}
+  .sub{color:#666;font-size:13px;margin-bottom:16px;}
+  .tag{font-size:11px;padding:2px 8px;border-radius:10px;color:#fff;font-weight:600;}
+  .deck-num{float:right;color:#aaa;font-size:12px;font-weight:600;}
+  table{border-collapse:collapse;font-size:13.5px;width:100%;margin:6px 0;}
+  th,td{padding:7px 12px;text-align:left;border-bottom:1px solid #e6e6e6;}
+  th{background:#f4f4f6;border-bottom:2px solid #cfcfcf;}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;}
+  .collective{background:#ffe6e6;} .moe{background:#e6f0ff;} .gemm{background:#eef7e6;}
+  .attn{background:#fff4e0;} .quant{background:#f0e6ff;} .hot{font-weight:700;}
+  .t-disp{background:#2b6fd1;} .t-comb{background:#7a2bd1;} .t-gemm{background:#5a9e2b;}
+  .t-good{background:#1f9d57;} .t-warn{background:#d18a2b;} .t-bad{background:#d12b2b;}
+  .row{display:flex;align-items:stretch;height:48px;margin:10px 0;border:1px solid #ddd;border-radius:4px;overflow:hidden;}
+  .k{display:flex;flex-direction:column;justify-content:center;align-items:center;color:#111;font-size:10.5px;
+     line-height:1.15;text-align:center;padding:2px 4px;border-right:1px solid rgba(255,255,255,.6);box-sizing:border-box;}
+  .k b{font-size:10.5px;} .k span{font-size:9px;color:#333;}
+  .disp{background:#a9c9f5;} .sort{background:#b8ead6;} .qt{background:#d9c2f0;}
+  .mg{background:#bfe3a6;} .comb{background:#f3b6e0;} .rt{background:#cfe8ff;}
+  .note{background:#fff8e6;border:1px solid #f0d98a;border-radius:5px;padding:11px 15px;font-size:12.5px;margin-top:14px;}
+  .good{background:#e7f7ee;border:1px solid #9bd9b6;border-radius:5px;padding:11px 15px;font-size:12.5px;margin-top:14px;}
+  .bad{background:#fdecec;border:1px solid #f0a9a9;border-radius:5px;padding:11px 15px;font-size:12.5px;margin-top:14px;}
+  .stat{display:inline-block;background:#f4f4f6;border:1px solid #ddd;border-radius:5px;padding:6px 12px;margin:3px 8px 3px 0;font-size:12.5px;}
+  code{background:#f0f0f3;padding:1px 5px;border-radius:3px;font-size:12px;}
+  .legend{font-size:11px;margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;}
+  .chip{display:inline-block;width:12px;height:12px;border-radius:2px;vertical-align:middle;margin-right:4px;}
+  ul{margin:6px 0;padding-left:22px;} li{margin:3px 0;font-size:13.5px;}
+  .cap{color:#999;font-size:11px;margin-top:8px;}
+</style>
+</head>
+<body>
+
+<!-- SLIDE 1 — TITLE -->
+<div class="slide">
+  <span class="deck-num">1 / 8</span>
+  <h1>DeepSeek-R1 MoE — the EP gather/scatter path (C4) and how we'll prove a fused win</h1>
+  <div class="sub">8&times;MI355X &middot; <b>C4 = TP4 &times; DP2 + expert-parallel + DP-attention</b> &middot; MORI all2all (high-throughput) &middot;
+     FP8 KV &middot; decode-heavy. The setting Simran asked for: where the MoE expert gather/scatter shows up around the expert GEMM.</div>
+  <div class="stat"><b>14&ndash;16%</b> of GPU kernel time = MoE dispatch+combine</div>
+  <div class="stat">gather is <b>before</b> the expert GEMM &mdash; the fusion target</div>
+  <div class="stat">but at decode the GEMM is a <b>weight memory wall</b> (measured, slide 5)</div>
+  <div class="note"><b>One-line thesis (sharpened by measurement).</b> In C4 the old TP all_reduce is <i>replaced</i> by a
+    MoE all-to-all (EpDispatch &rarr; &hellip; &rarr; EpCombine). A device-side fused <b>gather&rarr;pack&rarr;quant</b> feeding a
+    HipKittens expert GEMM is the right kernel &mdash; but the on-device data shows its decode value is to <b>hide the
+    gather under the unavoidable expert-weight stream</b> (ceiling ~1.1&ndash;1.4&times;), not to beat a 1.76&times; that only
+    exists at prefill-size batches. Benchmark at the real decode M_e.</div>
+</div>
+
+<!-- SLIDE 2 — WHY C4 -->
+<div class="slide">
+  <span class="deck-num">2 / 8</span>
+  <h2>Why C4 (and not the earlier TP8 run)</h2>
+  <div class="sub">The MoE all-to-all only fires when <code>dp_size&gt;1</code> AND <code>--enable-expert-parallel</code> (ROCm MoE guide, Misconception&nbsp;#4). TP-only configs use all_reduce regardless of the EP flag.</div>
+  <table>
+    <tr><th>Config</th><th>Topology</th><th>MoE comm primitive</th><th>Gather present?</th></tr>
+    <tr><td>TP8+EP (first run)</td><td>tp8, dp1</td><td class="collective">all_reduce / reduce_scatter (28% of time)</td><td>NO (dp=1)</td></tr>
+    <tr class="hot"><td>C4 (target)</td><td>tp4, dp2, EP, dp-attn</td><td class="moe">EpDispatch / EpCombine (MoE all-to-all)</td><td>YES</td></tr>
+    <tr><td>C2 (control, to run)</td><td>tp4, dp2, EP <b>off</b></td><td>AllGather/ReduceScatter</td><td>NO &rarr; isolates gather to EP flag</td></tr>
+    <tr><td>C6 (cleanest, running)</td><td>dp8, EP, dp-attn</td><td class="moe">only the MoE all-to-all (no TP all_reduce noise)</td><td>YES</td></tr>
+  </table>
+  <div class="note"><b>Heads-up on local artifacts:</b> the perfetto trace + <code>data_export.json</code> + the two HTML
+    tables you have on disk are the <b>TP8 graph-mode</b> run (all_reduce story). Your only C4-specific local file is
+    <code>c4-highthroughput-query2</code> (the EpDispatch/EpCombine neighbor export). Don't mine the TP8 trace for the gather.</div>
+</div>
+
+<!-- SLIDE 3 — THE SEQUENCE -->
+<div class="slide">
+  <span class="deck-num">3 / 8</span>
+  <h2>Anatomy of one C4 decode MoE layer &mdash; the gather sits <i>before</i> the GEMM</h2>
+  <div class="sub">Reconstructed from the <code>c4-highthroughput-query2</code> neighbor analysis (prev2/prev/target/next/next2 around every EpDispatch &amp; EpCombine). Bar widths illustrative.</div>
+  <div class="row">
+    <div class="k rt" style="flex:4.4"><b>grouped_topk</b><span>router</span></div>
+    <div class="k disp" style="flex:30.7"><b>EpDispatch</b><span>GATHER &middot; 30.7&micro;s &middot; XGMI</span></div>
+    <div class="k sort" style="flex:9.6"><b>moe_sorting</b><span>P0 + P23</span></div>
+    <div class="k qt" style="flex:5"><b>dynamic_quant</b><span>bf16&rarr;fp8</span></div>
+    <div class="k mg" style="flex:28"><b>fmoe g1u1</b><span>expert GEMM (gate+up+SiLU+down)</span></div>
+    <div class="k comb" style="flex:23.2"><b>EpCombine</b><span>SCATTER &middot; 23.2&micro;s &middot; XGMI</span></div>
+  </div>
+  <div class="legend">
+    <span><span class="chip rt"></span>router</span>
+    <span><span class="chip disp"></span>EpDispatch (gather, cross-GPU)</span>
+    <span><span class="chip sort"></span>sort</span>
+    <span><span class="chip qt"></span>quant</span>
+    <span><span class="chip mg"></span>expert GEMM</span>
+    <span><span class="chip comb"></span>EpCombine (scatter, cross-GPU)</span>
+  </div>
+  <div class="good"><b>The fusion surface (Case&nbsp;1).</b> <code>EpDispatch + moe_sorting + dynamic_quant</code> = the
+    &ldquo;gather &rarr; pack &rarr; quant&rdquo; envelope feeding the GEMM. That whole envelope is what a device-side fused
+    gather kernel collapses into one pass that writes <b>directly</b> into expert-major fp8 tiles. (EpDispatch &amp;
+    EpCombine durations are the real C4 trace averages over 150 calls each.)</div>
+</div>
+
+<!-- SLIDE 4 — BREAKDOWN -->
+<div class="slide">
+  <span class="deck-num">4 / 8</span>
+  <h2>Where the GPU time goes in C4 (8 ranks aggregated, 317,472 ms total)</h2>
+  <table>
+    <tr><th>Category</th><th class="num">% GPU kernel time</th><th>note</th></tr>
+    <tr class="gemm"><td>dense_gemm (QKV/O proj, MLA up/down)</td><td class="num">29.25</td><td>non-MoE</td></tr>
+    <tr class="moe"><td>moe_expert_gemm (<code>fmoe_bf16_blockscaleFp8</code>)</td><td class="num">26.80</td><td>the expert GEMM</td></tr>
+    <tr class="quant"><td>quant</td><td class="num">12.55</td><td>partly fusable into gather</td></tr>
+    <tr class="moe hot"><td>EP_combine (scatter)</td><td class="num">8.05</td><td>EpCombine</td></tr>
+    <tr><td>o-proj / misc</td><td class="num">7.10</td><td></td></tr>
+    <tr class="attn"><td>attention_mla</td><td class="num">6.47</td><td></td></tr>
+    <tr class="moe hot"><td>EP_dispatch (gather)</td><td class="num">6.18</td><td>EpDispatch</td></tr>
+    <tr class="moe"><td>moe_router_sort</td><td class="num">3.61</td><td><code>grouped_topk</code> + <code>opus_moe_sorting</code></td></tr>
+  </table>
+  <div class="stat">gather + scatter = <b>14.23%</b> &rArr; remove-it ceiling = <b>1.166&times;</b> end-to-end</div>
+  <div class="stat">+ fusable pack/quant &rArr; <b>23.3%</b> envelope</div>
+  <div class="note">This is the <b>denominator framing</b>: 14&ndash;16% is the share of the whole model. The kernel-level
+    win is measured against the <i>MoE region</i> itself (slides 6&ndash;7), not divided into the whole-model 317&nbsp;s.</div>
+</div>
+
+<!-- SLIDE 5 — MEASURED + COST MODEL -->
+<div class="slide">
+  <span class="deck-num">5 / 8</span>
+  <h2>MEASURED on MI350: the decode MoE is a WEIGHT memory wall, not a gather wall</h2>
+  <div class="sub">Stock aiter sort+quant+fmoe+moe_sum, single GPU, swept over M_e (<code>b2_unfused_region.py</code>) + the two trace XGMI terms. Real R1 shapes, fp8 per_1x128.</div>
+  <table>
+    <tr><th>Operating point</th><th class="num">M_e</th><th class="num">T_local &micro;s</th><th class="num">+EpDisp+Comb</th><th class="num">T_region &micro;s</th><th>note</th></tr>
+    <tr class="hot"><td>DECODE (TOKEN 16)</td><td class="num">4</td><td class="num">237.8</td><td class="num">+53.9</td><td class="num">291.7</td><td>GEMM = <b>97%</b></td></tr>
+    <tr><td>DECODE (TOKEN 64)</td><td class="num">16</td><td class="num">275.2</td><td class="num">+53.9</td><td class="num">329.1</td><td>GEMM ~95%</td></tr>
+    <tr><td>mid (TOKEN 256)</td><td class="num">64</td><td class="num">514.8</td><td class="num">+53.9</td><td class="num">568.7</td><td></td></tr>
+    <tr class="gemm"><td>PREFILL (TOKEN 1024)</td><td class="num">256</td><td class="num">1362.8</td><td class="num">+53.9</td><td class="num">1416.7</td><td>= the ledger's 1.76&times; point</td></tr>
+  </table>
+  <div class="sub" style="margin:8px 0 4px;">Per-kernel @ decode (M_e=4): <code>moe_gemm fc1</code> 145&micro;s + <code>fc2</code> 85&micro;s = <b>230&micro;s GEMM</b> &middot; quant 9.9 &middot; sort 5.0. T_local barely moves 515&rarr;238&micro;s as M_e drops 64&rarr;4 &mdash; it hits a floor.</div>
+  <div class="bad"><b>Why the floor.</b> The expert GEMM streams all 32 local experts' <b>~1.4&nbsp;GB</b> of fp8 weights from
+    HBM <b>every decode step</b> (940&nbsp;MB fc1 + 469&nbsp;MB fc2 &rarr; ~176&micro;s at 8&nbsp;TB/s, measured 230&micro;s).
+    Token count barely matters. <b>Decode MoE is weight-bandwidth-bound.</b> The cost model
+    (<code>moe_cost_model.py</code>) now reproduces this: GEMM 86% of region at M_e=4, fusion ceiling <b>~1.1&ndash;1.4&times;</b>.</div>
+  <div class="good"><b>The actionable insight (revised by data).</b> The gather/dispatch+combine is real but only ~18% of
+    the decode region. A fused gather&rarr;pack&rarr;quant wins by <b>HIDING the gather+sort+quant+launch overhead under
+    the unavoidable weight stream</b> (expert-granular pipeline) &mdash; ceiling ~1.1&ndash;1.4&times; at decode, not 1.76&times;.
+    Bigger decode levers: shard weights across more EP ranks, fp4 weights, or larger batch (turns the GEMM compute-bound).</div>
+</div>
+
+<!-- SLIDE 6 — THE FAIRNESS PROBLEM -->
+<div class="slide">
+  <span class="deck-num">6 / 8</span>
+  <h2>Why the current 714&micro;s vs 1255&micro;s is not yet a fair baseline</h2>
+  <div class="sub">Both numbers are real and useful, but they measure <b>different regions at the wrong operating point</b>.</div>
+  <table>
+    <tr><th>Side</th><th>What it includes</th><th>What it MISSES</th><th class="num">&micro;s</th><th class="num">M_e</th></tr>
+    <tr class="collective"><td>production <code>aiter.fused_moe</code></td><td>sort + quant + fmoe + moe_sum</td><td>EpDispatch, EpCombine (the XGMI)</td><td class="num">1255</td><td class="num">~256</td></tr>
+    <tr class="moe"><td>b1_dispatch (b0)</td><td>XGMI gather + grouped GEMM</td><td>quant, sort, <b>and the combine entirely</b></td><td class="num">714</td><td class="num">~256</td></tr>
+  </table>
+  <div class="bad"><b>Three gaps to fix.</b>
+    (1) <b>Region mismatch</b> &mdash; production has sort+quant but no XGMI dispatch/combine; ours has XGMI gather but no
+    quant/sort and <b>no combine</b>. They overlap only partially.
+    (2) <b>Operating point</b> &mdash; both run at M_e&asymp;256 (prefill-like). Real decode is M_e&asymp;4, a 64&times; smaller
+    point where BM=256 padding alone wastes the GEMM 64&times;.
+    (3) <b>GEMM dtype</b> &mdash; production fmoe is native fp8; grouped_b0 is bf16-dequant (~2&times; slower MMA). The pipeline
+    win comes from <i>eliminating sort+quant</i>, not a faster matmul.</div>
+</div>
+
+<!-- SLIDE 7 — THE FAIR BASELINE -->
+<div class="slide">
+  <span class="deck-num">7 / 8</span>
+  <h2>The fair baseline &mdash; three tiers, no R1 re-download needed</h2>
+  <h3>Define the region by its I/O boundary, then measure BOTH sides over it</h3>
+  <div class="sub">ENTER: routed bf16 tokens, unsorted + top-k decision. EXIT: bf16 expert outputs, combined, in token order.</div>
+  <table>
+    <tr><th>Tier</th><th>Baseline = the unfused kernels</th><th>How it's measured</th><th>Effort</th></tr>
+    <tr><td><b>1. Trace-grounded</b></td><td>EpDispatch + sort + quant + fmoe + EpCombine</td><td>read per-kernel &micro;s straight off the C4 trace at its real M_e &mdash; <b>zero re-run</b></td><td>have it</td></tr>
+    <tr class="hot"><td><b>2. Replay harness</b></td><td>same chain, run on ONE GPU now</td><td><code>b2_unfused_region.py</code>: stock aiter sort+quant+fmoe in sequence (run_perftest) + the two XGMI terms from the trace; sweep M_e</td><td>runs today</td></tr>
+    <tr><td><b>3. In-framework drop-in</b></td><td>real TP4/DP2 vLLM MoE region</td><td>HIP-event timers at the MoE call boundary, <b>MAX over ranks</b>, end-to-end TPOT; swap impl, same workload</td><td>the gold standard</td></tr>
+  </table>
+  <div class="good"><b>How people actually benchmark fused-vs-unfused multi-GPU kernels</b> (the recipe Tier&nbsp;2/3 follow):
+    define the region by I/O not kernel-count &middot; capture realistic inputs (the trace M_e) &middot; baseline = stock ops in
+    sequence, device-event timed, warmup+median, clocks locked &middot; multi-GPU region time = <b>MAX over ranks</b> &middot;
+    correctness gate (RMS) before timing &middot; report at decode AND prefill &middot; cross-check the harness's per-kernel times
+    against the trace.</div>
+</div>
+
+<!-- SLIDE 8 — NEXT -->
+<div class="slide">
+  <span class="deck-num">8 / 8</span>
+  <h2>Next steps</h2>
+  <h3>Profiling still worth doing before the kernel design freezes</h3>
+  <ul>
+    <li><b>rocprof-compute (omniperf) on EpDispatch/EpCombine</b> &mdash; VGPR / LDS / occupancy / achieved BW. Tells you if the gather is BW-bound (fusable) or latency/occupancy-bound (needs a redesign). <i>Highest-value input for the kernel.</i></li>
+    <li><b>Per-layer/per-step M_e capture</b> (<code>abi/ROUTE_CAPTURE_SCHEMA.md</code>) &mdash; the real decode distribution to feed the harness. Without it you benchmark the wrong operating point.</li>
+    <li><b>C2 control</b> (EP off) &mdash; confirm EpDispatch/EpCombine disappear &rarr; proves the gather came from the EP flag, not just dp&gt;1.</li>
+    <li><b>All-rank trace</b> (not rank0) &mdash; needed for the MAX-over-ranks production denominator in Tier&nbsp;3.</li>
+  </ul>
+  <h3>Kernel line</h3>
+  <ul>
+    <li>Match M_e to decode and re-run the Level-2 head-to-head over the <b>full region</b> (add the combine to b1_dispatch first).</li>
+    <li>Pin the cost-model constants; use it to set the target (close the gap to the perfect-overlap floor).</li>
+    <li>Then optimize the gather itself: current ep8_gather &asymp;210&micro;s (at 8192 rows) vs production EpDispatch &asymp;30&micro;s (decode) &mdash; measure ours at the SAME decode M_e to see the true gap.</li>
+  </ul>
+  <div class="cap">Sources: C4 results writeup (2026-06-24), c4-highthroughput-query2 neighbor export, EXPERIMENT_LEDGER.md (b1_dispatch Level-2),
+    UNFUSED_FUSED_BASELINE_FINDINGS.md, abi/PRODUCTION_ABI.md. Numbers on slides 1&ndash;4 are measured; slide&nbsp;5 is the analytic model (constants un-pinned).</div>
+</div>
+
+</body>
+</html>

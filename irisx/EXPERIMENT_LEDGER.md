@@ -530,6 +530,46 @@ dequantization amortization in a single pass.
 
 NEXT: run with native-fp8 phase-2 GEMM to close the remaining gap vs production's native-fp8 fmoe.
 
+## FAIR unfused-region baseline — operating-point sweep + decode weight-wall (2026-06-29) *** REFRAMES THE WIN ***
+_status: RUN on cv350-rck-g03-f03-18 (10.0.0.228), container qilihuan-dsv4-dp8-ep-vllm0617, single GPU,
+EAGER, E=32 R1 shapes (K=7168, INTER=2048, fc1 N=4096 g1u1, topk=8), fp8 per_1x128. Harness
+`b2_production/b2_unfused_region.py` (stock aiter sort+quant+fmoe+moe_sum via run_perftest) + the C4
+trace cross-GPU terms (EpDispatch 30.7us + EpCombine 23.2us). Cost model `b2_production/moe_cost_model.py`._
+
+Built to fix the unfair 714-vs-1255 comparison (mismatched regions at a prefill-like M_e). Measures the
+SAME local unfused chain the C4 trace shows between EpDispatch and EpCombine, swept over M_e.
+
+| TOKEN | routed | M_e mean | M_e max | T_local us (sort+quant+fmoe+sum) | +EpDisp+EpComb | T_region us |
+|---|---|---|---|---|---|---|
+| 16   | 128  | 4   | 9   | 237.8  | +53.9 | 291.7 |
+| 64   | 512  | 16  | 26  | 275.2  | +53.9 | 329.1 |
+| 256  | 2048 | 64  | 78  | 514.8  | +53.9 | 568.7 |
+| 1024 | 8192 | 256 | 277 | 1362.8 | +53.9 | 1416.7 |
+
+Per-kernel @ DECODE (TOKEN=16, M_e=4) via torch.profiler self-GPU-time:
+- `ck::kernel_moe_gemm` fc1 (up/gate) = **145.3 us**, fc2 (down) = **85.4 us** → GEMM = 230.7 us
+- `dynamic_per_group_scaled_quant` = 9.9 us ; `MoeSorting` = 5.0 us ; moe_sum ~0.
+- => **GEMM = 230.7 / 237.8 = 97% of the local region at decode.** (At M_e=16 aiter switches to the
+  asm `fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256` = 262 us single kernel — same conclusion.)
+
+*** KEY FINDING — the decode MoE is WEIGHT-MEMORY-BOUND, not gather-bound. ***
+T_local barely drops 514→275→238 us as M_e falls 64→16→4: it hits a ~230 us FLOOR set by streaming all
+32 local experts' ~1.4 GB fp8 weights from HBM EVERY decode step (940 MB fc1 + 469 MB fc2; ~176 us at
+8 TB/s, measured 230 us ⇒ ~0.76 eff). The gather/dispatch+combine (53.9 us from the trace) is REAL but
+only ~18% of the region at decode. CONSEQUENCES:
+- The ledger's **1.76× (714 vs 1255) is a PREFILL-like M_e≈256 result** (this harness reproduces 1363 us
+  there, consistent with the 1255 b2_aiter number). It does NOT represent decode.
+- At decode the cost-model fusion CEILING is **~1.1–1.4×** (hide the 21–71 us gather+sort+quant envelope
+  under the unavoidable ~176 us weight stream), NOT 1.76×. A faster matmul buys ~nothing while weight-bound.
+- Real decode levers: hide the gather under the weight stream (expert-granular pipeline), shard weights
+  across more EP ranks, fp4 weights, or batch more tokens (turns the GEMM compute-bound at M_e≳256).
+
+CAVEATS (honesty): (1) EAGER — production decode is HIP-graph-captured, which removes launch overhead;
+these eager numbers OVERSTATE the local region vs the graph-mode trace. Re-run under hipgraph to reconcile.
+(2) The trace category shares are model-wide (the 12.55% "quant" includes attention quant, not just MoE
+dynamic_quant) — don't map them 1:1 to this MoE microbench. (3) cost-model constants (HBM/XGMI BW, fp8
+peak) still un-pinned; the measured weight floor now pins HBM-eff≈0.76 for the fmoe kernel.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
