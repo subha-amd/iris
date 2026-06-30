@@ -718,3 +718,27 @@ remaining lever; pull/gather-reduce instead of scatter-atomic) and (2) the in-ke
 (occupancy headroom 16 vs ~32-40 waves/CU — the purest comm/compute-overlap thesis push). DECODE regime still
 pending Agent A's BM=16 tile. [git push of auto-gpu-kernel itself is blocked — third-party repo; work is in
 local commits + experiments/ on the cluster + this ledger.]
+
+## *** COMBINE REWRITE WON -> 1.64x PREFILL (Agent B, 2026-06-30) — fused region now BEATS unfused incl. a combine that beats MORI ***
+The #1 remaining gap (combine) rewritten from a per-element fp32 ctx.fetch_add SCATTER into a PULL/
+gather-reduce: each destination cell gathers its <=top-k fc2-output rows, reduces in fp32 (NO atomics),
+one bf16 store to the origin rank.
+- **T_combine 788 -> 386us (2.04x) — BEATS the unfused MORI EpCombine (398us).**
+- **Full PREFILL fused region 2377 -> 1974us = 1.64x vs b3 unfused (3246us)** (up from 1.36x).
+Crux (non-obvious, from cheap probes): the combine is XGMI WRITE-BANDWIDTH-bound (not atomic-bound: atomic=0
+saved 4%; not transaction-bound: vectorizing was a wash) -> the lever is BYTES. bf16 output halves them
+(234->117MB) and the local fp32 reduce makes bf16 correct under top-k collisions (no bf16 atomic-add exists),
+so the pull is MORE general than the scatter. The decisive trick: ROUND-ROBIN the cell->block order across
+dst_rank so concurrent blocks span all 8 XGMI links (sorted-by-rank hammered one link = 934us WORSE than
+scatter; round-robin = 386us). Gated: RMS 0.00166, folded real-accumulation (dst=2048, 6144 collisions),
+zipf routes, reproduced 4x. Deployed default: COMBINE_MODE=pull GRAN=8 INTERLEAVE=1.
+
+IN-KERNEL gather-under-GEMM overlap (the deepest thesis push) — honestly documented INTRACTABLE on the fast
+b0 8-wave GEMM: it has no producer/consumer warp split + no A-reuse; the only existing in-kernel gather body
+(microtk) runs 35.8 vs b0's 466 TFLOP/s (13x slower, XGMI-stall-bound); needs Agent A's GEMM to expose a
+fusable async A-fill + A-reuse, not a bolt-on (exp_14). The won advantage is FUSION (act+dequant+combine,
+all structural things the unfused MORI+aiter chain cannot do); warp-level overlap is the open research
+direction (needs the GEMM rewrite).
+
+DECODE region still LOSES: fused 1515us vs b3 830us (BM=256 padding -> Mpacked 8192 at low M). Gated on
+Agent A's BM=16 decode GEMM (in progress). PREFILL is the won regime; once A's BM=16 lands, decode integrates.
