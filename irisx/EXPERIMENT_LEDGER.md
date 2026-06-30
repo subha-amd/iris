@@ -710,3 +710,11 @@ REMAINING LEVERS (for a bigger / all-regime win):
   HipKittens warp-level overlap remains the deeper thesis target.
 Caveat: 8 DPX-half GPUs (clean for the relative fused-vs-unfused comparison). SPX full-GPU + the decode
 regime + the combine rewrite are the path to a larger, all-regime, production-faithful win.
+
+### UPDATE (Agent B exp10/11): prefill fused region 2600 -> ~2380us = 1.36x vs b3 3246 (up from 1.25x).
+exp10 vectorized dequant preamble (T_fc1 1001->884, T_fc2 493->472); exp11 gather grid-decouple (211->147us).
+Agent B then PLATEAUED on tractable wins -> re-launched on (1) the COMBINE rewrite (789us vs MORI's 398 = #1
+remaining lever; pull/gather-reduce instead of scatter-atomic) and (2) the in-kernel gather-under-GEMM overlap
+(occupancy headroom 16 vs ~32-40 waves/CU — the purest comm/compute-overlap thesis push). DECODE regime still
+pending Agent A's BM=16 tile. [git push of auto-gpu-kernel itself is blocked — third-party repo; work is in
+local commits + experiments/ on the cluster + this ledger.]
