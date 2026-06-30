@@ -50,6 +50,7 @@
 #include <hip/hip_fp8.h>
 #include "ep8_gather.h"     // VERIFIED multi-source row resolver (Agent 03) — included, not edited.
 #include <cstdio>
+#include <cstdlib>
 using namespace kittens;
 
 // ep8_gather.h's namespace holds the VERIFIED resolver + the route_segment ABI. Pull the pieces we
@@ -578,6 +579,39 @@ __global__ void dequant_packed_dense(const fp8_t* __restrict__ a_fp8,
         uint4* o = reinterpret_cast<uint4*>(orow + h);
         o[0] = out.v[0];
         o[1] = out.v[1];
+    }
+}
+
+// dequant ONLY the rows the BM=16 task list actually reads (one block per unique m-tile = 16 rows). At
+// low M_e (uniform decode) the packed buffer is ~94% inter-expert padding the GEMM never touches; the
+// dense dequant above wastes that, so the sat decode uses this task-driven variant instead. The unique
+// m-tiles are tasks[0], tasks[ntiles], tasks[2*ntiles], ... (nt is the innermost task axis).
+__global__ void dequant_packed_mtile(const fp8_t* __restrict__ a_fp8, const float* __restrict__ a_sc,
+                                     bf16* __restrict__ a_bf16, const int* __restrict__ tasks,
+                                     int ntiles, int Kdim) {
+    const int* tk = tasks + (size_t)((size_t)blockIdx.x * ntiles) * B0_TASK_W;   // first task (nt=0) of this m-tile
+    const int row0 = tk[B0_T_EROWBEG] + tk[B0_T_MTILE] * 16;
+    const int NG = Kdim / QGROUP;
+    for (int rr = 0; rr < 16; rr++) {
+        const int row = row0 + rr;
+        const fp8_t* frow = a_fp8 + (size_t)row * Kdim;
+        const float* srow = a_sc  + (size_t)row * NG;
+        bf16* orow = a_bf16 + (size_t)row * Kdim;
+        for (int h = threadIdx.x * 16; h < Kdim; h += blockDim.x * 16) {
+            const uint4 raw = *reinterpret_cast<const uint4*>(frow + h);
+            const float scale = srow[h >> 7];
+            const fp8e4m3_4* fq = reinterpret_cast<const fp8e4m3_4*>(&raw);
+            union { uint4 v[2]; bf16_2 h2[8]; } out;
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                float4 f = kittens::base_types::convertor<float4, fp8e4m3_4>::convert(fq[g]);
+                out.h2[g * 2]     = kittens::base_types::convertor<bf16_2, float2>::convert(make_float2(f.x * scale, f.y * scale));
+                out.h2[g * 2 + 1] = kittens::base_types::convertor<bf16_2, float2>::convert(make_float2(f.z * scale, f.w * scale));
+            }
+            uint4* o = reinterpret_cast<uint4*>(orow + h);
+            o[0] = out.v[0];
+            o[1] = out.v[1];
+        }
     }
 }
 
@@ -1142,6 +1176,99 @@ __global__ void scale_c_decode(const bf16* __restrict__ c_raw, bf16* __restrict_
     c_out[idx] = (bf16)((float)c_raw[idx] * s);
 }
 
+// ================================================================================================
+// SATURATING fp8 BM=16 decode (the DECODE-WIN body). Store B as fp8 (HALF the HBM bytes) but PRE-SWIZZLE
+// offline so it loads through the FAST bf16 global->register path (a half-width rt_bf<32,64> raw byte
+// copy — HK forbids fp8 global->register, which forces the slow ~2.6 TB/s LDS-staged path otherwise),
+// then UNPACK fp8->bf16 in-register (per-N-row scale, in float pre-rounding) and bf16xbf16 mma. A stays
+// bf16 (block-scaled dequant — keeps RMS ~0.018, no per-row requant coarsening). The load reuses the
+// proven bf16 decode schedule (no LDS, no barriers) on HALF the B bytes => ~2x the weight-stream rate.
+//
+// Offline column permutation (per 128-K block, per N-row): B_hbm[n, blk*128+p] = B_fp8_true[n, blk*128+
+// PERM[p]]. Derived + lane-by-lane round-trip-verified (reconstructs identity for all 128 K cols). The
+// kernel's FIXED unpack ((i,j,d) loaded -> target I=i, J=2j+(d>>1), data[2*(d&1)+(b>>1)], sub b&1) is the
+// inverse of this permutation; the swizzle is applied ONCE on-device (pointer-cached) over the fp8 B.
+// ================================================================================================
+__constant__ int g_decsat_perm[128];
+static const int kDecSatPerm[128] = {
+    0,1,2,3,4,5,6,7, 32,33,34,35,36,37,38,39, 8,9,10,11,12,13,14,15, 40,41,42,43,44,45,46,47,
+    16,17,18,19,20,21,22,23, 48,49,50,51,52,53,54,55, 24,25,26,27,28,29,30,31, 56,57,58,59,60,61,62,63,
+    64,65,66,67,68,69,70,71, 96,97,98,99,100,101,102,103, 72,73,74,75,76,77,78,79, 104,105,106,107,108,109,110,111,
+    80,81,82,83,84,85,86,87, 112,113,114,115,116,117,118,119, 88,89,90,91,92,93,94,95, 120,121,122,123,124,125,126,127
+};
+
+// one fp8 row per block; permute each 128-K block into the HK bf16-load fragment order.
+__global__ void swizzle_b_fp8_blocks(const fp8_t* __restrict__ in, fp8_t* __restrict__ out, int rows, int Kdim) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const fp8_t* irow = in  + (size_t)r * Kdim;
+    fp8_t*       orow = out + (size_t)r * Kdim;
+    for (int idx = threadIdx.x; idx < Kdim; idx += blockDim.x) {
+        const int blk = idx >> 7;          // / 128
+        const int p   = idx & 127;
+        orow[(blk << 7) + p] = irow[(blk << 7) + g_decsat_perm[p]];
+    }
+}
+
+template <int NN, int KK>
+__global__ __launch_bounds__(512, 2)
+void grouped_b0_gemm_decode_fp8_sat(
+        const gl<bf16, -1, -1, -1, -1> A,    // [Mpacked, K]   bf16 activations (block-dequant)
+        const gl<bf16, -1, -1, -1, -1> Bpk,  // [E*N, K/2]     PRE-SWIZZLED fp8 weights reinterpreted as bf16
+        const gl<bf16, -1, -1, -1, -1> C,    // [Mpacked, N]   final scaled output
+        const float* __restrict__ sBn,       // [E*N]          per-output-channel fp8 scale (e-major)
+        const int* __restrict__ tasks, int num_tasks) {
+    constexpr int BM_DEC = 16, BN_DEC = 256, BLOCK_K = 128;
+    constexpr int WARPS_COL = 8;
+    constexpr int REG_BLOCK_N = BN_DEC / WARPS_COL;    // 32
+    constexpr int k_iters = KK / BLOCK_K;              // 56 for K=7168
+    using RT_A   = rt_bf<BM_DEC,      BLOCK_K,   row_l, rt_16x32_s>;   // 16x128 bf16 A
+    using RT_BPK = rt_bf<REG_BLOCK_N, BLOCK_K/2, row_l, rt_16x32_s>;  // 32x64  bf16 = 32x128 packed fp8
+    using RT_B   = rt_bf<REG_BLOCK_N, BLOCK_K,   row_l, rt_16x32_s>;  // 32x128 bf16 (unpacked B)
+    using RT_C   = rt_fl<BM_DEC, REG_BLOCK_N, col_l, rt_16x16_s>;     // 16x32 fp32 accumulator
+    RT_A a; RT_BPK bpk; RT_B b; RT_C c;
+
+    const int task = blockIdx.x;
+    if (task >= num_tasks) return;
+    const int* tk = tasks + (size_t)task * B0_TASK_W;
+    const int e = tk[B0_T_EXPERT], mt = tk[B0_T_MTILE], nt = tk[B0_T_NTILE], ERB = tk[B0_T_EROWBEG];
+    const int warp_n = warpid();
+
+    const int a_row16 = ERB / BM_DEC + mt;
+    const int b_row32 = (e * NN) / REG_BLOCK_N + nt * WARPS_COL + warp_n;
+    const int c_row16 = ERB / BM_DEC + mt;
+    const int c_col32 = nt * WARPS_COL + warp_n;
+
+    const int   r16 = kittens::laneid() % 16;
+    const int   n0  = e * NN + nt * BN_DEC + warp_n * REG_BLOCK_N;
+    const float scale_i[2] = { sBn[n0 + r16], sBn[n0 + 16 + r16] };   // per-N-row B scale (read once)
+
+    zero(c);
+    #pragma unroll 4
+    for (int k = 0; k < k_iters; k++) {
+        kittens::load<2>(a,   A,   {0, 0, a_row16, k});   // 16x128 bf16 A slab (broadcast)
+        kittens::load<2>(bpk, Bpk, {0, 0, b_row32, k});   // 32x64  bf16 = this warp's 32x128 fp8 strip
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const float sc = scale_i[i];
+            #pragma unroll
+            for (int j = 0; j < 2; j++) {
+                #pragma unroll
+                for (int d = 0; d < 4; d++) {
+                    const fp8e4m3_4& q = reinterpret_cast<const fp8e4m3_4&>(bpk.tiles[i][j].data[d]);
+                    float4 f = base_types::convertor<float4, fp8e4m3_4>::convert(q);
+                    const int J  = 2 * j + (d >> 1);
+                    const int Dp = 2 * (d & 1);
+                    b.tiles[i][J].data[Dp]     = base_types::convertor<bf16_2, float2>::convert(make_float2(f.x * sc, f.y * sc));
+                    b.tiles[i][J].data[Dp + 1] = base_types::convertor<bf16_2, float2>::convert(make_float2(f.z * sc, f.w * sc));
+                }
+            }
+        }
+        mma_ABt(c, a, b, c);
+    }
+    store(C, c, {0, 0, c_row16, c_col32});
+}
+
 struct b0_dec_fp8_globals {
     gl<bf16,  -1, -1, -1, -1> a;       // [Mpacked, K/2] packed fp8-as-bf16 A (per-128-block sc)
     gl<float, -1, -1, -1, -1> sc;      // [Mpacked, K/128] A per-block scales
@@ -1154,8 +1281,61 @@ struct b0_dec_fp8_globals {
     hipStream_t stream;
 };
 
+// SATURATING decode-fp8 pipeline (the WIN body): (1) dequant packed fp8 A -> bf16 (block-scaled, no
+// per-row requant), (2) pointer-cached on-device pre-swizzle of the fp8 B into HK bf16-load order,
+// (3) the saturating bf16-load-unpack GEMM with the per-N-row sB folded in -> FINAL C. No scale_c.
+static void dispatch_grouped_gemm_b0_decode_fp8_sat_impl(b0_dec_fp8_globals g) {
+    // one-time: upload the column permutation to constant memory.
+    static bool perm_done = false;
+    if (!perm_done) { hipMemcpyToSymbol(HIP_SYMBOL(g_decsat_perm), kDecSatPerm, sizeof(kDecSatPerm)); perm_done = true; }
+
+    // 1. dequant A (packed fp8 + per-128-block scale) -> bf16 true values.
+    static bf16* d_a_bf16 = nullptr; static size_t cap_a = 0;
+    const size_t need_a = (size_t)g.Mpacked * g.K;
+    if (need_a > cap_a) { if (d_a_bf16) hipFree(d_a_bf16); hipMalloc(&d_a_bf16, need_a * sizeof(bf16)); cap_a = need_a; }
+    const fp8_t* a_fp8 = reinterpret_cast<const fp8_t*>(g.a.raw_ptr);
+    // dequant ONLY the rows the BM=16 GEMM reads (one block per unique m-tile) — avoids the ~94% padding-
+    // row waste of a dense dequant over all Mpacked at low M_e (uniform decode). Falls back to dense if the
+    // task list isn't the expected (e,mt,nt) grouping.
+    const int ntiles = (g.N >= 256) ? (g.N / 256) : 1;
+    if (ntiles > 0 && g.num_tasks % ntiles == 0)
+        dequant_packed_mtile<<<g.num_tasks / ntiles, 256, 0, g.stream>>>(a_fp8, g.sc.raw_ptr, d_a_bf16, g.tasks.raw_ptr, ntiles, g.K);
+    else
+        dequant_packed_dense<<<g.Mpacked, 256, 0, g.stream>>>(a_fp8, g.sc.raw_ptr, d_a_bf16, g.Mpacked, g.K);
+    gl<bf16, -1, -1, -1, -1> Abf(d_a_bf16, 1, 1, g.Mpacked, g.K);
+
+    // 2. pre-swizzle B once per distinct (pointer,size) — a 4-slot associative cache (fc1 + fc2 + spare).
+    struct SwzSlot { const void* key; fp8_t* buf; size_t cap; };
+    static SwzSlot slots[4] = {{nullptr,nullptr,0},{nullptr,nullptr,0},{nullptr,nullptr,0},{nullptr,nullptr,0}};
+    const void* bkey = g.b.raw_ptr;
+    const size_t b_bytes = (size_t)g.E * g.N * g.K;     // fp8 bytes ([E*N, K])
+    SwzSlot* slot = nullptr;
+    for (auto& s : slots) if (s.key == bkey && s.cap >= b_bytes) { slot = &s; break; }
+    if (!slot) {
+        // pick a free/smallest slot to (re)use
+        slot = &slots[0]; for (auto& s : slots) if (s.key == nullptr) { slot = &s; break; }
+        if (slot->cap < b_bytes) { if (slot->buf) hipFree(slot->buf); hipMalloc(&slot->buf, b_bytes); slot->cap = b_bytes; }
+        const fp8_t* b_in = reinterpret_cast<const fp8_t*>(g.b.raw_ptr);
+        swizzle_b_fp8_blocks<<<g.E * g.N, 256, 0, g.stream>>>(b_in, slot->buf, g.E * g.N, g.K);
+        slot->key = bkey;
+    }
+    gl<bf16, -1, -1, -1, -1> Bpk((bf16*)slot->buf, 1, 1, g.E * g.N, g.K / 2);
+
+    // 3. saturating GEMM -> final scaled C.
+    gl<bf16, -1, -1, -1, -1> Cfin(g.c.raw_ptr, 1, 1, g.Mpacked, g.N);
+    const float* sBn = g.sB.raw_ptr;
+    const int* tasks = g.tasks.raw_ptr;
+    const int threads = 8 * 64;
+    if      (g.N == 2048 && g.K == 7168) grouped_b0_gemm_decode_fp8_sat<2048, 7168><<<g.num_tasks, threads, 0, g.stream>>>(Abf, Bpk, Cfin, sBn, tasks, g.num_tasks);
+    else if (g.N == 4096 && g.K == 7168) grouped_b0_gemm_decode_fp8_sat<4096, 7168><<<g.num_tasks, threads, 0, g.stream>>>(Abf, Bpk, Cfin, sBn, tasks, g.num_tasks);
+    else if (g.N == 7168 && g.K == 2048) grouped_b0_gemm_decode_fp8_sat<7168, 2048><<<g.num_tasks, threads, 0, g.stream>>>(Abf, Bpk, Cfin, sBn, tasks, g.num_tasks);
+    else { printf("grouped_gemm_b0_decode_fp8_sat: unsupported (N=%d,K=%d)\n", g.N, g.K); return; }
+}
+
 void dispatch_grouped_gemm_b0_decode_fp8(b0_dec_fp8_globals g) {
     if (g.num_tasks <= 0) return;
+    static const int use_sat = (std::getenv("DECODE_SAT") ? atoi(std::getenv("DECODE_SAT")) : 1);
+    if (use_sat) { dispatch_grouped_gemm_b0_decode_fp8_sat_impl(g); return; }   // DECODE_SAT=0 -> old LDS path
     static fp8_t* d_a2 = nullptr; static float* d_sA = nullptr; static bf16* d_craw = nullptr;
     static size_t cap_a = 0, cap_c = 0, cap_m = 0;
     const size_t need_a = (size_t)g.Mpacked * g.K, need_c = (size_t)g.Mpacked * g.N, need_m = (size_t)g.Mpacked;

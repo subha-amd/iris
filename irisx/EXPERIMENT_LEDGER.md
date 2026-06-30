@@ -871,3 +871,40 @@ expert weights across the 50-iter timing loop, not realizable as pure HBM stream
 already measured it at ~2.6 TB/s, RMS 0.073 FAIL). The saturating path is the one that actually realizes
 the fp8 weight-halving on real HBM and keeps A bf16/per-block. [VERIFIED standalone; resource numbers from
 -Rpass-analysis; RMS < 0.05 vs TRUE unquantized B = region-equivalent error.]
+
+## DECODE REGION GATE — run on node A (mi355x-dlc-pollara-3), 2026-06-30 ~17:25 UTC — INTEGRATED sat fp8, but NODE IS ~1.8x SLOW → INCONCLUSIVE/LOSS-on-this-node
+
+The saturating fp8 BM=16 kernel (`grouped_b0_gemm_decode_fp8_sat`) is now INTEGRATED into the
+b1_dispatch module (tk_kernel.so built 14:49) and gated by `DECODE_SAT` (default on) inside
+`dispatch_grouped_gemm_b0_decode_fp8`. example.py reaches it via DECODE_FP8=1. Measured in-region.
+
+### Measured DECODE region (FFN=full COMBINE=1 pull, TOTAL_M=512 = 16 rows/expert x 32, ROUTE=uniform, DECODE_FP8=1 DECODE_SAT=1)
+3 stable runs (ITERS=50 WARMUP=10): T_total = 927.15 / 912.90 / 930.17 us (median ~927 us).
+Per-stage (us): gather 56 | fc1 502 (59.8 TFLOP/s) | act 41 | fc2 ~263 (57 TFLOP/s) | combine 60.
+RMS_rel = 0.05705 (FFN FAILED, tol 0.05; combine acc RMS 0.00166 PASS). Mpacked still 8192.
+In-region fc1 fp8 weight stream = 0.94 GB / 502 us = **1.87 TB/s** (vs 3.97 TB/s standalone on node B).
+
+### THE NODE IS RUNNING AT ~HALF THROUGHPUT vs the baseline node (this invalidates a direct vs-533 verdict)
+PREFILL re-run on THIS node (TOTAL_M=8192, DECODE=0 bf16, same path that gave 1259 us in the prior
+ledger entry): T_total = **2198 us** (RMS 0.01826 PASS), gather 257 | fc1 915 (525 TFLOP/s) |
+act 39 | fc2 462 (520 TFLOP/s) | combine 524. Every stage is ~1.8x the prior-node numbers
+(prior: 1259 total, fc1 964 TFLOP/s, fc2 763, gather 141, combine 280). Uniform ~1.8x slowdown =>
+this node (pollara-3) delivers ~half the HBM bandwidth/clocks of the node where b3=533 and the
+1259 prefill were established. CONSEQUENCE: my 920 us decode CANNOT be compared to the 533 us b3
+baseline (different hardware perf state).
+
+### b3 same-node denominator: NOT obtained
+b3_ep8_unfused.py (DISPATCH=bf16 TOKENS_PER_RANK=64) was launched twice; aiter fused_moe first-call
+JIT exceeded ~10 min each time and produced no region number inside the (tight, ~18:08 UTC) window.
+Without a same-node b3 the win/loss gate is INCONCLUSIVE on node A.
+
+### Honest status
+- The sat kernel IS integrated and runs correctly-ish (combine PASS) but the FFN region RMS 0.057 is
+  ABOVE the 0.05 tol (fp8 weights on BOTH fc1 and fc2 + fp8 intermediate requant) => FFN FAILED.
+- In-region the sat GEMM realizes only ~1.87 TB/s (fc1), ~half its 3.97 TB/s standalone (node B) —
+  the projected ~468 us region win did not materialize here. Part of this is the node being ~1.8x
+  slow; even after de-rating, the in-region fp8 path is not clearly beating the bf16 BM=16 path on
+  this node, and Mpacked is still 8192 (the BM=256 padding tax was NOT removed by DECODE_FP8=1).
+- VERDICT on node A as measured: decode 920 us vs the (faster-node) b3 533 us = nominal 1.73x LOSS,
+  but NOT a fair comparison. A fair same-node gate requires re-measuring b3 here (aiter JIT permitting)
+  or re-running both on the faster baseline node.
