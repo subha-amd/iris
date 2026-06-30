@@ -83,3 +83,33 @@ TFLOP/s **well above micro_tk's ~69**, approaching B0's ~183.
   grouped_b0 (phase-2) vs the current micro_tk phase-2, identical packed buffer.
 - **Native-FP8 grouped GEMM** (separate track): removes the dequant-to-bf16 2× MMA-rate penalty vs
   AITER fmoe.
+
+---
+
+## Update 2026-06-30 — built, run, and verified on-device (8×/single MI350, gfx950)
+
+The kernels below are now **built + correctness-verified + timed** on node B (mi355x-thor-4). The
+"NOT yet built" status above is superseded.
+
+### Decode (BM=16) GEMM family added to `grouped_b0.cu`
+- `grouped_expert_gemm_decode` — bf16 BM=16 skinny decode tile (kills the BM=256 padding tax at low
+  M_e). Decode case (E32, 512 real rows): **0.487 ms / 5.43 TB/s** B-stream.
+- `grouped_expert_gemm_decode_fp8` — **LDS-staged NATIVE-fp8 MMA** (exp_12 double-buffer, the only
+  HK-legal fp8 global path: `buffer_load_lds` → `ds_read_b128` → fp8×fp8 mma). Same decode case:
+  **0.176 ms / 171 TFLOP/s ≈ aiter's 171.6**, RMS 0.0037. VGPR 60, occ 4. (Its effective B-stream
+  exceeds the physical HBM ceiling → it benefits from L2 reuse of hot expert weights.)
+- `grouped_expert_gemm_fp8` + `scale_c` — native-fp8 256×256 path (prefill).
+
+### `sat_decode.cu` — SATURATING fp8 decode GEMM (new file)
+Stores B fp8 (half the bytes) but PRE-SWIZZLES it offline (`PERM128`, round-trip verified) so it loads
+through the fast half-width bf16 global→register path (no LDS, no barriers), unpacks fp8→bf16 in-register
+with a per-128-K-block scale, then bf16×bf16 mma. **No LDS, no spill, VGPR 91, occ 5.** Decode case:
+**0.333 ms / 3.97 TB/s, 1.46× over bf16**, RMS 0.0037 PASS. This is the conservative real-HBM floor
+(no cache assumption); the ~27% gap to the bf16 ceiling is in-register unpack throughput.
+
+Run: `SAT_VS_BF16=1 ./sat_decode` (carries its own bf16-ref head-to-head on the identical task list).
+
+### Honest verdict (see `EXPERIMENT_LEDGER.md`)
+Both fp8 decode kernels are genuine wins over bf16, but neither flips the verified COMPLETE-region
+result (fused b1 is 2.7–2.8× slower than MORI+aiter): the GEMM is one of three lagging components and
+aiter fuses the whole fc1+SiLU+fc2 FFN into one kernel. The fp8 GEMM is necessary but not sufficient.

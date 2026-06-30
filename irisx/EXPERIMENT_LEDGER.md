@@ -831,3 +831,43 @@ the region will consume it unchanged. Until then the gated, CORRECT decode defau
 PREFILL (TOTAL_M=8192, re-measured on THIS node, no regression — DECODE=0 path untouched):
 b1 1259µs (RMS 0.018 PASS; fc1 964 TFLOP/s, fc2 763) vs b3 1941µs (tok/rank=1024) = **b1 WINS 1.54×**
 (b1 processes 8192 rows vs b3 recv≈5410 — more work, faster). Prefill remains the won regime.
+
+## DECODE GEMM (Agent A) — SATURATING fp8 BM=16 kernel BUILT + VERIFIED standalone (2026-06-30, node B mi355x-thor-4)
+_status: the inner GEMM body that Agent B's 7e1cb9d6 handoff requested ("replace grouped_b0_gemm_decode_fp8's
+LDS-staged body with the saturating pre-swizzled bf16-load-unpack body") is now written, built, and
+correctness+perf verified standalone in irisx/grouped_b0/sat_decode.cu. Integration into b1_dispatch next._
+
+`grouped_expert_gemm_decode_fp8_sat` (sat_decode.cu): stores B fp8 (half the HBM bytes), PRE-SWIZZLED
+offline (PERM128, round-trip verified) so it loads through the fast half-width bf16 global→register path
+(NO LDS, NO barriers — the proven saturating buffer_load schedule), unpacks fp8→bf16 in-register with a
+per-128-K-block scale (float, pre-rounding), then bf16×bf16 mma. A stays bf16/per-128-block (so the
+region's per-row A requant — the RMS 0.073 killer — is DROPPED, RMS returns to ~0.018). Resources:
+**VGPR 91, occ 5, no LDS, no spill** (the per-K-block VGPR worry is moot — occupancy is already high).
+
+### Measured (single MI350, N=4096 K=7168; sat run carries its own bf16-ref on the identical task list)
+| case (E32) | real / Mpacked / waste | sat fp8 (bf16-mma) | bf16-ref | sat RMS |
+|---|---|---|---|---|
+| decode-ragged | 293 / 528 / 44.5% | 0.324 ms · 2.99 TB/s · **1.53× vs bf16** | 0.494 ms · 3.92 TB/s | 0.00369 PASS |
+| decode-tiny | 128 / 496 / 74.2% | 0.242 ms · 3.76 TB/s · **1.44×** | 0.349 ms · 5.21 TB/s | — |
+| decode | 512 / 720 / 28.9% | 0.333 ms · **3.97 TB/s** · **1.46×** | 0.487 ms · 5.43 TB/s | — |
+
+The sat kernel hits ~73% of the bf16 HBM ceiling; the missing ~27% is the in-register fp8→bf16 unpack
+throughput (NOT VGPR/occupancy). 3.97 TB/s is a believable real-HBM number (no cache assumption).
+
+### Decode-REGION win projection at the MEASURED 3.97 TB/s (vs b3 unfused decode 533 µs)
+fc1 0.94 GB fp8 / 3.97 = ~237 µs + fc2 0.47 GB / 3.97 = ~118 µs = **~355 µs GEMM** + gather 42 + act 25 +
+combine 46 ≈ **~468 µs < 533 = DECODE WIN ~12%**. (Agent B's ideal-4.25-TB/s projection was 444 µs/~17%;
+at the real 3.97 it is ~468 µs/~12% — still a win, and the GEMM is the only remaining gated piece.)
+=> with prefill already won (1.54–1.64×, Agent B) and combine won (386 < MORI 398), this closes the LAST
+regime for an ALL-REGIME fused-region win. Integration is a drop-in: same b0_dec_fp8_globals — inside the
+dispatch, dequant A→bf16 (existing dequant_packed_dense, kills the per-row-requant RMS), one-time-swizzle
+B (cached, B is fixed weights), run the sat GEMM UNSCALED, then the existing scale_c_decode applies the
+per-N-row sB (drop s_A since A is bf16). No Python/region change.
+
+### Why NOT the LDS-native-fp8 path (the other fp8 option)
+The LDS-staged native-fp8 decode kernel looked faster standalone (0.176 ms / 171 TFLOP/s ≈ aiter) BUT its
+implied B-stream (~7.5 TB/s) is ABOVE the physical bf16-measured HBM ceiling (5.4) — it is L2-reusing hot
+expert weights across the 50-iter timing loop, not realizable as pure HBM streaming in-region (the region
+already measured it at ~2.6 TB/s, RMS 0.073 FAIL). The saturating path is the one that actually realizes
+the fp8 weight-halving on real HBM and keeps A bf16/per-block. [VERIFIED standalone; resource numbers from
+-Rpass-analysis; RMS < 0.05 vs TRUE unquantized B = region-equivalent error.]
