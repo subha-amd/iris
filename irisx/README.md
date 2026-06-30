@@ -10,7 +10,9 @@ A modern C++ take on RMA/RDMA operations using AMD ROCm HIP. This is the C++ ver
 > — goal, results, cluster setup, and how to resume. The final, usable kernel is **`fused_moe/`** (prefill
 > **1.56×** over the unfused baseline; decode ~2–3% at matched fp8 precision); the unfused baseline is
 > **`baselines/`**; archived dev kernels + infra are in **`development/`**; authoritative measurements are in
-> **[`EXPERIMENT_LEDGER.md`](EXPERIMENT_LEDGER.md)**. The detailed notes below are **historical** (they predate
+> **[`EXPERIMENT_LEDGER.md`](EXPERIMENT_LEDGER.md)**. For the data-flow diagram + input ABI + the per-kernel
+> warp/SIMD behavior across the 8 XCDs, see **[`fused_moe/DATA_FLOW_AND_ABI.html`](fused_moe/DATA_FLOW_AND_ABI.html)**
+> (rendered) / **[`.md`](fused_moe/DATA_FLOW_AND_ABI.md)**. The detailed notes below are **historical** (they predate
 > the 2026-06-30 reorg: `b1_dispatch/` → `fused_moe/`, `b2_production/` → `baselines/`, dev → `development/`);
 > the upstream IRIS library docs follow them.
 >

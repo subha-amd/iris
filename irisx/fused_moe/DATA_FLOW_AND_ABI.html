@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Fused MoE Expert Region — Data Flow, Input ABI &amp; Warp/SIMD/XCD Map (MI355X)</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232d; --ink:#e6edf3; --mut:#9aa7b4;
+    --iris:#f2913d; --iris-d:#7a4514; --hk:#4aa3df; --hk-d:#15405e; --hkk:#8b5cf6;
+    --buf:#3fb950; --buf-d:#13361c; --meta:#8b97a4; --line:#30363d; --warn:#e5534b;
+    --gold:#e3b341;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1180px;margin:0 auto;padding:30px 26px 90px}
+  h1{font-size:25px;margin:0 0 4px;letter-spacing:-.2px}
+  h2{font-size:19px;margin:46px 0 6px;padding-top:14px;border-top:1px solid var(--line);letter-spacing:-.2px}
+  h3{font-size:15px;margin:22px 0 6px;color:var(--gold)}
+  .sub{color:var(--mut);font-size:13.5px;margin:0 0 6px}
+  code,.m{font-family:var(--mono)}
+  code{background:#0a0d12;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px;color:#cbd5e1}
+  p{font-size:14px;color:#d7dee6}
+  a{color:var(--hk)}
+  .legend{display:flex;flex-wrap:wrap;gap:9px;margin:14px 0 6px}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-family:var(--mono);
+        background:var(--panel);border:1px solid var(--line);border-radius:20px;padding:5px 12px}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}
+  @media(max-width:880px){.grid2,.grid3{grid-template-columns:1fr}}
+  table{border-collapse:collapse;width:100%;font-size:12.7px;margin:8px 0}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cdd9e5;font-weight:600}
+  td.m,th.m{font-family:var(--mono)}
+  .tag{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:5px;white-space:nowrap}
+  .t-iris{background:var(--iris-d);color:#ffd9b0;border:1px solid var(--iris)}
+  .t-hk{background:var(--hk-d);color:#bfe3ff;border:1px solid var(--hk)}
+  .t-buf{background:var(--buf-d);color:#c2f0cd;border:1px solid var(--buf)}
+  .t-meta{background:#2a2f36;color:#cdd5dd;border:1px solid var(--meta)}
+  .kk{color:var(--mut);font-size:12.5px}
+  .num{color:var(--gold);font-family:var(--mono)}
+  .warnbox{background:#2a1714;border:1px solid var(--warn);border-radius:10px;padding:13px 16px;margin:12px 0;font-size:13.3px}
+  .okbox{background:#10261a;border:1px solid var(--buf);border-radius:10px;padding:13px 16px;margin:12px 0;font-size:13.3px}
+  ul{margin:6px 0 6px;padding-left:20px}
+  li{font-size:13.6px;margin:3px 0}
+  .kernhdr{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .kernhdr .n{font-family:var(--mono);font-size:13px;color:#fff;background:#0a0d12;border:1px solid var(--line);
+              border-radius:6px;width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center}
+  .kv{display:grid;grid-template-columns:128px 1fr;gap:3px 12px;font-size:13px;margin-top:9px}
+  .kv .k{color:var(--mut);font-family:var(--mono);font-size:12px}
+  .kv .v{color:#e6edf3}
+  .kv .v .m{color:#bfe3ff}
+  svg{display:block;width:100%;height:auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;margin:10px 0}
+  .foot{color:var(--mut);font-size:12px;margin-top:8px}
+  .hl{color:var(--gold)}
+  .small{font-size:12.3px;color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Fused MoE Expert Region — Data Flow, Input ABI &amp; Warp/SIMD/XCD Map</h1>
+  <p class="sub">DeepSeek-R1 · EP8 · AMD MI355X (gfx950 / CDNA4) · HipKittens (on-GPU tile compute) + IRIS (cross-GPU XGMI).
+  Every grid/block/wave number below is taken verbatim from <code>irisx/fused_moe/kernel.cpp</code> + <code>example.py</code> + <code>b0_tasks.py</code>.</p>
+
+  <div class="legend">
+    <span class="chip"><span class="dot" style="background:var(--iris)"></span> IRIS kernel — crosses XGMI</span>
+    <span class="chip"><span class="dot" style="background:var(--hk)"></span> HipKittens kernel — local compute</span>
+    <span class="chip"><span class="dot" style="background:var(--buf)"></span> buffer (IRIS heap or local HBM)</span>
+    <span class="chip"><span class="dot" style="background:var(--meta)"></span> host-built metadata (NOT in timed region)</span>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>1 · The region at a glance — what fuses, and why no sort kernel</h2>
+  <p>The production <b>unfused</b> region is 7 kernels: <span class="m">MORI EpDispatch → moe_sorting ×2 → dynamic_quant → fmoe_g1u1_silu → moe_sum → MORI EpCombine</span>.
+  We collapse it to <b>5 kernels</b>. The whole expert region runs on the <b>consumer</b> rank against an
+  <span class="hl">expert-major packed buffer</span>; tokens cross XGMI <b>exactly twice</b> — once in (gather), once out (combine).</p>
+
+  <div class="okbox">
+  <b>Why there is no <code>moe_sorting</code> in the fused path</b> (Awad's question). The unfused GEMM consumes a flat
+  <code>[token, H]</code> activation buffer and needs <code>sorted_ids / sorted_expert_ids</code> to group tokens by expert.
+  Our <b>gather already groups</b>: <code>gather_pack</code> writes each expert's rows <i>contiguously</i> into the packed buffer
+  using the host <code>route_segments</code> map, so "sorting" <i>is</i> the placement. The GEMM then indexes experts by
+  <code>expert_row_begin</code> (a 256-aligned prefix), and <code>combine_pull</code> inverts the placement with a host CSR.
+  No sort/scan kernel, no scatter-to-sorted, no <code>moe_sum</code>.
+  </div>
+
+  <!-- ====== PIPELINE SVG ====== -->
+  <svg viewBox="0 0 1140 470" role="img" aria-label="Fused region data flow">
+    <defs>
+      <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+        <path d="M0,0 L9,4.5 L0,9 Z" fill="#9aa7b4"/></marker>
+      <marker id="arO" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+        <path d="M0,0 L10,5 L0,10 Z" fill="#f2913d"/></marker>
+    </defs>
+
+    <!-- host metadata band -->
+    <rect x="20" y="14" width="1100" height="44" rx="9" fill="#1c232d" stroke="#30363d"/>
+    <text x="34" y="32" fill="#8b97a4" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">HOST-BUILT METADATA (once, off the clock — built from the router's top-k assignment):</text>
+    <text x="34" y="48" fill="#cdd5dd" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">route_segments[Nseg,5] · tilemeta[Ntile,4]  →gather   ·   tasks_fc1 / tasks_fc2 [num_tasks,4]  →GEMMs   ·   cell_dst / cell_ptr / cell_rows + wgt  →combine</text>
+
+    <!-- 8 source ranks -->
+    <g>
+      <rect x="20" y="120" width="120" height="120" rx="10" fill="#13361c" stroke="#3fb950"/>
+      <text x="80" y="142" text-anchor="middle" fill="#c2f0cd" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">8 source ranks</text>
+      <text x="80" y="160" text-anchor="middle" fill="#9aa7b4" font-size="10">A_src fp8 [Msrc,7168]</text>
+      <text x="80" y="174" text-anchor="middle" fill="#9aa7b4" font-size="10">+ scales [Msrc,56]</text>
+      <text x="80" y="196" text-anchor="middle" fill="#c2f0cd" font-size="10">IRIS symmetric heap</text>
+      <text x="80" y="214" text-anchor="middle" fill="#9aa7b4" font-size="9.5">each rank fills its own</text>
+      <text x="80" y="228" text-anchor="middle" fill="#9aa7b4" font-size="9.5">routed activations</text>
+    </g>
+
+    <!-- K1 gather -->
+    <line x1="140" y1="180" x2="186" y2="180" stroke="#f2913d" stroke-width="2.4" marker-end="url(#arO)"/>
+    <text x="163" y="172" text-anchor="middle" fill="#f2913d" font-size="9.5" font-family="ui-monospace,Menlo,Consolas,monospace">XGMI</text>
+    <rect x="188" y="120" width="150" height="120" rx="10" fill="#2a1c10" stroke="#f2913d"/>
+    <text x="263" y="140" text-anchor="middle" fill="#ffd9b0" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">① gather_pack</text>
+    <text x="263" y="156" text-anchor="middle" fill="#f2913d" font-size="9.5">IRIS · multi-source</text>
+    <text x="263" y="178" text-anchor="middle" fill="#9aa7b4" font-size="10">raw fp8 copy (no</text>
+    <text x="263" y="191" text-anchor="middle" fill="#9aa7b4" font-size="10">dequant), zero-sentinel</text>
+    <text x="263" y="213" text-anchor="middle" fill="#c2f0cd" font-size="10">→ A_pk fp8 [Mpk,7168]</text>
+    <text x="263" y="227" text-anchor="middle" fill="#9aa7b4" font-size="9.5">expert-major packed (local)</text>
+
+    <!-- K2 fc1 -->
+    <line x1="338" y1="180" x2="384" y2="180" stroke="#9aa7b4" stroke-width="2" marker-end="url(#ar)"/>
+    <rect x="386" y="120" width="156" height="120" rx="10" fill="#11252f" stroke="#4aa3df"/>
+    <text x="464" y="140" text-anchor="middle" fill="#bfe3ff" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">② GEMM fc1</text>
+    <text x="464" y="156" text-anchor="middle" fill="#4aa3df" font-size="9.5">HipKittens · 8-wave</text>
+    <text x="464" y="177" text-anchor="middle" fill="#9aa7b4" font-size="10">dequant→ 256×256×64</text>
+    <text x="464" y="190" text-anchor="middle" fill="#9aa7b4" font-size="10">w13 [E·4096, 7168]</text>
+    <text x="464" y="212" text-anchor="middle" fill="#c2f0cd" font-size="10">→ C1 bf16 [Mpk,4096]</text>
+    <text x="464" y="226" text-anchor="middle" fill="#9aa7b4" font-size="9.5">gate ‖ up</text>
+
+    <!-- K3 act -->
+    <line x1="542" y1="180" x2="588" y2="180" stroke="#9aa7b4" stroke-width="2" marker-end="url(#ar)"/>
+    <rect x="590" y="120" width="150" height="120" rx="10" fill="#1b1430" stroke="#8b5cf6"/>
+    <text x="665" y="140" text-anchor="middle" fill="#d6c8ff" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">③ silu_quant</text>
+    <text x="665" y="156" text-anchor="middle" fill="#a586f0" font-size="9.5">HipKittens · no MFMA</text>
+    <text x="665" y="177" text-anchor="middle" fill="#9aa7b4" font-size="10">SiLU(gate)·up, per-128</text>
+    <text x="665" y="190" text-anchor="middle" fill="#9aa7b4" font-size="10">amax → fp8 re-quant</text>
+    <text x="665" y="212" text-anchor="middle" fill="#c2f0cd" font-size="10">→ A2 fp8 [Mpk,2048]</text>
+    <text x="665" y="226" text-anchor="middle" fill="#9aa7b4" font-size="9.5">+ scales [Mpk,16]</text>
+
+    <!-- K4 fc2 -->
+    <line x1="740" y1="180" x2="786" y2="180" stroke="#9aa7b4" stroke-width="2" marker-end="url(#ar)"/>
+    <rect x="788" y="120" width="156" height="120" rx="10" fill="#11252f" stroke="#4aa3df"/>
+    <text x="866" y="140" text-anchor="middle" fill="#bfe3ff" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">④ GEMM fc2</text>
+    <text x="866" y="156" text-anchor="middle" fill="#4aa3df" font-size="9.5">HipKittens · 8-wave</text>
+    <text x="866" y="177" text-anchor="middle" fill="#9aa7b4" font-size="10">dequant→ 256×256×64</text>
+    <text x="866" y="190" text-anchor="middle" fill="#9aa7b4" font-size="10">w2 [E·7168, 2048]</text>
+    <text x="866" y="212" text-anchor="middle" fill="#c2f0cd" font-size="10">→ C2 bf16 [Mpk,7168]</text>
+    <text x="866" y="226" text-anchor="middle" fill="#9aa7b4" font-size="9.5">down projection</text>
+
+    <!-- K5 combine -->
+    <line x1="944" y1="180" x2="990" y2="180" stroke="#9aa7b4" stroke-width="2" marker-end="url(#ar)"/>
+    <rect x="992" y="120" width="128" height="120" rx="10" fill="#2a1c10" stroke="#f2913d"/>
+    <text x="1056" y="140" text-anchor="middle" fill="#ffd9b0" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">⑤ combine</text>
+    <text x="1056" y="156" text-anchor="middle" fill="#f2913d" font-size="9.5">IRIS · pull-reduce</text>
+    <text x="1056" y="178" text-anchor="middle" fill="#9aa7b4" font-size="10">fp32 local reduce</text>
+    <text x="1056" y="191" text-anchor="middle" fill="#9aa7b4" font-size="10">→ 1 bf16 store/token</text>
+    <text x="1056" y="213" text-anchor="middle" fill="#c2f0cd" font-size="10">→ ACC [Tlocal,7168]</text>
+    <text x="1056" y="227" text-anchor="middle" fill="#9aa7b4" font-size="9.5">on origin ranks</text>
+
+    <!-- metadata feeders -->
+    <line x1="263" y1="58" x2="263" y2="118" stroke="#8b97a4" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+    <line x1="464" y1="58" x2="464" y2="118" stroke="#8b97a4" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+    <line x1="866" y1="58" x2="866" y2="118" stroke="#8b97a4" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+    <line x1="1056" y1="58" x2="1056" y2="118" stroke="#8b97a4" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#ar)"/>
+
+    <!-- combine XGMI back -->
+    <path d="M1056,240 L1056,300 L80,300 L80,242" fill="none" stroke="#f2913d" stroke-width="2.2" stroke-dasharray="6 4" marker-end="url(#arO)"/>
+    <text x="568" y="294" text-anchor="middle" fill="#f2913d" font-size="10.5" font-family="ui-monospace,Menlo,Consolas,monospace">XGMI back — scatter each fc2 row to its origin token's rank (weighted top-k accumulate)</text>
+
+    <!-- barriers -->
+    <rect x="20" y="330" width="1100" height="30" rx="7" fill="#161b22" stroke="#30363d"/>
+    <text x="34" y="349" fill="#9aa7b4" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">iris.barrier()  →  ① gather  →  ② fc1  →  ③ act  →  ④ fc2  →  ⑤ combine  →  iris.barrier()   (single stream; barriers bracket the two XGMI phases — relaxed loads/stores inside)</text>
+
+    <!-- decode note -->
+    <rect x="20" y="378" width="1100" height="74" rx="9" fill="#1c232d" stroke="#30363d"/>
+    <text x="34" y="398" fill="#e3b341" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">DECODE (low M_e): same ①③⑤, but ②④ swap the 256×256 tile for a skinny BM=16 tile (grouped_b0_gemm_decode / _fp8_sat).</text>
+    <text x="34" y="416" fill="#cdd5dd" font-size="11">Reason: at ~16 real rows/expert a 256-row tile is ~94% zero padding and runs compute-bound on padding. BM=16 (MFMA's min M) drops padded</text>
+    <text x="34" y="431" fill="#cdd5dd" font-size="11">compute below the weight-stream floor, so decode becomes weight-memory-bound (the right regime). The packed layout stays 256-aligned, so ①③⑤ are byte-identical.</text>
+    <text x="34" y="447" fill="#9aa7b4" font-size="10.5" font-family="ui-monospace,Menlo,Consolas,monospace">_fp8_sat: store weights fp8 (half the HBM bytes that bound decode) → the decode lever; fp4 next.</text>
+  </svg>
+
+  <!-- ============================================================ -->
+  <h2>2 · The 8-XCD execution model (read this before the per-kernel maps)</h2>
+  <p>An MI355X is <b>8 XCDs × 32 CUs = 256 CUs</b>. Every kernel here launches a <b>1-D grid of independent blocks</b>
+  (one block per expert-tile, per packed-row, or per destination-cell). The gfx950 hardware workgroup scheduler sprays
+  blocks <b>round-robin across the 8 XCDs</b> (block <span class="m">i</span> → XCD <span class="m">i&nbsp;mod&nbsp;8</span>), then round-robins across the 32 CUs inside each XCD.
+  So <i>consecutive</i> <code>blockIdx.x</code> values land on <i>different</i> XCDs — there is no per-XCD affinity in the code; load-balance is a property of the round-robin + the task <i>count</i>.</p>
+
+  <svg viewBox="0 0 1140 360" role="img" aria-label="Block to XCD to SIMD mapping">
+    <!-- grid -->
+    <rect x="20" y="20" width="1100" height="46" rx="9" fill="#1c232d" stroke="#30363d"/>
+    <text x="34" y="38" fill="#cdd9e5" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">1-D grid:  block 0   block 1   block 2   block 3   block 4   block 5   block 6   block 7   block 8   block 9  ...  block N-1</text>
+    <text x="34" y="56" fill="#8b97a4" font-size="11">e.g. fc1 prefill: N = Σ_e ⌈M_e/256⌉ × (4096/256=16) tiles · decode: ≈512 tiles · gather: Ntile×8 · combine: num_cells</text>
+
+    <!-- round robin arrows -->
+    <text x="570" y="88" text-anchor="middle" fill="#e3b341" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">hardware scheduler — round-robin across XCDs (block i → XCD i mod 8)</text>
+
+    <!-- 8 XCDs -->
+    <g font-family="ui-monospace,Menlo,Consolas,monospace">
+    <!-- positions -->
+    <!-- XCD boxes -->
+    <g>
+      <!-- generate 8 -->
+      <!-- x positions: 20 + i*137.5 -->
+      <rect x="20"   y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="157"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="294"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="431"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="568"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="705"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="842"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+      <rect x="979"  y="104" width="126" height="120" rx="9" fill="#11252f" stroke="#4aa3df"/>
+    </g>
+    <text x="83"   y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 0</text>
+    <text x="220"  y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 1</text>
+    <text x="357"  y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 2</text>
+    <text x="494"  y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 3</text>
+    <text x="631"  y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 4</text>
+    <text x="768"  y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 5</text>
+    <text x="905"  y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 6</text>
+    <text x="1042" y="124" text-anchor="middle" fill="#bfe3ff" font-size="11">XCD 7</text>
+    <!-- block labels each XCD -->
+    <text x="83"   y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 0,8,16…</text>
+    <text x="220"  y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 1,9,17…</text>
+    <text x="357"  y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 2,10…</text>
+    <text x="494"  y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 3,11…</text>
+    <text x="631"  y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 4,12…</text>
+    <text x="768"  y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 5,13…</text>
+    <text x="905"  y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 6,14…</text>
+    <text x="1042" y="142" text-anchor="middle" fill="#9aa7b4" font-size="9.5">blocks 7,15…</text>
+    <!-- CU + L2 -->
+    <g fill="#7d8893" font-size="9">
+      <text x="83"   y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="220"  y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="357"  y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="494"  y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="631"  y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="768"  y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="905"  y="166" text-anchor="middle">32 CUs · own L2</text>
+      <text x="1042" y="166" text-anchor="middle">32 CUs · own L2</text>
+    </g>
+    <!-- one CU detail in XCD0 -->
+    <rect x="30" y="176" width="106" height="40" rx="6" fill="#0a0d12" stroke="#30363d"/>
+    <text x="83" y="190" text-anchor="middle" fill="#cdd9e5" font-size="8.5">1 CU = 4×SIMD32</text>
+    <text x="83" y="201" text-anchor="middle" fill="#7d8893" font-size="8">wave64, 64KB LDS</text>
+    <text x="83" y="211" text-anchor="middle" fill="#7d8893" font-size="8">≤2 of these blocks/CU</text>
+    </g>
+
+    <!-- shared LLC + HBM -->
+    <rect x="20" y="244" width="1085" height="32" rx="8" fill="#1f2a16" stroke="#3fb950"/>
+    <text x="562" y="264" text-anchor="middle" fill="#c2f0cd" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">shared last-level (Infinity) cache  +  288 GB HBM3E  @  ~8 TB/s   (the weights B stream through here — the decode "weight wall")</text>
+
+    <!-- XGMI -->
+    <rect x="20" y="290" width="1085" height="50" rx="8" fill="#2a1c10" stroke="#f2913d"/>
+    <text x="34" y="309" fill="#ffd9b0" font-size="11.5" font-family="ui-monospace,Menlo,Consolas,monospace">8 XGMI links → the 7 peer GPUs.  Only ① gather and ⑤ combine touch XGMI.</text>
+    <text x="34" y="327" fill="#cdd5dd" font-size="10.5">gather: blocks on all 8 XCDs issue remote loads concurrently (that's why grid.y = GP_SPLIT = 8).   combine: cells are round-robined across dst_rank so any window of running blocks spreads its stores over all 8 links.</text>
+  </svg>
+
+  <div class="card">
+  <h3>The three load-balancing levers (all in the host task lists, none in the kernels)</h3>
+  <ul>
+    <li><b>Constant tile, variable count.</b> Every expert uses the <i>same</i> tile height (BM=256 prefill, 16 decode).
+      Expert imbalance is absorbed by the <i>number</i> of tiles: <code>⌈M_e / BM⌉</code>. A hot expert simply emits more blocks.
+      Each block is one entry in <code>tasks[num_tasks,4] = (expert, m_tile, n_tile, expert_row_begin)</code>.</li>
+    <li><b>Spray over XCDs.</b> Because the grid is flat and the scheduler is round-robin, a hot expert's many tiles land on
+      <i>different</i> XCDs — no single XCD becomes the bottleneck for one expert. The padding tail (≤BM−M_e rows) is masked /
+      MFMA'd to zero, never read by the next kernel.</li>
+    <li><b>Round-robin XGMI.</b> The combine CSR is ordered so consecutive cells target different destination ranks, spreading
+      remote-store bytes across all 8 XGMI links (sorted-by-rank was measured ~2.4× slower per byte).</li>
+  </ul>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>3 · Per-kernel warp / SIMD / XCD map</h2>
+  <p class="sub">Each card: the launch geometry, what one block does, how its waves split the work, what the SIMD lanes execute, and how blocks spread over the 8 XCDs. Line refs are into <code>kernel.cpp</code>.</p>
+
+  <!-- K1 -->
+  <div class="card">
+    <div class="kernhdr"><span class="n">1</span><span class="tag t-iris">IRIS · XGMI gather</span>
+      <b><code>gather_pack_kernel</code></b><span class="kk">kernel.cpp:108</span></div>
+    <div class="kv">
+      <span class="k">grid</span><span class="v"><span class="m">(Ntile, GP_SPLIT=8)</span> — Ntile = ⌈Mpacked/64⌉ packed BM-tiles; 8 split-blocks cooperate per tile</span>
+      <span class="k">block</span><span class="v"><span class="m">256 threads = 4 wave64</span> · <code>__launch_bounds__(256,1)</code></span>
+      <span class="k">one block</span><span class="v">copies a disjoint <span class="m">ci</span>-stride of its tile's <span class="m">64 rows × (7168/16 = 448)</span> uint4 chunks</span>
+      <span class="k">per lane</span><span class="v">one <span class="m">uint4 = 16 fp8 bytes</span>, <b>raw copy, no dequant</b> · <span class="m">vbytes = (src==cur)? *sp : ctx.load(sp, src_rank)</span></span>
+      <span class="k">SIMD work</span><span class="v">address math + a 128-bit global/XGMI load + a 128-bit store; one fp32 scale per 128-group (idempotent write). No MFMA.</span>
+      <span class="k">routing</span><span class="v">per tile, once: <code>tile_is_single_source</code> → Path 2 (constant map, the common case) else Path 1 builds <span class="m">row_seg[64]</span> in LDS</span>
+      <span class="k">zero-sentinel</span><span class="v">unrouted / tail rows → <span class="m">uint4(0)</span> → fp8 <span class="m">0x00</span> dequants to 0 downstream (no contamination)</span>
+      <span class="k">across XCDs</span><span class="v"><b>Ntile×8 blocks spray over all 8 XCDs</b> → 8 XCDs issue XGMI reads at once; <code>GP_SPLIT=8</code> exists to fill 256 CUs &amp; hide remote-load latency (grid=Ntile alone ≈ 50% of the chip).</span>
+    </div>
+  </div>
+
+  <!-- K2 -->
+  <div class="card">
+    <div class="kernhdr"><span class="n">2</span><span class="tag t-hk">HipKittens · 8-wave GEMM</span>
+      <b><code>grouped_b0_gemm&lt;N,K&gt;</code></b><span class="kk">kernel.cpp:749 · preamble dequant_packed_dense:556</span></div>
+    <div class="kv">
+      <span class="k">grid</span><span class="v"><span class="m">num_tasks</span> — one block per <span class="m">(expert, 256-row m_tile, 256-col n_tile)</span>; tasks are expert-major</span>
+      <span class="k">block</span><span class="v"><span class="m">512 threads = 8 wave64</span> · <code>__launch_bounds__(512,2)</code> → up to 2 blocks (16 waves) per CU</span>
+      <span class="k">macro-tile</span><span class="v">one block computes a <span class="m">256(M) × 256(N)</span> output tile, contracting <span class="m">K=7168</span> (fc1) / <span class="m">2048</span> (fc2) in <span class="m">BLOCK_K=64</span> steps</span>
+      <span class="k">8 waves</span><span class="v"><span class="m">warp_m = wid/4 ∈{0,1}</span>, <span class="m">warp_n = wid%4 ∈{0..3}</span> → a 2×4 wave grid; each wave holds <b>4 accumulators</b> <span class="m">cA,cB,cC,cD</span>, each <code>rt_fl&lt;64,32&gt;</code> (a checkerboard 128×64 of the tile)</span>
+      <span class="k">SIMD work</span><span class="v"><b>MFMA</b> <span class="m">mma_ABt</span> = <span class="m">16×16×32</span> bf16 matrix-multiply-accumulate (CDNA4 <span class="m">v_mfma_f32_16x16x32</span>); 64 MFMAs/wave/K-iter</span>
+      <span class="k">LDS</span><span class="v">double-buffered <span class="m">As[2][2], Bs[2][2]</span> of <code>st_bf&lt;128,64&gt;</code>; <code>group&lt;8&gt;</code> all-wave swizzled HBM→LDS load, ping-pong <span class="m">tic/toc</span></span>
+      <span class="k">scheduling</span><span class="v">hand-placed <span class="m">s_waitcnt vmcnt/lgkmcnt</span> + <span class="m">s_barrier</span> + <span class="m">s_setprio(1)</span> around each mma → all 8 waves' MFMA pipes stay full while next tiles stream</span>
+      <span class="k">why dequant</span><span class="v">HK has no fp8 global→register load on this path, so the preamble expands packed fp8 → bf16 scratch first (one block/row, <span class="m">v_cvt_pk_bf16</span>)</span>
+      <span class="k">across XCDs</span><span class="v"><b>num_tasks blocks spray over 8 XCDs.</b> Consecutive tasks (same expert, different n_tile) land on <i>different</i> XCDs, so one expert's <code>B[e·N : (e+1)·N]</code> weight rows are pulled by tiles now spread across XCDs — each XCD caches its slice in its own L2, the shared LLC/HBM backs reuse. B is the dominant HBM stream = the weight wall.</span>
+    </div>
+  </div>
+
+  <!-- K3 -->
+  <div class="card">
+    <div class="kernhdr"><span class="n">3</span><span class="tag t-hk" style="background:#1b1430;color:#d6c8ff;border-color:#8b5cf6">HipKittens · activation (no MFMA)</span>
+      <b><code>silu_quant_kernel</code></b><span class="kk">kernel.cpp:625 (decode: _mtile:677)</span></div>
+    <div class="kv">
+      <span class="k">grid</span><span class="v"><span class="m">Mpacked</span> (prefill) — one block per packed row; decode launches only the ~512 real rows (<code>_mtile</code>, skips 94% padding)</span>
+      <span class="k">block</span><span class="v"><span class="m">256 threads = 4 wave64</span></span>
+      <span class="k">one block</span><span class="v">reads <span class="m">C1[row, :4096] = gate(0:2048) ‖ up(2048:4096)</span>; each lane owns <span class="m">ELEMS = 2048/256 = 8</span> consecutive INTER cols (all inside one 128-group)</span>
+      <span class="k">SIMD work</span><span class="v"><span class="m">h = silu(gate)·up = (g/(1+e^−g))·u</span> per element (transcendental on the SIMD ALU); stash <span class="m">h</span> in LDS</span>
+      <span class="k">reduction</span><span class="v">per-lane local amax → <b>one</b> <span class="m">atomicMax</span> into <span class="m">samax[group]</span> ⇒ <b>16-way</b> contention (16 groups), not 128-way; <span class="m">scale = amax/448</span></span>
+      <span class="k">output</span><span class="v">requant <span class="m">q = e4m3(clamp(h/scale, ±448))</span> → A2 fp8 [Mpk,2048] + 16 scales/row. Replaces the ~7 [M,INTER] fp32 temporaries PyTorch eager would materialize with <b>1 read + 1 fp8 write</b>.</span>
+      <span class="k">across XCDs</span><span class="v">embarrassingly parallel — independent rows spray over all 8 XCDs; no cross-block comms.</span>
+    </div>
+  </div>
+
+  <!-- K4 -->
+  <div class="card">
+    <div class="kernhdr"><span class="n">4</span><span class="tag t-iris">IRIS · XGMI combine (EpCombine)</span>
+      <b><code>combine_pull_kernel</code></b><span class="kk">kernel.cpp:1558</span></div>
+    <div class="kv">
+      <span class="k">grid</span><span class="v"><span class="m">num_cells</span> — one block per <b>destination cell</b> = a unique <span class="m">(dst_rank, dst_token)</span></span>
+      <span class="k">block</span><span class="v"><span class="m">256 threads = 4 wave64</span> · <code>__launch_bounds__(256,1)</code></span>
+      <span class="k">one block</span><span class="v">reads its CSR span <span class="m">[lo,hi) = cell_ptr[c..c+1]</span> → <span class="m">cell_rows</span> = the ≤8 packed rows that route to this token</span>
+      <span class="k">SIMD work</span><span class="v"><b>local fp32 reduce</b> <span class="m">Σ wgt[row]·c2[row,h]</span> over ≤8 rows (no atomics) — this is what makes a bf16 output correct under top-k collisions</span>
+      <span class="k">XGMI store</span><span class="v"><b>one</b> store of the reduced row to <span class="m">accb[dst_token]</span> on <span class="m">dst_rank</span>: <span class="m">local *dst</span> if same rank else <span class="m">ctx.store(dst, v, dst_rank)</span>. <span class="m">store_gran</span>: bf16 / bf16×2 / uint4(16B). Shipped = bf16 ⇒ <b>half</b> the scatter's fp32 bytes (combine is write-BW-bound; fewer bytes is the only lever).</span>
+      <span class="k">across XCDs</span><span class="v">num_cells blocks spray over 8 XCDs; the host CSR <b>round-robins cells across dst_rank</b>, so the 8 XCDs × 8 XGMI links stay busy together. Reads of <code>c2</code> are local HBM; only the store crosses XGMI.</span>
+    </div>
+  </div>
+
+  <!-- decode card -->
+  <div class="card">
+    <div class="kernhdr"><span class="n">D</span><span class="tag t-hk">HipKittens · decode GEMM (replaces ②④ at low M_e)</span>
+      <b><code>grouped_b0_gemm_decode / _fp8_sat</code></b><span class="kk">kernel.cpp:1013 / 1273</span></div>
+    <div class="kv">
+      <span class="k">grid</span><span class="v"><span class="m">num_tasks ≈ 512</span> — one block per <span class="m">(expert, 16-row m_tile, 256-col n_tile)</span></span>
+      <span class="k">block</span><span class="v"><span class="m">512 threads = 8 wave64</span>, <b>WARPS_COL=8</b> (warp_m=0)</span>
+      <span class="k">tile</span><span class="v"><span class="m">16(M) × 256(N)</span>; the 8 waves split N into <b>8 disjoint 32-col strips</b> → 8-way HBM/XGMI-free weight parallelism; A (16×K) broadcast to all waves</span>
+      <span class="k">SIMD work</span><span class="v">bf16 path: <span class="m">16×16×32</span> MFMA. <code>_fp8_sat</code>: load fp8 B through the fast bf16 path, unpack fp8→bf16 in-register with per-N scale, then bf16 MFMA — halves the weight HBM bytes. <b>Critical</b> <span class="m">sched_barrier(0)</span> before each mma forbids the async ds_read hoist (else RMS≈0.71 + &gt;512-block hang).</span>
+      <span class="k">across XCDs</span><span class="v">≈512 blocks → ~2 per CU across 256 CUs; the BM=16 tile makes padded-row compute fall below the weight-stream floor, so decode runs weight-memory-bound (correct regime) instead of compute-bound on padding.</span>
+    </div>
+  </div>
+
+  <!-- ============================================================ -->
+  <h2>4 · Input ABI — every buffer the region consumes &amp; produces</h2>
+  <p class="sub">"Where" = IRIS symmetric heap (allocated in identical order on every rank → identical offsets, so <code>ctx.load/store(ptr, rank)</code> resolves a peer's copy) vs. local HBM (never crosses XGMI). Shapes for DeepSeek-R1: H=7168, INTER=2048, N_FC1=4096, E=32 local experts, top-k=8, QGROUP=128 (NG=56).</p>
+
+  <h3>4a · Activation &amp; weight tensors</h3>
+  <table>
+    <thead><tr><th>buffer</th><th class="m">shape</th><th class="m">dtype</th><th>where</th><th>built by</th><th>consumed by</th></tr></thead>
+    <tbody>
+      <tr><td class="m">A_src (+ A_src_sc)</td><td class="m">[Msrc,7168] (+[Msrc,56])</td><td class="m">fp8 e4m3 (+f32)</td><td><span class="tag t-buf">IRIS heap</span></td><td>each rank's attention/router output (routed activations it owns)</td><td>① gather (read remote)</td></tr>
+      <tr><td class="m">A_pk (+ A_pk_sc)</td><td class="m">[Mpacked,7168] (+[Mpacked,56])</td><td class="m">fp8 e4m3 (+f32)</td><td><span class="tag t-buf">IRIS heap*</span></td><td>① gather (writes; padding pre-zeroed)</td><td>② fc1 dequant</td></tr>
+      <tr><td class="m">B_fc1 (w13)</td><td class="m">[E·4096, 7168]</td><td class="m">bf16 / fp8</td><td><span class="tag t-buf">local HBM</span></td><td>model weights (preshuffled host-side)</td><td>② fc1 GEMM</td></tr>
+      <tr><td class="m">C1</td><td class="m">[Mpacked, 4096]</td><td class="m">bf16</td><td><span class="tag t-buf">local HBM</span></td><td>② fc1 GEMM (gate‖up)</td><td>③ silu_quant</td></tr>
+      <tr><td class="m">A2 (+ A2_sc)</td><td class="m">[Mpacked,2048] (+[Mpacked,16])</td><td class="m">fp8 e4m3 (+f32)</td><td><span class="tag t-buf">local HBM</span></td><td>③ silu_quant</td><td>④ fc2 dequant</td></tr>
+      <tr><td class="m">B_fc2 (w2)</td><td class="m">[E·7168, 2048]</td><td class="m">bf16 / fp8</td><td><span class="tag t-buf">local HBM</span></td><td>model weights (preshuffled host-side)</td><td>④ fc2 GEMM</td></tr>
+      <tr><td class="m">C2</td><td class="m">[Mpacked, 7168]</td><td class="m">bf16</td><td><span class="tag t-buf">local HBM</span></td><td>④ fc2 GEMM (down)</td><td>⑤ combine (read local)</td></tr>
+      <tr><td class="m">ACC / accb</td><td class="m">[Tlocal, 7168]</td><td class="m">bf16 (or f32)</td><td><span class="tag t-buf">IRIS heap</span></td><td>zeroed on every origin rank</td><td>⑤ combine (remote accumulate) → next layer</td></tr>
+    </tbody>
+  </table>
+  <p class="small">* A_pk lives on the heap only to keep allocation order symmetric across ranks; the GEMM reads it as plain local HBM (its <code>ctx.load</code> uses <code>src_rank = consumer</code>, a local deref). The fp8 buffer is allocated as a bf16 tensor and aliased to a fp8 view over the same bytes (<code>make_fp8</code>), so HK can take a bf16 <code>gl&lt;&gt;</code> and the dequant preamble reinterprets the raw bytes as fp8.</p>
+
+  <h3>4b · Routing metadata (host-built once, off the timed clock)</h3>
+  <table>
+    <thead><tr><th>buffer</th><th class="m">shape / record</th><th>feeds</th><th>meaning</th></tr></thead>
+    <tbody>
+      <tr><td class="m">route_segments (SEG)</td><td class="m">[Nseg, 5] = (expert_id, src_rank, src_row_begin, dst_row_begin, row_count)</td><td>① gather</td><td>one contiguous run of rows for <i>one expert from one source rank</i>; disjoint + sorted. The map that makes the gather group-by-expert.</td></tr>
+      <tr><td class="m">tilemeta (TILE)</td><td class="m">[Ntile, 4] = (seg_begin, seg_count, tile_dst0, valid_rows)</td><td>① gather</td><td>per BM=64 packed tile: which segments touch it + its true row count (tail mask).</td></tr>
+      <tr><td class="m">tasks_fc1 / tasks_fc2</td><td class="m">[num_tasks, 4] = (expert, m_tile, n_tile, expert_row_begin)</td><td>②④ GEMM</td><td>the flat work list. <code>expert_row_begin</code> = expert's first packed row (multiple of 256). One row = one block.</td></tr>
+      <tr><td class="m">expert_row_begin</td><td class="m">[E] (256-padded prefix sum of M_e)</td><td>②④⑤</td><td>each expert's region base in the packed space; padding keeps tiles inside one expert (no contamination).</td></tr>
+      <tr><td class="m">cell_dst / cell_ptr / cell_rows</td><td class="m">[nC,2] · [nC+1] · [total_routed]</td><td>⑤ combine</td><td>CSR transpose of the reverse route: group packed rows by destination <span class="m">(dst_rank,dst_token)</span>; round-robined across dst_rank.</td></tr>
+      <tr><td class="m">wgt</td><td class="m">[Mpacked, 1] f32</td><td>⑤ combine</td><td>per packed row's softmax gate weight (the top-k weight the combine reduces by).</td></tr>
+    </tbody>
+  </table>
+
+  <div class="warnbox">
+  <b>Two ABI traps a vLLM integrator must know</b> (from <code>PRODUCTION_ABI.md</code>):
+  <ul style="margin-bottom:0">
+    <li><b>Scale layout.</b> We pack scales <i>token-major</i> <code>[Mpacked, 56]</code>. Production <code>fmoe</code> reads <i>group-major</i>
+      <code>[56, M_pad]</code> — a transpose. Any code that hands our packed scales to stock fmoe (or vice-versa) must transpose or it reads numerically-wrong scales <i>with no crash</i>.</li>
+    <li><b>fc1 N-split.</b> We assume the fused 4096 is <code>[gate(0:2048) ‖ up(2048:4096)]</code> (blocked, not interleaved). If the production w13 preshuffle interleaves per-128-block, <code>silu_quant</code>'s gate/up split must match. (Flagged <b>[NEEDS-NODE]</b> in the ABI.)</li>
+  </ul>
+  </div>
+
+  <h3>4c · The two XGMI primitives (this is all of "IRIS" the region uses)</h3>
+  <table>
+    <thead><tr><th>call</th><th>used by</th><th>semantics</th></tr></thead>
+    <tbody>
+      <tr><td class="m">ctx.load(ptr, src_rank)</td><td>① gather</td><td>read 128 bits from the <i>same symmetric offset</i> on a peer GPU over XGMI (a local deref when <span class="m">src_rank == cur_rank</span>).</td></tr>
+      <tr><td class="m">ctx.store(ptr, v, dst_rank)</td><td>⑤ combine</td><td>write bf16/bf16₂/uint4 to a peer GPU's accumulator. Cross-rank visibility is established by the host <code>iris.barrier()</code> (hipDeviceSynchronize + MPI_Barrier = system fence) that brackets each phase, so in-kernel ops are <i>relaxed</i> — no per-element fences.</td></tr>
+    </tbody>
+  </table>
+  <p class="small">The combine also has a rejected <code>ctx.fetch_add</code> scatter variant (kernel.cpp:1464): correct but XGMI-write-bandwidth-bound at fp32 (788 µs). The shipped pull does the accumulate <i>locally</i> in fp32 and stores <i>bf16</i> → 386 µs, beating MORI EpCombine's 398 µs.</p>
+
+  <p class="foot">Sources: <code>kernel.cpp</code> (gather_pack:108 · grouped_b0_gemm:749 · silu_quant:625 · combine_pull:1558 · decode:1013/1273),
+  <code>ep8_gather.h</code> (route_segment / tile_is_single_source / build_row_seg_map),
+  <code>build_tasks.py</code> &amp; <code>b0_tasks.py</code> (packed layout + task lists), <code>example.py</code> (orchestration + heap allocation),
+  <code>development/abi/PRODUCTION_ABI.md</code> (the binding ABI). MI355X: 8 XCD × 32 CU = 256 CU, per-XCD L2, shared LLC, ~8 TB/s HBM3E.</p>
+
+</div>
+</body>
+</html>
