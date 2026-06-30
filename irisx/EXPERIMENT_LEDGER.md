@@ -632,6 +632,40 @@ of a Tier-3 in-server TPOT drop-in.
 (c) native-fp8 GEMM + the missing combine + full FFN. Until then b1_dispatch is the right *dataflow* but
 not a faster *kernel*. This is the honest baseline starting point.
 
+## COMPLETE-REGION head-to-head: b1 (gather+fc1+act+fc2+combine) vs C4-faithful unfused — *** OVERTURNS 1.76× ***
+_status: RUN 2026-06-29, 8×MI350, FFN=full COMBINE=1 (Agent-2's complete region, built clean on gfx950).
+Correctness PASSES: FFN RMS_rel=0.018 (tol 0.05), COMBINE acc RMS_rel=0.000000._
+
+The first apples-to-apples comparison of TWO COMPLETE regions (both do gather/dispatch → full FFN
+(fc1 g1u1 + SiLU + fc2) → combine):
+
+| operating pt | FUSED b1 complete (gather+fc1+act+fc2+combine) | UNFUSED C4-faithful (dispatch+fmoe+combine) | ratio |
+|---|---|---|---|
+| decode (M_e16) | **1293 µs** (108+535+253+327+70) | **471 µs** (49+379+54, recv335) | **b1 2.7× SLOWER** |
+| prefill (M_e256)| **2301 µs** (219+733+274+360+715) | **825 µs** (111+596+154, recv1355) | **b1 ~2.8× SLOWER** |
+
+*** b1_dispatch is ~2.7–2.8× SLOWER than the production unfused pipeline once the COMPLETE region is
+measured fairly. The old "1.76× faster" was an artifact: it compared b1's gather + ONE N=2048 projection
+(714 µs) against the unfused FULL FFN (1255 µs), single-GPU eager, at prefill. ***
+
+Every component is behind (decode):
+- **GEMM ~3× slower:** fc1 535 + act 253 + fc2 327 = 1115 µs vs aiter fmoe 379 µs (which does the same
+  full FFN in ONE fused kernel). Causes: bf16-dequant (not native fp8), BM=256 padding (Mpacked=8192
+  ALWAYS → 8192 rows computed for 512 real), and the **SiLU+requant is a separate unfused torch step
+  (253 µs!)** — in production it's fused into the fmoe g1u1_vs_silu epilogue.
+- **gather 2× slower:** 108 vs dispatch 49 µs (latency-bound small transfers — Agent-1 root cause: grid
+  = ceil(Mpacked/64) ⇒ ~2 blocks at decode; dependent pull-then-store; scalar per-chunk scale load).
+- **combine 1.3–4.6× slower:** 70 µs (decode) / 715 µs (prefill!) vs MORI 54/154 — same latency-bound
+  IRIS scatter problem, worse at scale.
+
+IMPLICATION (the honest strategic read): matching a mature MORI+aiter stack piece-by-piece is a long road
+to *parity*; the only structural edge IRIS has is OVERLAP (gather/combine concurrent with the weight-
+streaming GEMM, which MORI+aiter can't do) — but the decode overlap ceiling is only ~1.1–1.4× (all-to-all
+is ~21% of the region). So the fused-gather-as-decode-latency-play has a LOW ceiling AND starts 2.7× behind.
+Higher-value pivots: (a) the weight-wall GEMM (native fp4) since fmoe/GEMM is ~80% of the region; (b) target
+prefill/large-batch where the all-to-all is 31–42%; (c) reconsider whether to contribute the FUSION/overlap
+capability specifically rather than rebuild the whole pipeline. [VERIFIED, complete region, both sides.]
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
