@@ -570,6 +570,51 @@ these eager numbers OVERSTATE the local region vs the graph-mode trace. Re-run u
 dynamic_quant) — don't map them 1:1 to this MoE microbench. (3) cost-model constants (HBM/XGMI BW, fp8
 peak) still un-pinned; the measured weight floor now pins HBM-eff≈0.76 for the fmoe kernel.
 
+## REAL 8-GPU head-to-head: b1_dispatch (fused) vs MORI+aiter (unfused) — RUN 2026-06-29 *** BASELINE TRUTH ***
+_status: RUN on cv350-rck-g03-f03-18 (10.0.0.228), container qilihuan-dsv4-dp8-ep-vllm0617, 8×MI350 gfx950.
+UNFUSED = `b2_production/b3_ep8_unfused.py` (real MORI EpDispatch/EpCombine all-to-all + aiter fused_moe,
+8 ranks via mp.Pool, MAX over ranks). FUSED = `b1_dispatch/example.py` np=8 SCHEDULE=b0 (IRIS gather +
+grouped_b0). Needed MORI_GPU_ARCHS=gfx950 (container defaulted gfx942-first → hipModuleLoad invalid)._
+
+### UNFUSED production EP MoE region (8-GPU, MAX over ranks) — the REAL denominator
+| tok/rank | recv/rank | dispatch (a2a) | fmoe (full FFN) | combine (a2a) | REGION | all-to-all % |
+|---|---|---|---|---|---|---|
+| 16   | 84   | 24.5 µs | 291.3 µs | 18.3 µs | **321 µs**  | 13% |
+| 64   | 335  | 25.1 µs | 312.4 µs | 18.1 µs | **353 µs**  | 12% |
+| 256  | 1355 | 110.0 µs| 672.4 µs | 273.3 µs| **909 µs**  | 42% |
+| 1024 | 5410 | 234.6 µs| 1412.9 µs| 378.1 µs| **1991 µs** | 31% |
+MORI dispatch+combine confirm the C4 trace (24+18≈trace's 30.7+23.2). At DECODE the all-to-all is only
+~13% of the region (fmoe weight-wall ~90%); at large batch it grows to 31–42% (BW-bound movement).
+
+### FUSED b1_dispatch (np=8, SCHEDULE=b0, N=2048 = ONE projection, single consumer rank, NO combine)
+| TOTAL_M | M_e | T_gather | T_gemm | T_total | GEMM TFLOP/s | Mpacked | gather RMS |
+|---|---|---|---|---|---|---|---|
+| 128  | 4   | 78.2 µs  | 339.6 µs | 422.7 µs | 11.1  | 8192 | 0.000000 ✅ |
+| 512  | 16  | 104.4 µs | 342.6 µs | 452.1 µs | 43.9  | 8192 | 0.000000 ✅ |
+| 2048 | 64  | 200.7 µs | 345.6 µs | 551.3 µs | 174.0 | 8192 | 0.000000 ✅ |
+| 8192 | 256 | 215.8 µs | 500.7 µs | 721.7 µs | 480.4 | 8192 | 0.000000 ✅ |
+(Reproduces the prior Level-2 row at TOTAL_M=8192: gather 216, gemm 501, total 722 ≈ ledger 215/494/714.)
+
+### VERDICT — b1_dispatch is a CORRECT proof-of-concept but NOT yet competitive
+1. **Gather 3–4× slower than MORI at decode.** b1 IRIS pull-gather 78 µs vs MORI dispatch 24.5 µs (M_e≈4);
+   104 vs 25 (M_e≈16); converges only at the largest batch (216 vs 235). And b1's gather is measured
+   SINGLE-CONSUMER (favorable) — a real all-to-all (all 8 ranks congesting) would widen the gap. This is
+   THE thing the gather-kernel project must fix: close the 3–4× to MORI's batched all-to-all.
+2. **Decode GEMM is padding-killed.** Mpacked = 8192 ALWAYS (BM=256 × 32 experts), so at M_e=4 the GEMM
+   computes 8192 rows for 128 real (98% waste) → 11 TFLOP/s, and 340 µs for ONE projection vs the
+   unfused's 291 µs for the FULL FFN. The BM=256 padding is catastrophic below M_e=256.
+3. **Incomplete pipeline.** b1 does ONE N=2048 projection (not the full fc1+SiLU+fc2 FFN) and has NO
+   combine. A complete b1 (full FFN ≈ 3× the GEMM + a combine) at M_e=256 would be ~1944 µs ≈ PARITY with
+   the unfused 1991 µs; at decode it would be SLOWER (padding + gather overhead).
+4. **The old "1.76×" (714 vs 1255) was an artifact:** it compared b1's partial work (one projection, no
+   combine) at a single prefill-size point against a single-GPU EAGER full-pipeline number. Apples-to-oranges
+   on (region scope, projections, eager-vs-graph, operating point). The honest 8-GPU picture is parity-to-slower.
+
+### What this makes the project: close 3 quantified gaps
+(a) gather efficiency vs MORI (3–4× at decode), (b) a BM<256 decode schedule (kill the padding tax),
+(c) native-fp8 GEMM + the missing combine + full FFN. Until then b1_dispatch is the right *dataflow* but
+not a faster *kernel*. This is the honest baseline starting point.
+
 ## Phase C — single-expert schedule ablations (4P4C / 8-wave / 4-wave / occupancy / XCD / cache)
 _status: PARKED per redirection — schedule variants (04/05/07/08) park until copy-once pipeline works_
 
