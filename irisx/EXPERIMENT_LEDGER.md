@@ -999,5 +999,21 @@ run) → RMS would collapse to ~0.005, but changing the reference to pass the ga
 done here. So against the CURRENT bf16-weight reference, a strict RMS<0.05 win is unreachable while keeping
 the latency win. HONEST STATE: **decode is a latency win at the inherent fp8-on-both precision floor (0.057),
 the same fp8 weight class the b3/aiter baseline runs; prefill's 1.56x (RMS 0.018 PASS) remains the clean
-all-regime headline.** Next levers (latency-only, do not change the RMS verdict): gap-2 layout compaction
-(PAD 256→16, projected fc1 274→~237 / fc2 147→~118) and the in-region 3.43→3.97 TB/s GEMM-rate gap.
+all-regime headline.**
+
+### On gap-2 (Mpacked 8192 compaction) — REASSESSED: likely-low-reward, NOT pursued (the act tax, the real
+### padding cost, was the recoverable part and is already gone in round 1)
+The research-diagnosis projected compaction (PAD 256→16) would also lift the GEMM (fc1 274→~237, fc2
+147→~118) by removing an "8192-row address scatter." Reassessment says that GEMM projection is unconfirmed
+and probably illusory: the fc1/fc2 weight stream (0.94/0.47 GB — the bottleneck) is a CONTIGUOUS per-expert
+[E·N, K] buffer, NOT scattered; only the A-read (~3.7 MB) and C-write (~2 MB) live in the 8192-row space,
+and ≤6 MB of scattered traffic cannot account for the ~37 µs that separates the in-region 3.43 from the
+standalone 3.97 TB/s (≤6 MB at even 1 TB/s = a few µs). The residual rate gap is in-region pipeline/clock
+context + the N-shape difference (in-region fc1 is N=4096 vs the 3.97-standalone's N=2048), not padding. And
+compaction is INVASIVE/high-risk: the sat decode kernel only needs ERB%16, but the gather and the dense
+BM=256 GEMM rely on ERB%64 / ERB%256 (b0_tasks.py:19), and the ledger rule is REUSE-don't-rewrite (3 rewrites
+→ RMS≈1.0). So round 1 (task-driven act, removing the ~94% padding HBM traffic that WAS exposed) captured the
+real padding cost; the decode region is now GEMM-weight-bound (fc1 273 + fc2 147 = 420 of 516 µs is the two
+fp8 weight streams near the in-region HBM rate), with no large latency lever left that doesn't touch the GEMM
+internals or the layout. Net latency win (516.5 vs 527) is genuine but slim; not worth risking the verified
+pipeline for a verdict-neutral deepening.
