@@ -908,3 +908,40 @@ Without a same-node b3 the win/loss gate is INCONCLUSIVE on node A.
 - VERDICT on node A as measured: decode 920 us vs the (faster-node) b3 533 us = nominal 1.73x LOSS,
   but NOT a fair comparison. A fair same-node gate requires re-measuring b3 here (aiter JIT permitting)
   or re-running both on the faster baseline node.
+
+## FAIR DECODE GATE on node B (mi355x-thor-4 = the BASELINE node) — 2026-06-30 ~17:55 UTC — SUPERSEDES the node-A note above
+
+The node-A (pollara-3) note above is throttle-contaminated: pollara-3 was running ~1.8x slow
+(prefill 2198 vs baseline 1259). thor-4 (job 6915, container irisx2) is the node where b3=533 and the
+1259 prefill were established — confirmed below. The gate was re-run there (after `pip install mpi4py`
+into irisx2; iris_py.so + tk_kernel.so are on the shared /home so already present).
+
+### DECODE region — node B, saturating fp8 BM=16 DECODE_SAT (FFN=full COMBINE=1 pull, TOTAL_M=512, ROUTE=uniform, DECODE_FP8=1)
+3 runs: T_total = **538.16 / 536.63 / 537.20 us** (median **~537 us**, very stable).
+Per-stage (us): gather 41.5 | fc1 274.2 (**109.6 TFLOP/s ≈ 3.43 TB/s** fp8 weight stream) | act 25.1 |
+fc2 150.4 (99.9 TFLOP/s) | combine 46.9. RMS_rel = **0.05669 (FFN FAILED, tol 0.05)**; combine acc RMS 0.00166 PASS. Mpacked=8192.
+
+vs b3 decode (MORI disp + aiter fmoe + MORI comb, tok/rank=64) = **533 us**:
+**decode 537 us / 533 us = 1.008x → NEAR-TIE, marginal ~0.8% LOSS. NOT a win.**
+The sat kernel realizes ~3.43 TB/s in-region (vs 3.97 standalone) — it slashed decode from the prior
+bf16 BM=16 874 us and fp8-LDS 850 us down to 537 us (landing within 1% of b3), but does NOT cross under
+533, and the region RMS 0.057 (fp8 weights on BOTH fc1 and fc2 + fp8 intermediate requant) exceeds the
+0.05 correctness tol. So decode is essentially parity, not the projected ~468 us win.
+
+### PREFILL — node B (TOTAL_M=8192, DECODE=0 bf16, the won regime)
+T_total = **1240.5 us** (RMS 0.01826 PASS), fc1 482.6 us (**996.8 TFLOP/s**), combine 285.6.
+vs b3 prefill 1941 us = **b1 WINS 1.56x** (matches the prior 1.54x; confirms node B == baseline node).
+
+### VERDICT (fair, same-node B)
+- PREFILL: b1 WINS 1.56x (holds). DECODE: PARITY (537 vs 533, marginal loss) — NOT an all-regime win.
+- The integrated saturating fp8 BM=16 DECODE_SAT kernel is correct-ish (combine PASS) and fast (3.43 TB/s
+  in-region) but two things block the decode win: (1) it lands ~1% above b3, and (2) region RMS 0.057 > 0.05
+  tol. Closing it needs either a faster in-region fp8 GEMM (3.43→3.97+ TB/s, e.g. shrink Mpacked below
+  8192 — DECODE_FP8 did NOT remove the BM=256 padding) and/or a lower-error fp8 scheme to pass RMS.
+
+### NOTE on the aiter b3 "JIT hang"
+Not a hang — cold-cache JIT. aiter compiles per-(shape,dtype) MoE asm/CK kernels on first fused_moe call;
+the cache lives in container-local /app/aiter-test/aiter/jit (NOT the shared /home). irisx1 (node A) had a
+COLD cache → 10+ min compile (637MB module_aiter_operator.so + per-shape moe ck2stages instances). irisx2
+(node B) already has module_moe_asm.so + ck2stages instances built, which is why b3=533 was obtainable there.
+Fix: run b3 on node B, or pre-warm node A's aiter cache before timing.
