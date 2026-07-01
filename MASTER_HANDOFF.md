@@ -203,7 +203,22 @@ Run independent subagents concurrently (one Agent message, multiple tool calls).
 
 ## 10. Open directions / next steps (in rough priority)
 
-1. **fp4 weights for decode** (§5.5/§5.6) — the highest-leverage decode experiment; halves the weight wall + raises the fusion ceiling. **HK already ships the scaled-MFMA `mxfp8` GEMM body** (`kernels/gemm/mxfp8/`, `mma_ABt_scaled` with E8M0 per-32-block scales), so this is now mostly **MX-format wiring** (re-quantize to MXFP8/MXFP4, reuse HK's body, wrap our expert-grouping + IRIS gather/combine) rather than a new MFMA path — use the AMD-quantized MX model Simran sent. First verify aiter has an fp4 `fmoe` for a fair baseline.
+1. **fp4 weights for decode** (§5.5/§5.6) — **✅ DONE 2026-06-30 (Route 1, shipped in `kernel.cpp`).**
+   - **Model (amd/DeepSeek-R1-MXFP4):** OCP **MXFP4 W4A4** — weights (static) AND activations (dynamic) fp4
+     e2m1, group_size 32, E8M0 per-block scale along K (HF config.json + card). Our Route-1 decode keeps A
+     bf16 (weight-only fp4; more accurate than the model's true A4).
+   - **Kernel:** `grouped_b0_gemm_decode_mxfp4_sat` — store B fp4 (¼ bf16 bytes), PRE-SWIZZLE (`kDecSatPermFp4`
+     = algebraic compose of the fp8 `PERM128`), load via the fast bf16 path as `rt_bf<32,32>`, unpack fp4→bf16
+     with the **gfx950 hardware `__builtin_amdgcn_cvt_scalef32_pk_bf16_fp4`** (MX scale folded in — the software
+     `float4(fp4e2m1_4)` path is 4× slower, the key perf lever), bf16 MFMA. Env `DECODE_MXFP4=1`.
+   - **Standalone GEMM (same node):** MXFP4 **1.6× over our fp8 `_sat` decode**, ~2× over bf16. Gate: RMS vs
+     dequant-fp4 = 0.0033 (correct); fp4 precision class vs true bf16 B = 0.117 (vs fp8 0.057).
+   - **Fused decode REGION (8× MI350, same node, TOTAL_M=512):** MXFP4 **520.6 µs** (FFN PASS RMS 0.018) vs fp8
+     578.9 vs bf16 881.3 → **1.11× over fp8, 1.69× over bf16** (GEMM-only 1.16×/1.96×; region diluted by the
+     shared A-dequant + gather/act/combine boundaries).
+   - **Next:** the aiter fp4 `a4w4` fmoe (`per_1x32`, fp4x2, e8m0_shuffle) exists — capture it for the true
+     baseline; and reduce the ¼-byte-load convert-bound tail (fp4 needs 2× the converts of fp8) / faithful
+     1-byte E8M0 scale stream (currently f32 scales). Route 2 (true fp4×fp4 scaled-MFMA) is the prefill path.
 2. **The gather-under-MFMA GEMM body** (§6) — a producer/consumer-warp GEMM with async A-fill + reuse, to make true in-kernel comm/compute overlap work. This is Osama's "fuse inside the GEMM" prize.
 3. **`reduce_scatter`** as the second IRIS collective (the meeting's other target).
 4. **End-to-end TPOT** integration — measure the region win at the model level, not just region-level (the gold-standard denominator).

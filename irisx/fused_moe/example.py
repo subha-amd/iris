@@ -88,8 +88,11 @@ COMBINE_GRAN = int(os.environ.get("COMBINE_GRAN", "8"))        # pull store widt
 # tax at low M_e). Same 256-padded packed layout (build_b0_tasks_decode) so phase1/act/combine UNCHANGED.
 DECODE       = int(os.environ.get("DECODE", "0"))
 DECODE_FP8   = int(os.environ.get("DECODE_FP8", "0"))          # 1 = native-fp8 BM=16 decode (halves weight stream)
-if DECODE_FP8:
-    DECODE = 1                                                 # fp8 decode uses the BM=16 task layout
+DECODE_MXFP4 = int(os.environ.get("DECODE_MXFP4", "0"))        # 1 = MXFP4 (OCP W4, E8M0/32blk) BM=16 decode (1/4 bytes)
+if DECODE_FP8 or DECODE_MXFP4:
+    DECODE = 1                                                 # both use the BM=16 task layout
+if DECODE_MXFP4:
+    DECODE_FP8 = 0                                             # mxfp4 and fp8 decode are mutually exclusive
 assert FFN in ("single", "full"), f"bad FFN={FFN}"
 if FFN == "full":
     assert SCHEDULE == "b0", "FFN=full chains grouped_gemm_b0 twice -> requires SCHEDULE=b0"
@@ -99,6 +102,39 @@ N_FC1  = 2 * INTER                               # 4096 (gate||up fused)
 K_FC1  = K                                       # 7168
 N_FC2  = K                                       # 7168 (down projects back to hidden)
 K_FC2  = INTER                                   # 2048
+
+# ---- MXFP4 (OCP W4, E8M0 per-32-K-block) weight quantizer — matches kernel.cpp grouped_b0_gemm_decode_
+# mxfp4_sat EXACTLY (kDecSatPermFp4 swizzle, 2 fp4/byte, low nibble = even col, hardware e2m1 codes). ----
+_PERM_FP4 = [
+    0,1,2,3,4,5,6,7, 32,33,34,35,36,37,38,39, 64,65,66,67,68,69,70,71, 96,97,98,99,100,101,102,103,
+    8,9,10,11,12,13,14,15, 40,41,42,43,44,45,46,47, 72,73,74,75,76,77,78,79, 104,105,106,107,108,109,110,111,
+    16,17,18,19,20,21,22,23, 48,49,50,51,52,53,54,55, 80,81,82,83,84,85,86,87, 112,113,114,115,116,117,118,119,
+    24,25,26,27,28,29,30,31, 56,57,58,59,60,61,62,63, 88,89,90,91,92,93,94,95, 120,121,122,123,124,125,126,127]
+def _quant_b_mxfp4(Bw, Ne):
+    """Bw [E*Ne, Kd] bf16 -> (packed_swizzled_fp4_as_bf16 [E*Ne, Kd/4], scale_f32 [E*Ne, Kd/32],
+    dequant_bf16 [E*Ne, Kd]). E8M0 scale = 2^(floor(log2(amax))-2); e2m1 nearest-code."""
+    dev = Bw.device; R = Bw.shape[0]; Kd = Bw.shape[1]
+    levels = torch.tensor([0.,0.5,1.,1.5,2.,3.,4.,6.], device=dev)
+    mids   = torch.tensor([0.25,0.75,1.25,1.75,2.5,3.5,5.0], device=dev)
+    perm   = torch.tensor(_PERM_FP4, dtype=torch.long, device=dev)
+    x = Bw.float().view(R, Kd // 32, 32)
+    amax = x.abs().amax(dim=2)                                              # [R, Kd/32]
+    _, ex = torch.frexp(amax)                                              # amax = m*2^ex, floor(log2)=ex-1
+    se = (ex - 1 - 2 + 127).clamp(1, 254)
+    se = torch.where(amax > 0, se, torch.full_like(se, 127))
+    scale = torch.exp2((se.float() - 127.0))                              # [R, Kd/32]
+    q = x / scale.unsqueeze(2)
+    a = q.abs()
+    mag = torch.bucketize(a, mids, right=True)                            # 0..7
+    sign = (q < 0)
+    code = (mag + sign.to(torch.int32) * 8).view(R, Kd).to(torch.uint8)   # [R, Kd] codes 0..15
+    deq = (levels[mag] * torch.where(sign, -1.0, 1.0)).view(R, Kd // 32, 32) * scale.unsqueeze(2)
+    deq = deq.view(R, Kd).to(torch.bfloat16)
+    csw = code.view(R, Kd // 128, 128)[:, :, perm].reshape(R, Kd)         # swizzle per 128-fp4-block
+    c2 = csw.view(R, Kd // 2, 2)
+    packed = (c2[:, :, 0].int() | (c2[:, :, 1].int() << 4)).to(torch.uint8).contiguous()   # [R, Kd/2] bytes
+    packed_bf16 = packed.view(torch.bfloat16).contiguous()               # [R, Kd/4]
+    return packed_bf16, scale.contiguous(), deq
 
 iris = iris_py.Iris(heap_size_mb=512, verbose=False)
 rank = iris.rank()
@@ -294,6 +330,12 @@ if FFN == "full":
         for _e in range(E):
             _rowe[int(expert_row_begin[_e]):int(expert_row_begin[_e]) + int(padded_rows[_e])] = _e
         ROW_EXPERT = torch.from_numpy(_rowe).to('cuda')
+    if DECODE_MXFP4:
+        # host pre-swizzled+packed fp4 B (as bf16 [E*N, K/4]) + per-32-block scale [E*N, K/32]; filled on consumer.
+        B_fc1_mxfp4 = torch.zeros(E * N_FC1, K_FC1 // 4, dtype=torch.bfloat16, device='cuda')
+        B_fc2_mxfp4 = torch.zeros(E * N_FC2, K_FC2 // 4, dtype=torch.bfloat16, device='cuda')
+        sBe_fc1 = torch.ones(E * N_FC1, K_FC1 // 32, dtype=torch.float32, device='cuda')
+        sBe_fc2 = torch.ones(E * N_FC2, K_FC2 // 32, dtype=torch.float32, device='cuda')
 
 # COMBINE reverse map (LOCAL on the consumer — read locally by the combine kernel; acc is the only
 # combine buffer that must be on the IRIS heap). REV ints + WGT float mirror the route_reverse ABI.
@@ -328,6 +370,11 @@ if FFN == "full" and rank == CONSUMER:
     if DECODE_FP8:
         _q1, _s1 = _quant_b_perrow(B_fc1, N_FC1); B_fc1_fp8.copy_(_q1); sB_fc1.copy_(_s1)
         _q2, _s2 = _quant_b_perrow(B_fc2, N_FC2); B_fc2_fp8.copy_(_q2); sB_fc2.copy_(_s2)
+    if DECODE_MXFP4:
+        # quantize -> load kernel buffers; then replace B_fc1/B_fc2 with the DEQUANT-fp4 weights so the
+        # FFN reference measures KERNEL correctness (RMS ~0.003), not the fp4 quant class (~0.12, reported separately).
+        _p1, _e1, _d1 = _quant_b_mxfp4(B_fc1, N_FC1); B_fc1_mxfp4.copy_(_p1); sBe_fc1.copy_(_e1); B_fc1.copy_(_d1)
+        _p2, _e2, _d2 = _quant_b_mxfp4(B_fc2, N_FC2); B_fc2_mxfp4.copy_(_p2); sBe_fc2.copy_(_e2); B_fc2.copy_(_d2)
 
 if rank == CONSUMER:
     SEG.copy_(torch.from_numpy(seg_arr).cuda())
@@ -383,7 +430,10 @@ _gemm_b0 = (tk_kernel.grouped_gemm_b0_decode if DECODE else tk_kernel.grouped_ge
 
 def phase_fc1():
     # fc1: packed A [Mpacked,7168] fp8 -> C1 [Mpacked,4096] bf16 (gate||up fused, g1u1).
-    if DECODE_FP8:
+    if DECODE_MXFP4:
+        tk_kernel.grouped_gemm_b0_decode_mxfp4(A_pk_bf16, A_pk_sc, B_fc1_mxfp4, sBe_fc1,
+                                               C1, TASKS_fc1, Mpacked, N_FC1, K_FC1, num_tasks_fc1, E)
+    elif DECODE_FP8:
         tk_kernel.grouped_gemm_b0_decode_fp8(A_pk_bf16, A_pk_sc, B_fc1_fp8.view(torch.bfloat16), sB_fc1,
                                              C1, TASKS_fc1, ROW_EXPERT, Mpacked, N_FC1, K_FC1, num_tasks_fc1, E)
     else:
@@ -403,7 +453,10 @@ def phase_act_quant():
 
 def phase_fc2():
     # fc2: packed A2 [Mpacked,2048] fp8 -> C2 [Mpacked,7168] bf16 (down projection).
-    if DECODE_FP8:
+    if DECODE_MXFP4:
+        tk_kernel.grouped_gemm_b0_decode_mxfp4(A2_bf16, A2_sc, B_fc2_mxfp4, sBe_fc2,
+                                               C2, TASKS_fc2, Mpacked, N_FC2, K_FC2, num_tasks_fc2, E)
+    elif DECODE_FP8:
         tk_kernel.grouped_gemm_b0_decode_fp8(A2_bf16, A2_sc, B_fc2_fp8.view(torch.bfloat16), sB_fc2,
                                              C2, TASKS_fc2, ROW_EXPERT, Mpacked, N_FC2, K_FC2, num_tasks_fc2, E)
     else:

@@ -1424,6 +1424,116 @@ void dispatch_grouped_gemm_b0_decode_fp8(b0_dec_fp8_globals g) {
 }
 
 // ================================================================================================
+// MXFP4 (OCP W4, E8M0 per-32-K-block) BM=16 decode — Route 1: fp4 B (1/4 bf16 bytes) PRE-SWIZZLED
+// (kDecSatPermFp4 = algebraic compose of the fp8 PERM128) loads via the fast bf16 path as rt_bf<32,32>,
+// unpacked fp4->bf16 in-register by the gfx950 HARDWARE v_cvt_scalef32_pk_bf16_fp4 (MX scale folded in),
+// then bf16 MFMA. A stays bf16. ~1.6x over the fp8 _sat decode (halves the fp8 weight wall). exp_14-15.
+// ================================================================================================
+template<int SEL>
+__device__ __forceinline__ bf16_2 mxfp4_cvt_pair(unsigned reg, float s) {
+    auto v = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp4(reg, s, SEL);   // 2 fp4 (byte SEL) -> 2 bf16 * s
+    bf16_2 out; __builtin_memcpy(&out, &v, 4); return out;
+}
+
+template <int NN, int KK>
+__global__ __launch_bounds__(512, 2)
+void grouped_b0_gemm_decode_mxfp4_sat(
+        const gl<bf16, -1, -1, -1, -1> A,    // [Mpacked, K]   bf16 activations (block-dequant)
+        const gl<bf16, -1, -1, -1, -1> Bpk,  // [E*N, K/4]     PRE-SWIZZLED fp4 weights reinterpreted as bf16
+        const gl<bf16, -1, -1, -1, -1> C,    // [Mpacked, N]   final output
+        const float* __restrict__ sBe,       // [E*N, K/32]    per-32-block weight scale (E8M0 decoded to f32)
+        const int* __restrict__ tasks, int num_tasks) {
+    constexpr int BM_DEC = 16, BN_DEC = 256, BLOCK_K = 128;
+    constexpr int WARPS_COL = 8;
+    constexpr int REG_BLOCK_N = BN_DEC / WARPS_COL;    // 32
+    constexpr int k_iters = KK / BLOCK_K;              // 56 for K=7168
+    constexpr int NBLK32  = KK / 32;                   // scales per N-row
+    using RT_A   = rt_bf<BM_DEC,      BLOCK_K,   row_l, rt_16x32_s>;   // 16x128 bf16 A
+    using RT_BPK = rt_bf<REG_BLOCK_N, BLOCK_K/4, row_l, rt_16x32_s>;  // 32x32  bf16 = 32x128 packed fp4
+    using RT_B   = rt_bf<REG_BLOCK_N, BLOCK_K,   row_l, rt_16x32_s>;  // 32x128 bf16 (unpacked B)
+    using RT_C   = rt_fl<BM_DEC, REG_BLOCK_N, col_l, rt_16x16_s>;     // 16x32 fp32 accumulator
+    RT_A a; RT_BPK bpk; RT_B b; RT_C c;
+
+    const int task = blockIdx.x;
+    if (task >= num_tasks) return;
+    const int* tk = tasks + (size_t)task * B0_TASK_W;
+    const int e = tk[B0_T_EXPERT], mt = tk[B0_T_MTILE], nt = tk[B0_T_NTILE], ERB = tk[B0_T_EROWBEG];
+    const int warp_n = warpid();
+
+    const int a_row16 = ERB / BM_DEC + mt;
+    const int b_row32 = (e * NN) / REG_BLOCK_N + nt * WARPS_COL + warp_n;
+    const int c_row16 = ERB / BM_DEC + mt;
+    const int c_col32 = nt * WARPS_COL + warp_n;
+
+    const int    r16 = kittens::laneid() % 16;
+    const int    n0  = e * NN + nt * BN_DEC + warp_n * REG_BLOCK_N;
+    const size_t se0 = (size_t)(n0 + r16)      * NBLK32;
+    const size_t se1 = (size_t)(n0 + 16 + r16) * NBLK32;
+
+    zero(c);
+    #pragma unroll 4
+    for (int k = 0; k < k_iters; k++) {
+        kittens::load<2>(a,   A,   {0, 0, a_row16, k});   // 16x128 bf16 A slab (broadcast)
+        kittens::load<2>(bpk, Bpk, {0, 0, b_row32, k});   // 32x32  bf16 = this warp's 32x128 fp4 strip
+        float sc[2][4];
+        #pragma unroll
+        for (int d = 0; d < 4; d++) { sc[0][d] = sBe[se0 + 4*k + d]; sc[1][d] = sBe[se1 + 4*k + d]; }
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            #pragma unroll
+            for (int d = 0; d < 4; d++) {
+                const float s = sc[i][d];
+                unsigned reg; __builtin_memcpy(&reg, &bpk.tiles[i][0].data[d], 4);
+                b.tiles[i][d].data[0] = mxfp4_cvt_pair<0>(reg, s);
+                b.tiles[i][d].data[1] = mxfp4_cvt_pair<1>(reg, s);
+                b.tiles[i][d].data[2] = mxfp4_cvt_pair<2>(reg, s);
+                b.tiles[i][d].data[3] = mxfp4_cvt_pair<3>(reg, s);
+            }
+        }
+        mma_ABt(c, a, b, c);
+    }
+    store(C, c, {0, 0, c_row16, c_col32});
+}
+
+struct b0_dec_mxfp4_globals {
+    gl<bf16,  -1, -1, -1, -1> a;       // [Mpacked, K/2] packed fp8-as-bf16 A (per-128-block sc)
+    gl<float, -1, -1, -1, -1> sc;      // [Mpacked, K/128] A per-block scales
+    gl<bf16,  -1, -1, -1, -1> b;       // [E*N, K/4] B pre-swizzled packed fp4-as-bf16
+    gl<float, -1, -1, -1, -1> sB;      // [E*N, K/32] per-32-block B scale (E8M0 decoded to f32)
+    gl<bf16,  -1, -1, -1, -1> c;       // [Mpacked, N] bf16 output
+    gl<int,   -1, -1, -1, -1> tasks;   // [num_tasks, 4] BM=16 task list
+    int Mpacked, N, K, num_tasks, E;
+    hipStream_t stream;
+};
+
+// MXFP4 decode pipeline: (1) dequant packed fp8 A -> bf16 (block-scaled, reuses the fp8 path), then
+// (2) the saturating fp4-load-unpack GEMM (B arrives PRE-SWIZZLED from the host) -> final C.
+void dispatch_grouped_gemm_b0_decode_mxfp4(b0_dec_mxfp4_globals g) {
+    if (g.num_tasks <= 0) return;
+    // 1. dequant A (packed fp8 + per-128-block scale) -> bf16.
+    static bf16* d_a_bf16 = nullptr; static size_t cap_a = 0;
+    const size_t need_a = (size_t)g.Mpacked * g.K;
+    if (need_a > cap_a) { if (d_a_bf16) hipFree(d_a_bf16); hipMalloc(&d_a_bf16, need_a * sizeof(bf16)); cap_a = need_a; }
+    const fp8_t* a_fp8 = reinterpret_cast<const fp8_t*>(g.a.raw_ptr);
+    const int ntiles = (g.N >= 256) ? (g.N / 256) : 1;
+    if (ntiles > 0 && g.num_tasks % ntiles == 0)
+        dequant_packed_mtile<<<g.num_tasks / ntiles, 256, 0, g.stream>>>(a_fp8, g.sc.raw_ptr, d_a_bf16, g.tasks.raw_ptr, ntiles, g.K);
+    else
+        dequant_packed_dense<<<g.Mpacked, 256, 0, g.stream>>>(a_fp8, g.sc.raw_ptr, d_a_bf16, g.Mpacked, g.K);
+    gl<bf16, -1, -1, -1, -1> Abf(d_a_bf16, 1, 1, g.Mpacked, g.K);
+
+    gl<bf16, -1, -1, -1, -1> Bpk(g.b.raw_ptr, 1, 1, g.E * g.N, g.K / 4);   // pre-swizzled fp4 as quarter-width bf16
+    gl<bf16, -1, -1, -1, -1> Cfin(g.c.raw_ptr, 1, 1, g.Mpacked, g.N);
+    const float* sBe = g.sB.raw_ptr;
+    const int* tasks = g.tasks.raw_ptr;
+    const int threads = 8 * 64;
+    if      (g.N == 2048 && g.K == 7168) grouped_b0_gemm_decode_mxfp4_sat<2048, 7168><<<g.num_tasks, threads, 0, g.stream>>>(Abf, Bpk, Cfin, sBe, tasks, g.num_tasks);
+    else if (g.N == 4096 && g.K == 7168) grouped_b0_gemm_decode_mxfp4_sat<4096, 7168><<<g.num_tasks, threads, 0, g.stream>>>(Abf, Bpk, Cfin, sBe, tasks, g.num_tasks);
+    else if (g.N == 7168 && g.K == 2048) grouped_b0_gemm_decode_mxfp4_sat<7168, 2048><<<g.num_tasks, threads, 0, g.stream>>>(Abf, Bpk, Cfin, sBe, tasks, g.num_tasks);
+    else { printf("grouped_gemm_b0_decode_mxfp4: unsupported (N=%d,K=%d)\n", g.N, g.K); return; }
+}
+
+// ================================================================================================
 // COMBINE (the EpCombine equivalent) — scatter the fc2 output back to origin tokens over IRIS.
 //
 // ADDITIVE: nothing above changes. This is the REVERSE of phase-1 gather. Phase-1 gather read REMOTE
@@ -1692,6 +1802,21 @@ PYBIND11_MODULE(tk_kernel, m) {
         &b0_dec_fp8_globals::K,
         &b0_dec_fp8_globals::num_tasks,
         &b0_dec_fp8_globals::E
+    );
+    // DECODE MXFP4: fp4 (OCP W4, E8M0 per-32-block) BM=16 GEMM (1/4 the bf16 bytes; ~1.6x over fp8 decode).
+    // B is host pre-swizzled+packed fp4 (as bf16 [E*N,K/4]); sB = per-32-block scale (E8M0 decoded to f32).
+    py::bind_function<dispatch_grouped_gemm_b0_decode_mxfp4>(m, "grouped_gemm_b0_decode_mxfp4",
+        &b0_dec_mxfp4_globals::a,
+        &b0_dec_mxfp4_globals::sc,
+        &b0_dec_mxfp4_globals::b,
+        &b0_dec_mxfp4_globals::sB,
+        &b0_dec_mxfp4_globals::c,
+        &b0_dec_mxfp4_globals::tasks,
+        &b0_dec_mxfp4_globals::Mpacked,
+        &b0_dec_mxfp4_globals::N,
+        &b0_dec_mxfp4_globals::K,
+        &b0_dec_mxfp4_globals::num_tasks,
+        &b0_dec_mxfp4_globals::E
     );
     // COMBINE (EpCombine equivalent): scatter fc2 output [Mpacked,H] back to acc[Tlocal,H] on each
     // origin rank over IRIS, weighted by route_weight, accumulating top-k contributions. c2/rev/wgt
