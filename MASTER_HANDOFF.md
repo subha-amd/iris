@@ -203,6 +203,25 @@ Run independent subagents concurrently (one Agent message, multiple tool calls).
 
 ## 10. Open directions / next steps (in rough priority)
 
+> ⚠️ **DO THIS BEFORE more fp4 work — establish a LEGITIMATE EXTERNAL baseline (lesson learned 2026-07-01).**
+> Our fp4 comparison so far replays a *captured* aiter `a4w4` CK kernel that turned out **untuned + buggy** for
+> our EP shape (see §10.1) — effectively a "fake baseline" we generated. Beating it means nothing. Use a baseline
+> **we did NOT generate**, in this priority:
+> 1. **AMD's official reproducible SGLang DeepSeek-R1-FP4 benchmark** — Docker
+>    `rocm7.0_preview_ubuntu_22.04_sgl-dev-v0.5.2rc2_mi35x_rc1`, model **`amd/DeepSeek-R1-0528-MXFP4-Preview`**,
+>    TP8, full server+bench commands (1024 in/out, conc 64, 128 prompts). Runs the REAL production stack (SGLang +
+>    **FlyDSL** MoE + MoRI) on our exact MI350X. Run it on the node, **profile the MoE region** (the FlyDSL MoE +
+>    MoRI dispatch/combine kernels it actually launches), and iterate our fused region against THAT trace.
+>    (`rocm.docs.amd.com/en/docs-7.0-rc1/preview/benchmark-docker/inference-sglang-deepseek-r1-fp4.html`)
+> 2. **Kernel-level:** aiter's *tuned single-GPU* a4w4 bar (FlyDSL `afp4_wfp4_bf16`, **169 µs @ M_e16**) — real,
+>    external, and **2.4× ahead of our Route-1** (410 µs). Route 2 chases this.
+> 3. **Reference points (published/third-party):** LMSYS/SGLang MoRI (MI355X 2,436 tok/s/GPU, MXFP4 FP4-dispatch +
+>    FP8-combine, 2.56× round-trip BW cut); SemiAnalysis **InferenceX / InferenceMAX** (open-source live bench);
+>    MLPerf Inference v6.0 (audited, Llama-heavy). Simran offered to run the full e2e SGLang test — gold denominator.
+>
+> **The rule: never iterate against a kernel you captured/generated; iterate against the reproducible production
+> stack or an audited third-party number.**
+
 1. **fp4 weights for decode** (§5.5/§5.6) — **✅ DONE 2026-06-30 (Route 1, shipped in `kernel.cpp`).**
    - **Model (amd/DeepSeek-R1-MXFP4):** OCP **MXFP4 W4A4** — weights (static) AND activations (dynamic) fp4
      e2m1, group_size 32, E8M0 per-block scale along K (HF config.json + card). Our Route-1 decode keeps A
@@ -216,9 +235,20 @@ Run independent subagents concurrently (one Agent message, multiple tool calls).
    - **Fused decode REGION (8× MI350, same node, TOTAL_M=512):** MXFP4 **520.6 µs** (FFN PASS RMS 0.018) vs fp8
      578.9 vs bf16 881.3 → **1.11× over fp8, 1.69× over bf16** (GEMM-only 1.16×/1.96×; region diluted by the
      shared A-dequant + gather/act/combine boundaries).
-   - **Next:** the aiter fp4 `a4w4` fmoe (`per_1x32`, fp4x2, e8m0_shuffle) exists — capture it for the true
-     baseline; and reduce the ¼-byte-load convert-bound tail (fp4 needs 2× the converts of fp8) / faithful
-     1-byte E8M0 scale stream (currently f32 scales). Route 2 (true fp4×fp4 scaled-MFMA) is the prefill path.
+   - **Baseline status (Phase A, 2026-07-01):** the captured aiter `a4w4` EP fmoe is **untuned AND buggy for our
+     shape** — every `block_size_M` / `max_num_inp_token` sweep falls back to `2stage default` (no tuned config for
+     E_local=32 / per_1x32), so the unfused a4w4 region stays **791 µs**, and its EP fmoe (691) is even *slower*
+     than aiter's fp8 EP fmoe (503). ROCm/aiter #3632 (not HIP-graph-safe, gfx950) + #2343 (EP memory-fault,
+     MI355X) confirm the CK-a4w4+EP path is immature. **So our 1.52× over that region is over an untuned/buggy
+     kernel — do NOT headline it** (see the ⚠️ callout above for the real external baseline plan).
+   - **Route 2 (true fp4×fp4 scaled-MFMA) — feasibility validated (Phase B, exp_17), NOT yet built:** needs **NO
+     new HK tile types** (the earlier premise was wrong) — `mma_ABt_scaled<cbsz,blgp>` accepts `fp8e4m3` A/B and
+     `cbsz/blgp=4` selects fp4 on the existing `rt_fp8e4m3` tiles; the fp4-cbsz variant compiles clean. Stock HK
+     `mxfp8/MXFP8_8wave` (fp8 scaled-MFMA) builds+passes at **421 TFLOPS** — the ready vehicle. Two on-device
+     unknowns remain (multi-iteration; stopped rather than flail): (a) the fp4 operand byte→K layout with cbsz=4
+     (K doubles to 256/tile, undocumented like the fp8 `_sat` swizzle), (b) the scale granularity (mxfp8 packs 4
+     E8M0 for K=128; fp4's K=256 needs 8 per-32 blocks — per-64 would be lossy vs MXFP4's per-32). Route 2's value
+     is **prefill** (decode is weight-bound where Route-1 W4A16 is already the recommended variant).
 2. **The gather-under-MFMA GEMM body** (§6) — a producer/consumer-warp GEMM with async A-fill + reuse, to make true in-kernel comm/compute overlap work. This is Osama's "fuse inside the GEMM" prize.
 3. **`reduce_scatter`** as the second IRIS collective (the meeting's other target).
 4. **End-to-end TPOT** integration — measure the region win at the model level, not just region-level (the gold-standard denominator).
