@@ -1,6 +1,6 @@
 # MASTER HANDOFF — Fused DeepSeek-R1 MoE expert region on AMD MI355X
 
-> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-06-30.
+> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-06.
 
 ---
 
@@ -110,7 +110,7 @@ Latest commits on origin: `0d0abf7` (decode round-1) ← `de876b5` (task-driven 
    - **Prefill** (`grouped_b0_gemm`): activations dequant fp8→bf16 (`dequant_packed_dense`), **weights are stored bf16** (`example.py:270`) → **bf16×bf16 MFMA (16×16×32)**, RMS **0.018**. This is *more accurate* than aiter's fp8 (we don't quantize the weights at all), but it **assumes bf16 weights in HBM** — production R1 ships **fp8** weights, so dropping this into vLLM needs a one-time fp8→bf16 weight dequant (≈2× the weight footprint) **or** an fp8-GEMM adaptation. ⚠️ flag for Simran.
    - **Decode shipped** (`grouped_b0_gemm_decode_fp8_sat`, `DECODE_SAT=1`): weights **stored fp8 (1 byte — the byte-saving that matters for the weight-bound regime)**, loaded through the *fast bf16 path* (2 fp8 bytes reinterpreted as 1 bf16 via an offline per-128-block column **pre-swizzle**), unpacked fp8→bf16 **in-register**, then **bf16 MFMA**. So **memory = fp8, math = bf16**. RMS 0.057 is set by the fp8 *weight* quant (matches aiter's precision class) — the activations stay bf16.
    - **Decode native-fp8** (`grouped_b0_gemm_decode_fp8`, `DECODE_SAT=0`, **NOT shipped**): a true fp8×fp8 MFMA (16×16×128) — but it needs A requantized to a single **per-row** scale (our scales are **per-128-block**), and that coarsening pushed RMS to **0.073**, so it's behind the flag.
-   - **Why bf16 and not fp8 (checked against the HK source at `/Users/subha/repos/HipKittens`, HEAD `840c967` "MXFP8 Optimizations"):** HipKittens has **no native fp8 global→register load — it's a hard `static_assert("Unsupported type for load")`** (`include/cdna4/ops/warp/memory/tile/global_to_register.cuh:30,139`); the fast `buffer_load_b64/b128` path is bf16/float only. **This is by design, not a gap** — HK's *own* fp8 kernels (`kernels/gemm/fp8fp32/FP8_8wave`, `kernels/gemm/mxfp8/MXFP8_8wave`) stage fp8 through **LDS**: `st_fp8e4m3` shared tiles via `G::load` (global→shared) then `load_st_to_rt` (shared→register, `ds_read_b128`). Our non-`_sat` `_fp8` path matches that exactly; we measured the LDS-staged path **~2.6 TB/s** for the skinny BM=16 tile, vs our `_sat` reinterpret-as-bf16 trick **3.97 TB/s** — i.e. **`_sat` already beats HK's intended fp8 path** for that tile. So the unpack is NOT a real bottleneck and a "native fp8 load" is neither available nor the lever — **fewer bytes (fp4) is.**
+   - **Why bf16 and not fp8 (checked against the HK source at `/Users/subha/repos/HipKittens`, HEAD `840c967` "MXFP8 Optimizations"):** HipKittens has **no native fp8 global→register load — it's a hard `static_assert("Unsupported type for load")`** (`include/cdna4/ops/warp/memory/tile/global_to_register.cuh:30,139`); the fast `buffer_load_b64/b128` path is bf16/float only. (Precise: global→**shared** *does* accept fp8 — `global_to_shared.cuh:266` allows 1-byte dtypes; only global→**register** forbids it, which is why the intended fp8 path stages via shared.) **This is by design, not a gap** — HK's *own* fp8 kernels (`kernels/gemm/fp8fp32/FP8_8wave`, `kernels/gemm/mxfp8/MXFP8_8wave`) stage fp8 through **LDS**: `st_fp8e4m3` shared tiles via `G::load` (global→shared) then `load_st_to_rt` (shared→register, `ds_read_b128`). Our non-`_sat` `_fp8` path matches that exactly; we measured the LDS-staged path **~2.6 TB/s** for the skinny BM=16 tile, vs our `_sat` reinterpret-as-bf16 trick **3.97 TB/s** — i.e. **`_sat` already beats HK's intended fp8 path** for that tile. So the unpack is NOT a real bottleneck and a "native fp8 load" is neither available nor the lever — **fewer bytes (fp4) is.**
    - **The scaled MFMA is ALREADY exposed in HK** (this resolves the earlier "open question"): `mma_ABt_scaled(d,a,b,c,scale_a,scale_b)` (`include/cdna4/ops/warp/register/tile/mma.cuh:529` → `mfma1616128_scaled` → `__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4`), with `pack_scales` and a full reference GEMM in `kernels/gemm/mxfp8/`. It consumes **E8M0 (power-of-two), per-32-K-block** scales = the **MX** format. "requant to per-row" = the cost of applying scales *outside* an unscaled MFMA (which sums all of K, so only one scale/row fits); the scaled MFMA applies per-block scales *inside* the accumulate → no requant, no accuracy loss.
    - **The real remaining gap is a quantization FORMAT mismatch, not an HK feature:** aiter/DeepSeek fp8 = **per-128-K, fp32** scales; HK/hardware scaled MFMA = **per-32-K, E8M0** scales. per-128→per-32 is lossless replication, but **fp32→E8M0 is lossy** unless the model is genuinely MX-quantized. ⇒ **If we use the AMD-quantized MXFP8/MXFP4 model (almost certainly what Simran sent), HK already gives a full scaled, no-requant fp8/fp4 GEMM — reuse the `mxfp8` 8-wave body + wrap our expert-grouping + IRIS gather/combine around it.** This makes §5.5 / §10.1 (the fp4 decode lever) much closer than previously framed: the GEMM exists in HK; the work is the MX wiring + the MX-format reference, not a new MFMA path.
    - **Implication:** the **1.56× prefill win is purely from fusion** — achieved while our GEMM does *more* work per weight byte than aiter's fp8 (bf16 MFMA is ~½ the fp8 MFMA rate; bf16 weights are 2× the bytes). So a true fp8/fp4 GEMM is **headroom, not a regression**.
@@ -210,9 +210,18 @@ Run independent subagents concurrently (one Agent message, multiple tool calls).
 > 1. **AMD's official reproducible SGLang DeepSeek-R1-FP4 benchmark** — Docker
 >    `rocm7.0_preview_ubuntu_22.04_sgl-dev-v0.5.2rc2_mi35x_rc1`, model **`amd/DeepSeek-R1-0528-MXFP4-Preview`**,
 >    TP8, full server+bench commands (1024 in/out, conc 64, 128 prompts). Runs the REAL production stack (SGLang +
->    **FlyDSL** MoE + MoRI) on our exact MI350X. Run it on the node, **profile the MoE region** (the FlyDSL MoE +
->    MoRI dispatch/combine kernels it actually launches), and iterate our fused region against THAT trace.
+>    **FlyDSL** MoE + MoRI) on our exact MI350X. Run it, **profile the MoE region** + the realistic-config collective
+>    breakdown, and iterate our fused region against THAT trace.
 >    (`rocm.docs.amd.com/en/docs-7.0-rc1/preview/benchmark-docker/inference-sglang-deepseek-r1-fp4.html`)
+>    **STATUS 2026-07-06 — ATTEMPTED, INCOMPLETE (no MoE baseline captured yet).** Infra learnings from the attempt:
+>    the model is **403 GB** (82 safetensors, NOT ~190) → needs a node with **~500 GB genuinely-free** disk (put
+>    `HF_HOME` on the big mount; use an HF token — unauth HF is ~5 MB/s). The aiter **EP MoE memory-faults in *eager*
+>    mode too** (not just graph capture) — root cause is very likely **NUMA balancing enabled** (aiter warns; run
+>    `echo 0 > /proc/sys/kernel/numa_balancing` before serving). SGLang capture = `/start_profile` with `num_steps` +
+>    `profile_by_stage=true` → N prefill + N decode passes, one gzipped chrome trace per TP rank. **Profile the
+>    REALISTIC config (C4 / DP8), NOT TP8** (see the opportunity map at the end of §10). Repeated node/SSH churn + an
+>    API overload stopped the run before a trace landed. **Fallback: Simran offered to run the full e2e** — take her up
+>    on it for the region baseline rather than brute-forcing the 403 GB serve on a shared node.
 > 2. **Kernel-level:** aiter's *tuned single-GPU* a4w4 bar (FlyDSL `afp4_wfp4_bf16`, **169 µs @ M_e16**) — real,
 >    external, and **2.4× ahead of our Route-1** (410 µs). Route 2 chases this.
 > 3. **Reference points (published/third-party):** LMSYS/SGLang MoRI (MI355X 2,436 tok/s/GPU, MXFP4 FP4-dispatch +
@@ -240,7 +249,10 @@ Run independent subagents concurrently (one Agent message, multiple tool calls).
      E_local=32 / per_1x32), so the unfused a4w4 region stays **791 µs**, and its EP fmoe (691) is even *slower*
      than aiter's fp8 EP fmoe (503). ROCm/aiter #3632 (not HIP-graph-safe, gfx950) + #2343 (EP memory-fault,
      MI355X) confirm the CK-a4w4+EP path is immature. **So our 1.52× over that region is over an untuned/buggy
-     kernel — do NOT headline it** (see the ⚠️ callout above for the real external baseline plan).
+     kernel — do NOT headline it** (see the ⚠️ callout above for the real external baseline plan). *Update
+     2026-07-06:* the EP memory-fault reproduced in **eager** mode (not just graph capture) and is very likely
+     **NUMA balancing** (`echo 0 > /proc/sys/kernel/numa_balancing` before serving) — a config issue, so the a4w4 EP
+     path may become *runnable* once NUMA is off, but it is still **untuned** for our shape.
    - **Route 2 (true fp4×fp4 scaled-MFMA) — feasibility validated (Phase B, exp_17), NOT yet built:** needs **NO
      new HK tile types** (the earlier premise was wrong) — `mma_ABt_scaled<cbsz,blgp>` accepts `fp8e4m3` A/B and
      `cbsz/blgp=4` selects fp4 on the existing `rt_fp8e4m3` tiles; the fp4-cbsz variant compiles clean. Stock HK
@@ -253,6 +265,49 @@ Run independent subagents concurrently (one Agent message, multiple tool calls).
 3. **`reduce_scatter`** as the second IRIS collective (the meeting's other target).
 4. **End-to-end TPOT** integration — measure the region win at the model level, not just region-level (the gold-standard denominator).
 5. **SPX full-GPU re-confirm** of all numbers (the canonical set is on thor-4; keep same-node discipline).
+
+### The end-to-end opportunity map (beyond MoE) — READ THE CONFIG CAVEAT FIRST (added 2026-07-06)
+
+**⚠️ Collective costs are CONFIG-DEPENDENT — the all-reduce is NOT a universal lever.** The meeting-1 profiling
+("collectives ~30% of total, all-reduce is the top kernel, fires 2×/layer") was measured at **TP8, which is
+UNREALISTIC** for DeepSeek on AMD (Simran: "data-parallel TP4 is the better throughput/interactivity point; TP8
+isn't used much for this model size on AMD — enough HBM"). By config:
+
+| setting | TP all-reduce / reduce-scatter | MoE all-to-all | realistic? |
+|---|---|---|---|
+| TP8 (meeting-1) | **dominates (~30%)** | present | **NO — artifact** |
+| TP4 × DP2 (C4) | small (within the 4-GPU group only) | present | yes (prefill) |
+| DP8 / TP1 (C6) | **removed entirely** | present (only cross-GPU traffic) | ~decode |
+| DP-attention + EP | **~gone** (attention is data-parallel) | **dominant** | yes (decode) |
+
+So in the realistic **decode** path the **MoE all-to-all is the dominant collective** — the thing we already fused,
+so our work is on the decode critical path. The all-reduce fusion is a **TP4-PREFILL** lever (real, but TP4-sized,
+not the TP8 ~30%). **Never size a collective opportunity from a TP8 trace.**
+
+**The levers, from Meeting 1 (`amd-general/HipKittens + Iris.docx`), ranked by the notes:**
+- **MoE gather/combine** — ✅ already built (Osama: "the easy starting point… but has the essence of everything").
+  It IS the dominant decode collective.
+- **all-reduce + RMSnorm + quant fusion** (TP4 prefill) — Simran: "all AMD engines do NOT fuse the all-reduce with
+  anything right now, so either one will have a huge production impact." aiter has one but "it's not very fast." The
+  easier NVIDIA-style fusion; high impact **for the TP prefill path**.
+- **GEMM + all-reduce tile-level fusion** — Osama's research prize: "how many tiles you produce from the GEMM side
+  before you reduce… that permutation space is absolutely insane and really unexplored." Harder (GEMM-resource-bound),
+  most differentiated.
+- **reduce_scatter as a new IRIS device-side primitive** — the TP-decomposition stepping stone toward the fused
+  GEMM+all-reduce (all-reduce = reduce_scatter + all-gather). Osama's suggested next collective.
+- **attention / MLA** — the other pre-all-reduce region; profile its share.
+
+**Decision rule:** get the **realistic-config** profile FIRST (the §10 ⚠️ callout), then pick between Route 2 (MoE)
+and the TP4 collective fusions by **measured %**, not by the TP8 prior.
+
+**External-benchmark reality (web, 2026-07-01):** fp4 is the validated production direction — AMD merged MXFP4+AITER
+into vLLM/SGLang; NVIDIA's DeepSeek-R1 record uses **NVFP4 MoE + PD-disagg EP** (= our C4 config). BUT the literature
+is explicit: at **small-batch / decode, 4-bit *activation* quant gives ~no speedup (weight-memory-bound) — weight-only
+fp4 is preferred** — which independently **validates our Route-1 W4A16 decode choice**. fp4's throughput win is a
+**prefill** effect (~1.41× over fp8 at batch 128). NVFP4 (per-16 fp8-scale) beats MXFP4 (per-32 E8M0 power-of-two) on
+accuracy; MXFP4's power-of-two scale needs good calibration (our fp4 RMS class = 0.117). Reference bars: LMSYS/SGLang
+MoRI (MI355X **2,436 tok/s/GPU**, MXFP4 FP4-dispatch+FP8-combine); SemiAnalysis InferenceX/InferenceMAX (open-source);
+MLPerf v6.0 (audited).
 
 ---
 
