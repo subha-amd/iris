@@ -15,7 +15,8 @@ something the library computes from declared demand + measured link topology.
 |---|---|
 | `DESIGN.md` | the abstraction spec + paper framing: declare / schedule / execute, the 4 intents (`tile_gather/scatter/reduce_scatter/all_reduce`), the quadrant vs NCCL/MSCCL/aiter/IRIS/HK, how it maps onto our existing kernels, novelty, roadmap, honest limits. **Start here.** |
 | `tilesched.py` | runnable scheduler + wave-based link-contention **cost model**, calibrated to the measured combine point (386/934). Three schedulers (`sorted`, `round_robin`, `proportional`) + a skew sweep. Pure numpy — runs anywhere. |
-| `xgmi_probe.py` | on-node **validation** microbenchmark: measures sorted vs round-robin vs proportional store schedules directly on 8× MI350X via IRIS primitives (no full `fused_moe` build). A 2nd measured point for the cost model. |
+| `xgmi_probe.py` | on-node **validation** microbenchmark: sorted vs round-robin vs proportional store schedules on 8× MI350X via IRIS primitives (no full `fused_moe` build). |
+| `xgmi_probe_results.md` | **the on-node run (2026-07-07) + honest read: inconclusive.** The probe as written is issue-bound (IRIS stores are fire-and-forget → timed issue rate, not link BW), so it showed ~1.05× and did **not** validate the link-contention mechanism. Confirmed the env + the corrected `iris.store` usage + 47 GiB/s control BW. Needs a completion fence to be a valid 2nd point. |
 
 ## Run
 

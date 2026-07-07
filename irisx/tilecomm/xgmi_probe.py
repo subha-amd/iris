@@ -43,21 +43,34 @@ def scatter_sched_kernel(
     order_dst,          # int32 [num_cells]: destination rank for each cell (the schedule)
     num_cells,
     H: tl.constexpr,
-    cur_rank,
+    cur_rank: tl.constexpr,   # constexpr: from_rank must be the (compile-time) current rank
+    WORLD: tl.constexpr,
     BLOCK_H: tl.constexpr,
     heap_bases_ptr,
 ):
+    # NOTE on the destination rank: iris.store's __translate does
+    #   offset = ptr - heap_base[from_rank];  translated = heap_base[to_rank] + offset
+    # and every working IRIS scatter (example 07_gemm_all_scatter) selects the
+    # destination with a CONSTEXPR `for r in range(world): if r == cur_rank ...`
+    # loop -- a data-dependent, memory-loaded `to_rank` faults (read-only page).
+    # So we load the per-cell destination (runtime) but dispatch the actual store
+    # through a static_range so `to_rank` is constexpr in each store, matching 07.
     pid = tl.program_id(0)
     if pid >= num_cells:
         return
-    dst_rank = tl.load(order_dst + pid)
+    dst_rank = tl.load(order_dst + pid)          # runtime, the schedule's choice
     row_off = pid * H
     for h0 in range(0, H, BLOCK_H):
-        offs = row_off + h0 + tl.arange(0, BLOCK_H)
-        mask = (h0 + tl.arange(0, BLOCK_H)) < H
+        idx = h0 + tl.arange(0, BLOCK_H)
+        offs = row_off + idx
+        mask = idx < H
         vals = tl.load(src_buf + offs, mask=mask)
-        # remote store over XGMI (local if dst_rank == cur_rank)
-        iris.store(dst_buf + offs, vals, cur_rank, dst_rank, heap_bases_ptr, mask=mask)
+        for r in tl.static_range(WORLD):         # constexpr destination selection
+            if dst_rank == r:
+                if r == cur_rank:                # local write -> plain store
+                    tl.store(dst_buf + offs, vals, mask=mask)
+                else:                            # remote write over XGMI
+                    iris.store(dst_buf + offs, vals, cur_rank, r, heap_bases_ptr, mask=mask)
 
 
 # ---- schedules (host side; mirror tilesched.py) --------------------------------
@@ -139,7 +152,7 @@ def _worker(local_rank, world_size, init_url, args):
         order_t = torch.from_numpy(order).to("cuda")
 
         def run():
-            scatter_sched_kernel[grid](src, dst, order_t, nC, H, cur, 1024,
+            scatter_sched_kernel[grid](src, dst, order_t, nC, H, cur, world, 1024,
                                        shmem.get_heap_bases())
 
         run(); shmem.barrier()

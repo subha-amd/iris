@@ -336,9 +336,9 @@
 
   <!-- 6 — WHY ORDER MATTERS (LIVE VIZ) ----------------------------------------->
   <section class="slide" id="s6">
-    <div class="eyebrow"><span class="num">06</span> · the intuition, live</div>
-    <h2>Order decides how many links stay busy at once</h2>
-    <p style="margin-bottom:6px">Each tick is one remote write, colored by its destination link (0–7). The moving box is the concurrency window — the blocks in flight together. The bar under each row is the window's <strong>busiest-link load</strong>: taller = more contention.</p>
+    <div class="eyebrow"><span class="num">06</span> · the working hypothesis</div>
+    <h2>Why we <em>think</em> order matters — and an honest caveat</h2>
+    <p style="margin-bottom:6px">The hypothesis: each tick is a remote write colored by destination link (0–7); the moving box is the concurrency window; the bar is the window's <strong>busiest-link load</strong>. Sorted saturates one link, spreading keeps all 8 busy.</p>
     <div class="card" id="vizCard" style="margin:14px 0 8px;padding:20px 22px">
       <div id="viz"></div>
       <div class="legend" style="margin-top:14px">
@@ -347,7 +347,7 @@
         <span style="color:var(--muted)">destination link 0…7 = hue</span>
       </div>
     </div>
-    <p class="note">Sorted keeps ~1 link busy per window (the rest idle); round-robin and proportional keep all 8 busy. Same total bytes — 2.4× less wall-clock. This is the whole mechanism.</p>
+    <p class="note"><strong>Caveat (honest):</strong> the on-node probe I ran tonight to test this was <em>issue-bound</em> — IRIS stores are fire-and-forget, so it timed issue rate, not link bandwidth (it implied ~4.7 TB/s, &gt;10× the fabric), and showed only ~1.05×. So this mechanism is <strong>not yet validated</strong> in isolation. The 2.4× is a real <em>region</em> result; whether it's link-spreading or the combine's read/reduction structure is still being isolated. Fixing the probe's completion fence is next.</p>
     <div class="foot">07 / 11</div>
   </section>
 
@@ -358,9 +358,9 @@
     <p style="margin-bottom:14px">A wave-based link-contention model (<span class="m">tilecomm/tilesched.py</span>), calibrated so uniform combine reproduces the measured 934 / 386 µs. Three schedulers: <span class="amber">sorted</span> (naive), <span style="color:var(--muted)">round-robin</span> (today), <span class="teal">proportional</span> (byte-weighted, demand-aware).</p>
     <div class="grid g2" style="align-items:start">
       <figure style="margin:0" class="card">
-        <div class="kicker">A · uniform combine — reproduces the measurement</div>
+        <div class="kicker">A · uniform combine — calibrated to the measurement</div>
         <div class="svgwrap" id="chartA"></div>
-        <figcaption>model: sorted 927.8 · rr 388.2 · prop 388.3 µs — matches measured 934 / 386.</figcaption>
+        <figcaption>model fit (2 params → 2 points): sorted 927.8 · rr 388.2 · prop 388.3 µs vs measured 934 / 386. A fit, not an independent prediction.</figcaption>
       </figure>
       <figure style="margin:0" class="card">
         <div class="kicker">B · imbalanced gather — makespan vs expert skew</div>
@@ -432,7 +432,7 @@
     <div class="grid g2" style="align-items:start">
       <div>
         <ol style="margin:0;padding-left:0;list-style:none;display:grid;gap:11px;counter-reset:r">
-          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px;align-items:start"><span class="stat teal" style="font-size:14px">01</span><span><strong>On-node XGMI probe</strong> — a 2nd measured point to validate the cost model (running now).</span></li>
+          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px;align-items:start"><span class="stat teal" style="font-size:14px">01</span><span><strong>Fix the on-node XGMI probe</strong> — tonight's run was issue-bound (measured store issue, not link BW); add a completion fence + back-pressure so it actually tests the mechanism. Environment + corrected <span class="m">iris.store</span> usage confirmed; control link BW = 47 GiB/s.</span></li>
           <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat teal" style="font-size:14px">02</span><span><strong>Drop-in into combine</strong> — <span class="m">tilecomm.schedule()</span> replaces <code>interleave</code>; gate at 386 µs, win on an imbalanced trace.</span></li>
           <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat teal" style="font-size:14px">03</span><span><strong>reduce_scatter as a real IRIS collective</strong> — the TP-decomposition stepping stone (bulk-synchronous first).</span></li>
           <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat" style="font-size:14px;color:var(--amber)">04</span><span><strong>Tile-fused execution</strong> — emit the reduce-scatter <em>inside</em> the GEMM tile loop. The unbounded comm/compute-overlap win — Osama's prize.</span></li>

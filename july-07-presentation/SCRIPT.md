@@ -104,10 +104,20 @@ granularity with hand-authored schedules, standalone. TileComm is tile-granular,
 *demand-adaptive* (the schedule is computed, not written), and designed to fuse into the
 compute kernel's tile loop. The fusion + auto-scheduling is the delta.
 
-**"Your cost model is calibrated to one point — is it real?"** Yes, one measured point so far
-(combine, 934/386). Step 1 of the roadmap is the on-node XGMI probe for a second, independent
-point. Until then I present absolute off-calibration numbers as estimates, and the model
-reproduces the calibration point to under 1%.
+**"Your cost model is calibrated to one point — is it real?"** Be upfront: it's a fit to one
+measured region number (combine, 934/386), and the mechanism isn't validated yet. I ran an on-node
+XGMI probe tonight to test the link-contention story — it was *issue-bound* (IRIS stores are
+fire-and-forget, so it timed issue rate not link bandwidth, implying ~4.7 TB/s, >10× the fabric)
+and showed only ~1.05×. So the probe is inconclusive, not a refutation — but I won't claim the model
+is mechanistically proven. It's a design-space tool calibrated to a real number; fixing the probe's
+completion fence is the immediate next step. (This is on slide 6 and slide 11 — lead with it, don't
+let someone catch it.)
+
+**"So does scheduling even matter, if the probe shows ~1×?"** The probe couldn't test it (issue-bound).
+The 2.4× is a real region measurement; what's open is *why* — pure link-spreading, or the combine's
+read/reduction structure. Either way the abstraction's case holds: scheduling should be empirical and
+library-owned precisely because the mechanism behind a hand-tuned win isn't obvious. And the big prize
+(tile-fused comm/compute overlap) doesn't depend on this at all.
 
 **"On an all-to-all fabric, can ordering even beat the hottest link?"** No — reorder-only is
 capped by the hottest link's bytes (I say this on slide 8). Multi-path routing (roadmap step 5)

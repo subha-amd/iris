@@ -218,9 +218,15 @@ directly measurable against the number we already trust.
 
 ## 6. Roadmap
 
-1. **On-node XGMI microbenchmark** (`xgmi_probe.py`) — a standalone IRIS store benchmark on
-   the 8× MI350X that measures sorted vs round-robin vs proportional directly, giving a
-   *second measured point* to validate the cost model beyond the combine calibration.
+1. **On-node XGMI microbenchmark** (`xgmi_probe.py`) — **ran 2026-07-07 on 8× MI350X; result:
+   inconclusive (see `xgmi_probe_results.md`).** Confirmed the environment + the corrected
+   `iris.store` usage (a data-dependent `to_rank` faults — select the destination through a
+   constexpr `static_range`, like example 07) and a control link BW of 47 GiB/s. But the probe is
+   **issue-bound** (IRIS stores are fire-and-forget; `do_bench` timed issue rate, not link BW —
+   implied ~4.7 TB/s, >10× the fabric), so it showed only ~1.05× and did **not** validate the
+   link-contention mechanism. Fix: store-completion fence + enough per-link bytes to back-pressure +
+   MAX-over-ranks timing, then re-run. **Until then the 2.4× is a real region result whose mechanism
+   is not yet isolated, and the cost model is a calibrated design tool, not a validated one.**
 2. **Drop-in into `combine`** — `tilecomm.schedule()` replaces `interleave=True`; regression-
    gate at 386 µs on uniform, measure the win on a load-imbalanced routing trace (Simran can
    supply a real text-distribution trace; the harness already tracks per-expert row counts).
@@ -236,9 +242,10 @@ directly measurable against the number we already trust.
 
 ## 7. Honest limitations
 
-- The cost model is calibrated to **one** measured collective (combine). Step 1 adds a
-  second, independent measured point; until then, absolute predictions off the calibration
-  point are estimates, not measurements.
+- The cost model is calibrated to **one** measured collective (combine) and its link-contention
+  mechanism is **not yet validated** — the on-node probe that was meant to be the second point was
+  issue-bound (Step 1). Treat the model as a design-space tool calibrated to a real number, not a
+  mechanistically-proven predictor. The skew-sweep numbers are model extrapolations, not measurements.
 - Reorder-only scheduling buys 2.4–6× over the naive order but only 1–4% over the already-
   good hand-rolled round-robin. The abstraction's value at this layer is *automation +
   correctness-by-construction + robustness to imbalance*, not a large new speedup. The large
