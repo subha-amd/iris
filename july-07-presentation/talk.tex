@@ -1,0 +1,395 @@
+\documentclass[pdf,aspectratio=169]{beamer}
+
+\usepackage{amssymb,amsmath,amsthm,enumerate}
+\usepackage[utf8]{inputenc}
+\usepackage{array}
+\usepackage[parfill]{parskip}
+\usepackage{graphicx}
+\usepackage{caption}
+\captionsetup[figure]{labelformat=empty}
+\usepackage{subcaption}
+\usepackage{bm}
+\usepackage{amsfonts,amscd}
+\usepackage[]{units}
+\usepackage{listings}
+\usepackage{multicol}
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+
+\newcommand{\empy}[1]{{\color{darkorange}\emph{#1}}}
+\newcommand{\empr}[1]{{\color{cardinalred}\emph{#1}}}
+\newcommand{\examplebox}[2]{%
+\begin{tcolorbox}[colframe=darkcardinal,colback=boxgray,title={#1}]
+#2
+\end{tcolorbox}}
+
+\usetheme{Stanford}
+\input{./style_files_stanford/my_beamer_defs.sty}
+\logo{}
+
+% compact monospace for kernel chains
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,columns=fullflexible,frame=none}
+\newcommand{\mc}[1]{{\ttfamily\small #1}}
+
+\title[Typed Tile Edge]{From TileComm to a Typed Tile Edge}
+\subtitle{Profiling-driven abstractions for fused DeepSeek-R1 MoE inference on 8$\times$MI350X:\\
+the decode \textbf{weight wall} (QuantTile) $+$ the TP4-prefill \textbf{all-reduce} (tile-fused reduce-scatter)}
+
+\beamertemplatenavigationsymbolsempty
+
+\begin{document}
+
+\author[Subha]{
+  \begin{tabular}{c}
+  \Large Subha \\
+  \footnotesize AMD \;$\cdot$\; advised by Simran Arora \& Muhammad Osama
+  \end{tabular}
+  \vspace{-4ex}}
+\institute{8$\times$MI350X (gfx950, all-to-all XGMI) \,$\cdot$\, DeepSeek-R1 MXFP4 \,$\cdot$\, TP4$\times$DP2 $+$ DP-attention $+$ EP \,$\cdot$\, HipKittens $+$ IRIS}
+\date{\today}
+
+\begin{noheadline}
+\begin{frame}\maketitle\end{frame}
+\end{noheadline}
+
+% ------------------------------------------------------------------ Slide 1: the arc
+\begin{frame}{The arc --- profiling reshaped the plan}
+\footnotesize
+Last time: a fused DeepSeek-R1 MoE region (\empr{1.56$\times$ prefill}) $+$ a \emph{TileComm} traffic-shaping idea. This time I profiled the two candidate communication abstractions \empy{directly on 8$\times$MI350X} --- and the measurement changed the plan.
+\vspace{1ex}
+\begin{columns}
+\begin{column}{0.32\textwidth}
+\examplebox{What died}{\footnotesize \empr{Traffic-shaping.} Reorder-only comm scheduling is capped at \empy{1--4\%} over a good round-robin on a fully-connected fabric; the on-node probe was issue-bound.}
+\end{column}
+\begin{column}{0.34\textwidth}
+\examplebox{The two real levers}{\footnotesize \empy{(1) decode weight wall} $\to$ fewer weight bytes (MXFP4 / a QuantTile). \empy{(2) TP4 prefill all-reduce} $=$ 60--85\% of GEMM+AR $\to$ tile-fused overlap, real 1.4--1.7$\times$ ceiling.}
+\end{column}
+\begin{column}{0.34\textwidth}
+\examplebox{The unifier}{\footnotesize A \empr{typed tile edge} (\mc{stage}/\mc{retire}): a tile whose \emph{residency} and \emph{format} are first-class. \empy{QuantTile-v0} is the falsifiable first milestone.}
+\end{column}
+\end{columns}
+\vspace{1ex}
+\centering\empr{The abstraction is the same; the profiling told me which lowering to build first --- and it is not the comm one.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 2: recap
+\begin{frame}{Recap --- the fused region works, and it told me where to look}
+\footnotesize
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\begin{itemize}\footnotesize
+  \item \empr{Prefill: 1.56$\times$} over the unfused MORI-dispatch $\to$ aiter-fmoe $\to$ MORI-combine baseline (1247 vs 1941\,$\mu$s), correctness-gated (RMS 0.018).
+  \item We fuse the expert \emph{region}: the gather \empy{produces the GEMM's packed layout}, so \empy{7 kernels collapse to 3} --- no sort, no standalone quant, no scatter-combine. HipKittens compute $+$ IRIS comm.
+  \item \empr{Decode is only marginal} ($\sim$2--3\%, 516.5 vs 527\,$\mu$s at matched fp8) --- because decode is a \empy{weight-memory wall} (next). Fusion cannot move the dominant cost there.
+\end{itemize}
+\end{column}
+\begin{column}{0.45\textwidth}
+\examplebox{Two regimes, two bottlenecks}{\footnotesize
+\empy{Prefill} is token-scaled compute followed by a \empr{TP4 all-reduce}. \empy{Decode} streams \empr{all 32 local experts' weights} every step with \emph{no} TP all-reduce (DP-attention).
+\vspace{1ex}\\
+So the levers are \emph{different per regime} --- which is exactly what the new profiling had to pin down before committing to an abstraction.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 3: the pivot
+\begin{frame}{The pivot --- traffic-shaping is a weak lever (measured, honest)}
+\footnotesize
+The seed: the combine's \empr{2.4$\times$} (934$\to$386\,$\mu$s) from \emph{one} hand-written line --- \mc{build\_combine\_pull(interleave=True)} round-robins destination cells across the 8 XGMI links (sorted-by-dst piles concurrent blocks onto one link; round-robin spreads them). I tried to generalize it into a demand-aware scheduler. It doesn't:
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.46\textwidth}
+\centering\scriptsize cost model (\mc{tilesched.py}, calibrated to 934/386)
+\begin{tabular}{lrr}
+\toprule
+schedule & model $\mu$s & vs naive \\
+\midrule
+\empr{sorted} (naive default) & 927.8 & 1.0$\times$ \\
+round-robin (today) & 388.2 & \empy{2.4$\times$} \\
+\empy{proportional} (byte-aware) & 388.3 & (= rr) \\
+\bottomrule
+\end{tabular}
+\vspace{0.5ex}\\
+\scriptsize demand-aware beats round-robin by only \empr{1--4\%}, growing slowly with expert skew.
+\end{column}
+\begin{column}{0.54\textwidth}
+\examplebox{Why it's capped}{\scriptsize
+On a \empr{fully-connected} 8-GPU XGMI fabric, \emph{bytes-per-link are fixed by the demand matrix.} Reordering \emph{when} blocks fire only avoids the pathological sorted order --- it \empy{cannot beat the hottest-link floor}.}
+\vspace{-1ex}
+\examplebox{And the probe was inconclusive}{\scriptsize
+The on-node XGMI probe was \empr{issue-bound} (fire-and-forget stores timed \emph{issue rate}: $\sim$4.7\,TB/s, $>$10$\times$ the fabric) and showed $\sim$1.05$\times$. \empy{Inconclusive, not a refutation} --- not a lever to bet on.}
+\end{column}
+\end{columns}
+\centering\empr{So I stopped tuning the order and re-profiled the two candidate comm abstractions directly on-node.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 4: methodology
+\begin{frame}{Profiling methodology --- exactly what was measured}
+\footnotesize
+\begin{columns}
+\begin{column}{0.54\textwidth}
+\begin{itemize}\footnotesize
+  \item \empy{Node:} the dedicated 8$\times$MI350X (gfx950), container \mc{subha\_probe} (torch 2.10$+$rocm7.2, triton 3.6, IRIS editable). Config \empr{TP4}, \empr{bf16}.
+  \item \empy{Unfused reference $=$ what production does today:} a full-256-CU \emph{torch} matmul of each rank's \empr{K-slice partial GEMM}, \emph{then} a separate \empr{RCCL all-reduce}. Two ops, not fused.
+  \item \empy{Timing:} \empr{median-of-30} CUDA-event, then \empr{MAX over the 4 ranks} (Simran's rule: long all-reduce times are usually profiling artifacts --- use in-kernel / max-over-ranks).
+\end{itemize}
+\end{column}
+\begin{column}{0.46\textwidth}
+\examplebox{Each shape is a real R1 op}{\footnotesize
+\begin{itemize}\scriptsize
+  \item \mc{8192,7168,18432} $=$ R1 \empy{down-projection} (prefill).
+  \item \mc{8192,7168,7168} $=$ R1 \empy{attention out-projection} (prefill).
+  \item \mc{1024/256,7168,18432} $=$ small-$M$ / decode-ish $M$ (the same op at lower token count).
+\end{itemize}
+\empr{No synthetic shapes} --- every $(M,N,K)$ is an all-reduce-preceding GEMM on the TP4 prefill path.}
+\end{column}
+\end{columns}
+\vspace{0.5ex}
+\centering\empy{Question the profile answers:} is the TP4 all-reduce cheap-relative-to-GEMM (then comm fusion is pointless) or does it dominate?
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 5: the result table
+\begin{frame}{Result --- the all-reduce DOMINATES the prefill GEMM$+$AR sequence}
+\footnotesize
+Unfused $=$ torch K-slice GEMM \emph{then} RCCL all-reduce. Overlap ceiling $=$ serial$/$AR (a tile-fused reduce-scatter that hides the short GEMM under the long AR floors at $\max(\text{GEMM},\text{AR})\!\approx\!\text{AR}$).
+\begin{center}
+\scriptsize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{l r r r r r}
+\toprule
+GEMM $(M,N,K)$ --- R1 role & GEMM 256CU & RCCL AR & serial GEMM+AR & AR share & ceiling \\
+ & (ms) & (ms) & (ms) & & serial$/$AR \\
+\midrule
+\mc{8192,7168,18432} --- down-proj      & 0.565 & 1.148 & 1.641 & \empr{70\%} & \empy{1.43$\times$} \\
+\mc{8192,7168,7168}  --- attn out-proj  & 0.252 & 1.147 & 1.357 & \empr{85\%} & \empy{1.18$\times$} \\
+\mc{8192,4608,36864} --- example        & 0.606 & 0.750 & 1.269 & \empr{59\%} & \empy{1.69$\times$} \\
+\mc{1024,7168,18432} --- small prefill  & 0.093 & 0.176 & 0.262 & \empr{67\%} & \empy{1.49$\times$} \\
+\mc{256,7168,18432}  --- decode-$M$     & 0.053 & 0.073 & 0.121 & \empr{60\%} & \empy{1.66$\times$} \\
+\bottomrule
+\end{tabular}\\
+\scriptsize GEMM 256CU $=$ per-rank K-slice torch GEMM; RCCL AR $=$ RCCL all-reduce; ceiling $=$ serial$/$AR.
+\end{center}
+\vspace{0.3ex}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{The reading}{\footnotesize
+The all-reduce is \empr{59--85\% of the serial GEMM+AR} --- $1.2$--$4.5\times$ the GEMM itself. \empy{Comm dominates the sequence}; it is \emph{not} cheap-relative-to-GEMM.}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{The lever}{\footnotesize
+A tile-fused reduce-scatter has a real \empr{$\sim$1.4--1.7$\times$ prefill ceiling} --- stronger than traffic-shaping, and it validates Simran: \empy{no AMD engine fuses the all-reduce.}}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 6: substrate not ready
+\begin{frame}{But the shipped overlap substrate is far off --- realizing A is a real build}
+\footnotesize
+The two IRIS examples that already fuse a GEMM with a collective, run at \mc{8192,4608,36864} (\mc{-{}-gemm\_sms 128}):
+\begin{center}
+\scriptsize
+\begin{tabular}{l r r}
+\toprule
+substrate & fused GEMM$+$AR & vs unfused 1.269\,ms \\
+\midrule
+unfused torch GEMM $+$ RCCL all-reduce (ref) & 1.269\,ms & 1.0$\times$ \\
+ex.09 one-shot all-reduce (IRIS) & 5.898\,ms & \empr{4.7$\times$ SLOWER} \\
+ex.08 atomics all-reduce (IRIS) & 358.8\,ms & \empr{280$\times$ SLOWER} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{Why they lose}{\footnotesize
+ex.09 is a \empr{Triton streamK GEMM at 471 TFLOP/s} (vs torch's 1149 --- 2.4$\times$ off) $+$ a per-tile-barrier one-shot AR that reads-all-ranks; ex.08's per-element cross-rank atomic AR is catastrophic (7.76 TFLOP/s). \empy{You cannot fuse your way out of a 2.4$\times$-slow GEMM.}}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{What A actually needs}{\footnotesize
+(1) a \empy{HipKittens producer/consumer GEMM body} at $\sim$torch rate whose epilogue emits tile transfers, and (2) an \empy{in-kernel reduce-scatter matching RCCL bandwidth} (unproven on IRIS). Both substantial. And A is \empr{PREFILL-only} --- decode has no TP all-reduce.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 7: decode regime
+\begin{frame}{The other regime --- decode is weight-bound, with no all-reduce to fuse}
+\footnotesize
+\begin{columns}
+\begin{column}{0.52\textwidth}
+\begin{itemize}\footnotesize
+  \item Under \empy{DP-attention} the TP all-reduce is \empr{gone at decode} --- there is nothing for abstraction A to fuse.
+  \item The expert GEMM streams \empr{all 32 local experts' $\sim$1.4\,GB of fp8 weights every step} --- a fixed \empr{$\sim$176\,$\mu$s HBM floor} at 8\,TB/s, independent of token count. Gather$+$combine $\approx$ \empy{18\%} of the region.
+  \item So \empy{decode $\approx$ 80\% weight floor $+$ 20\% boundaries.} \emph{Any} comm fusion caps decode at $\sim$1.1--1.25$\times$.
+\end{itemize}
+\end{column}
+\begin{column}{0.48\textwidth}
+\examplebox{The only high-ceiling decode lever}{\footnotesize
+Move \empr{fewer weight bytes.} That is a \emph{representation} lever, not a comm/overlap one --- and it is where serving latency is actually set.
+\vspace{1ex}\\
+$\Rightarrow$ \empy{MXFP4 weights} ($\frac14$ the bf16 bytes) directly attack the 80\% floor. This is abstraction \empy{B (QuantTile)}, and it is the higher-serving-impact of the two.}
+\end{column}
+\end{columns}
+\vspace{0.3ex}
+\centering\empr{A (comm) $=$ prefill throughput; B (format) $=$ decode latency. They attack different regimes --- and B owns the serving denominator.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 8: MXFP4 results
+\begin{frame}{MXFP4 --- the format lever already ships $\sim$1.6$\times$ on the decode GEMM}
+\footnotesize
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{Setup (real MX checkpoint)}{\scriptsize
+\begin{itemize}\scriptsize
+  \item Model \mc{amd/DeepSeek-R1-MXFP4}: OCP \empy{MXFP4 W4A4}, group 32, \empr{E8M0} per-block scale along $K$.
+  \item \empy{Route-1 W4A16} decode GEMM \mc{..decode\_mxfp4\_sat}: store B \empr{fp4 ($\frac14$ bytes)}, pre-swizzle, unpack fp4$\to$bf16 with the gfx950 \emph{hardware} \mc{cvt\_scalef32\_pk\_bf16\_fp4}, then \empy{bf16 MFMA}. Weight-only fp4 --- the right decode choice (weight-bound).
+\end{itemize}}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{Measured (8$\times$MI350, same node)}{\footnotesize
+\begin{itemize}\scriptsize
+  \item Standalone GEMM: MXFP4 \empr{$\sim$1.6$\times$} over our fp8 \mc{\_sat} decode, $\sim$2$\times$ over bf16 (RMS-vs-fp4-dequant 0.0033).
+  \item Fused decode region (\mc{TOTAL\_M=512}): \empr{520.6\,$\mu$s} $=$ \empy{1.11$\times$ over fp8}, \empy{1.69$\times$ over bf16} (region diluted by shared A-dequant $+$ gather/act/combine).
+\end{itemize}}
+\end{column}
+\end{columns}
+\vspace{-0.5ex}
+\examplebox{Honest caveat + the hardware is ready}{\scriptsize
+\empr{Baseline:} our captured aiter \mc{a4w4} EP kernel was \emph{untuned and buggy} for our shape (every \mc{block\_size\_M} sweep fell back to \mc{2stage default}) --- so beating it means nothing. The real baseline is the reproducible \empy{SGLang R1-FP4 e2e} (Simran offered to run it --- the gold denominator). \empy{HK's scaled-MFMA already supports fp4} (\mc{mma\_ABt\_scaled}, \mc{cbsz/blgp=4}) --- a true fp4$\times$fp4 path is headroom, not a blocker.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 9: the abstraction
+\begin{frame}[fragile]{The abstraction --- a typed tile edge (\mc{stage} / \mc{retire})}
+\footnotesize
+A tile whose \empr{RESIDENCY} (may live on another rank) and \empr{FORMAT} (may be compressed) are \empy{first-class type parameters}. The author declares an edge; the compiler lowers each axis to its own backend.
+\begin{columns}
+\begin{column}{0.54\textwidth}
+\begin{lstlisting}
+// inbound: fill an HK tile (QuantTile = FORMAT)
+stage(b_tile)
+  .from( local() )                   // RESIDENCY
+  .format( mx_fp4{scale,32,E8M0} )   // FORMAT
+  .for_mma<Bt>();
+
+// outbound: dispose a tile (Overlap-A)
+retire(c)
+  .reduce_scatter( tp_group, sum )   // RESIDENCY
+  .overlap_with( next );             // SCHEDULE
+\end{lstlisting}
+\end{column}
+\begin{column}{0.46\textwidth}
+\examplebox{Two lowerings, one declaration}{\scriptsize
+\empy{QuantTile} (FORMAT, decode) $\to$ CDNA4 scaled-MFMA / in-register dequant. \empy{Tile-fused reduce-scatter} (RESIDENCY, prefill) $\to$ IRIS RMA $+$ a tile schedule. Same two verbs; the compiler dispatches on the type axes.}
+\vspace{-1ex}
+\examplebox{Honest boundary}{\scriptsize
+An \empr{API-level unifier, not one cost model.} The axes are orthogonal (residency $\neq$ numerics, format $\neq$ topology), so each keeps its \emph{own} validated model --- by design. No scalar objective spans $\mu$s-of-comm vs HBM-bytes vs RMS.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 10: QuantTile v0
+\begin{frame}{QuantTile-v0 --- the falsifiable first milestone}
+\footnotesize
+\empr{One} HipKittens grouped-decode GEMM body serving \empy{both} fp8-\mc{sat} \empy{and} MXFP4 through a compile-time tile descriptor --- \empr{no per-format kernel fork} (today they are a 90\%-identical copy-paste; HK itself hard-codes one GEMM per format).
+\begin{center}
+\scriptsize
+\begin{tabular}{l l l}
+\toprule
+gate & threshold & anchor (measured, same-node) \\
+\midrule
+\empy{G1} fp8 no-regression & within $\pm$5\% of standalone & 3.97\,TB/s (fp8 \mc{\_sat}) \\
+\empy{G2} mxfp4 win preserved & $\geq$ 1.5$\times$ over fp8 (5\% slack on 1.6$\times$) & 1.6$\times$ \\
+\empy{G3} correctness & fp8 / mxfp4 RMS $\leq$ 5e-3 vs faithful dequant & 0.0037 / 0.0033 \\
+\empy{G4} region still wins & $\geq$ 1.10$\times$ (fused decode, \mc{TOTAL\_M=512}) & 520.6 vs 578.9\,$\mu$s \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{Why this first}{\footnotesize
+Highest serving impact (attacks the \empr{dominant decode weight wall}) $+$ cleanest novelty (the \empy{format/lowering} axis). Falsifiable against numbers we already trust --- \emph{not} against a captured baseline.}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{Why not comm first}{\footnotesize
+The overlap/comm axis is \empr{crowded} (Flux, CoCoNet, MSCCL++, TRT-LLM) \emph{and} needs a new GEMM body before it can even match unfused (slide 6). Format-first is the cheaper, more differentiated proof.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 11: roadmap + asks
+\begin{frame}{Roadmap \& asks}
+\footnotesize
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\begin{enumerate}\footnotesize
+  \item \empr{QuantTile-v0} --- one HK decode body, fp8 $+$ MXFP4 via a tile descriptor, gated G1--G4. The falsifiable proof the FORMAT axis is real.
+  \item \empy{Tile-fused reduce-scatter} for the TP4 prefill AR --- the RESIDENCY axis; the schedule is Osama's ``how many tiles before you reduce'' ($G^\star\!\approx\!\sqrt{P L/(t_c+t_m)}$), first target: \emph{match} unfused, then claw toward the 1.4--1.7$\times$ ceiling.
+  \item \empy{e2e SGLang R1-MXFP4 profile} under TP4$\times$DP2 $+$ DP-attention $+$ EP --- the gold denominator that decides the real baseline.
+\end{enumerate}
+\end{column}
+\begin{column}{0.45\textwidth}
+\examplebox{What I'd like from you}{\footnotesize
+\begin{itemize}\scriptsize
+  \item \empy{Simran} --- the e2e SGLang R1-FP4 run (gold baseline) $+$ a per-expert token-count trace.
+  \item \empy{Osama} --- gut-check the tile-fused reduce-scatter schedule (the $G$ sweep) as the overlap target.
+  \item \empy{Awad} --- is \mc{stage} / \mc{retire} the right \emph{shape} for the tile edge?
+\end{itemize}}
+\empr{Honest limits:} traffic-shaping is weak; the overlap substrate is far off (4.7--280$\times$ today); A is prefill-only; decode carries an fp8 RMS floor; the MXFP4 baseline is not yet external.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ================================================================== BACKUP
+\begin{frame}{Backup --- the empty quadrant (prior art, adversarially searched)}
+\footnotesize
+The claim: \empy{a typed tile whose remote residency AND quantized representation are both first-class}, co-lowered to IRIS device-RMA $+$ CDNA4 scaled-MFMA --- compression kept live \emph{from HBM across XGMI into the MFMA accumulate.}
+\begin{center}
+\scriptsize
+\begin{tabular}{l l l}
+\toprule
+ & \textbf{no residency axis} & \textbf{residency first-class} \\
+\midrule
+\textbf{no format axis} & HipKittens (tile compute, no comm) & IRIS / Triton-distributed (opaque dtypes) \\
+\textbf{format first-class} & Tilus (single-GPU, no transport) & \empr{this work (\mc{stage}/\mc{retire})} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}\scriptsize
+  \item \empy{Overlap line} (Flux, CoCoNet, MSCCL++, TRT-LLM fused AR$+$RMSNorm$+$quant) owns residency; data crosses in native dtype or dequants \emph{before} the matmul / \emph{after} the reduce.
+  \item \empy{Low-precision line} (Tilus, LiquidGEMM) owns representation but is single-GPU --- no transport boundary to preserve compression across.
+  \item \empr{Nearest threat: DeepGEMM ``Mega MoE'' (DeepSeek-V4)} --- the mechanism twin, but a \emph{hand-written Blackwell mega-kernel}, not an abstraction, NVLink not IRIS, MoE-combine not the TP all-reduce. We distinguish on \empy{programming-model $+$ AMD (IRIS$+$CDNA4)} --- never on ``first to send fp4 over the wire'' (MORI/DeepEP already do).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Backup --- the honest ledger (measured / claimed / unknown)}
+\footnotesize
+\begin{center}
+\scriptsize
+\begin{tabular}{p{0.40\textwidth} p{0.55\textwidth}}
+\toprule
+item & status \\
+\midrule
+FORMAT lever real (decode weight wall) & \empy{MEASURED} --- MXFP4 $\sim$1.6$\times$ over fp8; region 1.11/1.69$\times$ \\
+fp8 \mc{\_sat} decode $=$ 3.97\,TB/s (G1 anchor) & \empr{FLAGGED} --- re-verify on the HK build before v0 rests on it \\
+RESIDENCY lever real (TP4 AR $=$ 59--85\%) & \empy{MEASURED} --- slide 5 \\
+Overlap-A $\sim$1.4--1.7$\times$ prefill ceiling & \empr{CEILING} --- $\max(\text{GEMM},\text{AR})$, not a fused run \\
+A on the current IRIS substrate & \empr{NO} --- examples 4.7--280$\times$ slow; needs new GEMM body $+$ RS \\
+compositional cell (fp4-over-XGMI combine) & \empr{UNMEASURED} --- the one cell the split models don't cover \\
+one unified cost model over the 5 currencies & \empr{DOES NOT EXIST} --- and the thesis must not claim it \\
+traffic-shaping as the headline lever & \empr{REJECTED} --- 1--4\% over round-robin; probe issue-bound \\
+\bottomrule
+\end{tabular}
+\end{center}
+\empr{RCCL bus BW here $\approx$ 150 GB/s} (modest --- under-tuned for these sizes on gfx950, or per-iter barrier overhead). The robust takeaway is the \empy{ratio} (AR share), not the absolute BW.
+\end{frame}
+
+\begin{frame}{Backup --- anticipated questions}
+\footnotesize
+\begin{itemize}\footnotesize
+  \item \empr{``Why abandon the comm abstraction Awad asked for?''} I didn't --- I re-pointed it. Traffic-shaping (the \emph{scheduling} half) is capped at 1--4\%. The comm lever that \emph{is} real is \empy{fusion} (Overlap-A, tile-fused reduce-scatter) on the TP4 prefill AR --- kept as the second lowering of the same \mc{stage}/\mc{retire} notation, with a measured 1.4--1.7$\times$ ceiling and an honest build cost.
+  \item \empr{``Isn't `residency $+$ format' just one big cost model you don't have?''} Correct that we don't have it --- and we deliberately don't claim it. The axes are \empy{orthogonal} (residency doesn't change numerics; format doesn't change topology), so each lowers to its \emph{own} validated model. The word ``unify'' applies to the \empy{declaration surface}, never to the objective function.
+  \item \empr{``Did you get a new end-to-end MXFP4 speedup?''} No --- deliberately. Route-1 is shipped ($\sim$1.6$\times$ GEMM, 1.11$\times$ region); the missing piece is a \empy{legitimate external baseline} (the SGLang R1-FP4 e2e), because the a4w4 kernel we captured was untuned/buggy. Never iterate against a kernel we captured ourselves.
+  \item \empr{``Why QuantTile before the combine or Overlap-A?''} It attacks the \emph{dominant} decode cost (the 80\% weight floor), it is falsifiable against trusted numbers (G1--G4), and it needs \emph{no} new GEMM body --- the two fast decode kernels already exist; v0 makes them \empy{one} at zero cost.
+\end{itemize}
+\end{frame}
+
+\end{document}

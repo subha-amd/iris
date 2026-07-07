@@ -19,6 +19,9 @@
 #include "grouped_b0.cu"
 #include <bit>
 #include <hip/hip_fp4.h>
+#ifdef USE_QT
+#include "../../fused_moe/quanttile_decode.h"   // QuantTile v0: unified descriptor-parameterized body
+#endif
 
 // ---- verified fp4 swizzle (per 128-fp4-block): B_hbm[:, p] = B_true[:, kDecSatPermFp4[p]] ----
 static const int kDecSatPermFp4[128] = {
@@ -218,7 +221,11 @@ static bool run_case_fp4_sat(const char* label, const std::vector<int>& Me, int 
     kittens::gl<bf16, -1, -1, -1, -1> Cg(d_c, 1, 1, Mpacked, N);
     const int threads = NUM_WARPS * 64;
 
+#ifdef USE_QT
+    auto launch = [&]() { grouped_expert_gemm_decode_qt<qt::Fmt::MXFP4_E2M1, N, K><<<num_tasks, threads>>>(A, Bpk, Cg, d_sBe, d_tasks, num_tasks); };
+#else
     auto launch = [&]() { grouped_expert_gemm_decode_mxfp4_sat<N, K><<<num_tasks, threads>>>(A, Bpk, Cg, d_sBe, d_tasks, num_tasks); };
+#endif
     for (int i = 0; i < 5; i++) launch();
     hip_check(hipDeviceSynchronize(), "warm"); hip_check(hipGetLastError(), "warm err");
 

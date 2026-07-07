@@ -10,7 +10,19 @@ A modern C++ take on RMA/RDMA operations using AMD ROCm HIP. This is the C++ ver
 > — goal, results, cluster setup, and how to resume. The final, usable kernel is **`fused_moe/`** (prefill
 > **1.56×** over the unfused baseline; decode ~2–3% at matched fp8 precision); the unfused baseline is
 > **`baselines/`**; archived dev kernels + infra are in **`development/`**; authoritative measurements are in
-> **[`EXPERIMENT_LEDGER.md`](EXPERIMENT_LEDGER.md)**. For the data-flow diagram + input ABI + the per-kernel
+> **[`EXPERIMENT_LEDGER.md`](EXPERIMENT_LEDGER.md)**.
+>
+> **➜ CURRENT DIRECTION (2026-07-07) — the `stage`/`retire` typed-tile-edge abstraction; see
+> [`tilecomm/RESEARCH_PLAN.md`](tilecomm/RESEARCH_PLAN.md).** On-node TP4 profiling
+> ([`tilecomm/MEASURED_FINDINGS.md`](tilecomm/MEASURED_FINDINGS.md)) reshaped the plan: comm
+> traffic-shaping is a weak lever (demoted), but the profiling revealed the two real levers — the **decode
+> weight wall** (→ QuantTile / MXFP4, a *representation* lever) and the **TP4-prefill all-reduce** (59–85% of
+> the GEMM+AR sequence → tile-fused reduce-scatter, a ~1.4–1.7× *prefill* ceiling). Both unify under a tile
+> whose **residency + format are first-class**. **QuantTile v0 is built + validated**
+> ([`fused_moe/quanttile_decode.h`](fused_moe/quanttile_decode.h),
+> [`tilecomm/QUANTTILE_V0_RESULT.md`](tilecomm/QUANTTILE_V0_RESULT.md)): one descriptor-parameterized
+> decode-GEMM body replaces the fp8-sat + mxfp4-sat kernels at **zero cost** (fp8 within 0.07% / TB/s
+> unchanged, mxfp4 keeps 1.63× over fp8, output bit-stable). Talk: `../july-07-presentation/talk.pdf`. For the data-flow diagram + input ABI + the per-kernel
 > warp/SIMD behavior across the 8 XCDs, see **[`fused_moe/DATA_FLOW_AND_ABI.html`](fused_moe/DATA_FLOW_AND_ABI.html)**
 > (rendered) / **[`.md`](fused_moe/DATA_FLOW_AND_ABI.md)**. The detailed notes below are **historical** (they predate
 > the 2026-06-30 reorg: `b1_dispatch/` → `fused_moe/`, `b2_production/` → `baselines/`, dev → `development/`);

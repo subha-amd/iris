@@ -20,6 +20,9 @@
 #define GB0_SKIP_MAIN
 #include "grouped_b0.cu"
 #include <bit>
+#ifdef USE_QT
+#include "../../fused_moe/quanttile_decode.h"   // QuantTile v0: unified descriptor-parameterized body
+#endif
 
 // offline column permutation (per 128-K block): B_hbm[:, p] = B_fp8_true[:, PERM128[p]]
 static const int PERM128[128] = {
@@ -201,7 +204,11 @@ static bool run_case_fp8_sat(const char* label, const std::vector<int>& Me, int 
     const int threads = NUM_WARPS * 64;
 
     auto launch_sat = [&]() {
+#ifdef USE_QT
+        grouped_expert_gemm_decode_qt<qt::Fmt::FP8_E4M3, N, K><<<num_tasks, threads>>>(A, Bpk, Cg, d_sBn, d_tasks, num_tasks);
+#else
         grouped_expert_gemm_decode_fp8_sat<N, K><<<num_tasks, threads>>>(A, Bpk, Cg, d_sBn, d_tasks, num_tasks);
+#endif
     };
     for (int i = 0; i < 5; i++) launch_sat();
     hip_check(hipDeviceSynchronize(), "warm sync"); hip_check(hipGetLastError(), "warm err");

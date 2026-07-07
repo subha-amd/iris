@@ -1,0 +1,374 @@
+\documentclass[pdf,aspectratio=169]{beamer}
+
+\usepackage{amssymb,amsmath,amsthm,enumerate}
+\usepackage[utf8]{inputenc}
+\usepackage{array}
+\usepackage[parfill]{parskip}
+\usepackage{graphicx}
+\usepackage{caption}
+\captionsetup[figure]{labelformat=empty}
+\usepackage{subcaption}
+\usepackage{bm}
+\usepackage{amsfonts,amscd}
+\usepackage[]{units}
+\usepackage{listings}
+\usepackage{multicol}
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+
+\newcommand{\empy}[1]{{\color{darkorange}\emph{#1}}}
+\newcommand{\empr}[1]{{\color{cardinalred}\emph{#1}}}
+\newcommand{\examplebox}[2]{%
+\begin{tcolorbox}[colframe=darkcardinal,colback=boxgray,title={#1}]
+#2
+\end{tcolorbox}}
+
+\usetheme{Stanford}
+\input{./style_files_stanford/my_beamer_defs.sty}
+\logo{}
+
+% compact monospace for kernel chains
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,columns=fullflexible,frame=none}
+\newcommand{\mc}[1]{{\ttfamily\small #1}}
+
+\title[Tile-Level Communication]{Tile-Level Communication for Fused Multi-GPU Inference}
+\subtitle{Make the cross-GPU \emph{communication schedule} a first-class, demand-aware library concern:\\ \textbf{declare}\,$\to$\,\textbf{schedule}\,$\to$\,\textbf{execute}}
+
+\beamertemplatenavigationsymbolsempty
+
+\begin{document}
+
+\author[Subha]{
+  \begin{tabular}{c}
+  \Large Subha \\
+  \footnotesize AMD \;$\cdot$\; advised by Simran Arora \& Muhammad Osama
+  \end{tabular}
+  \vspace{-4ex}}
+\institute{TileComm \,$\cdot$\, 8$\times$MI350X (gfx950, all-to-all XGMI) \,$\cdot$\, built on HipKittens + IRIS}
+\date{\today}
+
+\begin{noheadline}
+\begin{frame}\maketitle\end{frame}
+\end{noheadline}
+
+% ------------------------------------------------------------------ Slide 1
+\begin{frame}{Going a level up: from a fused region to a comm abstraction}
+\footnotesize
+Last time I showed the fused DeepSeek-R1 MoE region. Today I go one level up: make the \empr{communication schedule itself} a first-class, demand-aware library concern --- the tile-level abstraction Awad and Osama pointed at --- and I close out the MXFP4 and memory questions.
+\vspace{1ex}
+\begin{columns}
+\begin{column}{0.33\textwidth}
+\examplebox{Where I was}{\footnotesize \empy{Fused MoE region.} 1.56$\times$ prefill over the MORI\,$\to$\,aiter\,$\to$\,MORI baseline. HipKittens compute + IRIS comm.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{Where I'm going}{\footnotesize \empy{The comm abstraction.} A tile-granular collective the library \emph{schedules} --- the paper Awad + Osama pointed at.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{Hardware}{\footnotesize \empy{8$\times$MI350X, gfx950.} All-to-all XGMI. DeepSeek-R1 MXFP4, config TP4$\times$DP2 + DP-attention + EP.}
+\end{column}
+\end{columns}
+\vspace{1ex}
+\centering\empr{A fused kernel declares which tiles go to which ranks; the library picks the link-balanced schedule --- instead of every kernel hand-rolling its own.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 2
+\begin{frame}{Recap --- the fused region works, and it told me where to look}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\footnotesize
+\begin{itemize}\footnotesize
+  \item \empr{Prefill: 1.56$\times$} over the unfused MORI-dispatch $\to$ aiter-fmoe $\to$ MORI-combine baseline (1247 vs 1941\,$\mu$s), correctness-gated.
+  \item We fuse the expert \emph{region}: the gather \empy{produces the GEMM's layout}, so \empy{7 kernels collapse to 3} --- no sort, no standalone quant, no scatter-combine.
+  \item \empr{Decode is a weight wall} --- the GEMM streams all 32 local experts' $\sim$1.4\,GB of fp8 weights every step; fusion caps at $\sim$1.25$\times$. So fp4 + the comm work matter more than more GEMM tuning.
+\end{itemize}
+\end{column}
+\begin{column}{0.45\textwidth}
+\examplebox{The thread I'm pulling on}{\footnotesize
+Our biggest single communication win didn't come from a better \emph{algorithm}. It came from \empr{changing the order} in which thread blocks issue their remote writes.
+\vspace{1ex}\\
+That's a \empy{scheduling decision} --- and right now it's hand-rolled. Making it a library concern is the contribution.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 3
+\begin{frame}{The observation --- 2.4$\times$ from one hand-rolled line}
+\footnotesize
+Same kernel, same bytes, same reduction. The \emph{only} change: how destination rows are ordered across the 8 XGMI links.
+\begin{center}
+\begin{tabular}{lrl}
+\toprule
+combine schedule & region $\mu$s & why \\
+\midrule
+\empr{sorted by dst rank} (natural CSR order) & \empr{934\,$\mu$s} & a window of concurrent blocks hammers \emph{one} link \\
+\empy{round-robin cells} (\mc{interleave=True}) & \empy{386\,$\mu$s} & spreads the window across all 8 links \\
+\midrule
+\textbf{delta} & \textbf{2.42$\times$} & and now \emph{beats} MORI EpCombine (386 vs 398) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\examplebox{The hook}{\footnotesize
+\mc{irisx/fused\_moe/example.py $\to$ build\_combine\_pull(interleave=True)} --- a human noticed the link imbalance and hand-wrote a round-robin. \empr{That instinct is worth 2.4$\times$. The question is why a human had to have it.}}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 4
+\begin{frame}{The problem --- that round-robin is right by luck}
+\footnotesize
+\begin{columns}
+\begin{column}{0.33\textwidth}
+\examplebox{workload-blind}{\footnotesize
+\empr{Balances count, not bytes.} Under the expert imbalance Simran flagged --- some experts get 8$\times$ the tokens --- a hot expert's tile is far bigger, and cycling ranks equally leaves links unbalanced.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{not reusable}{\footnotesize
+\empr{Re-derived per collective.} The gather has its own ordering; a future reduce\_scatter needs a third. Every collective re-invents link balancing from scratch, with its own bugs.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{a cliff, not a slope}{\footnotesize
+\empr{The default is pathological.} The order you get \emph{for free} from a CSR grouped by destination is the 934\,$\mu$s one. Miss the hand-tuning and you're 2.4$\times$ slow --- silently.}
+\end{column}
+\end{columns}
+\vspace{1ex}
+\centering\empy{The schedule should be computed by the library from the declared demand and the measured link topology --- not authored by hand, per kernel, once per collective.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 5
+\begin{frame}[fragile]{TileComm --- declare the transfer, let the library schedule \& execute}
+\footnotesize
+\begin{columns}
+\begin{column}{0.33\textwidth}
+\examplebox{1 $\cdot$ declare}{\footnotesize \empy{What moves.} A set of tile transfers \mc{\{tile, src, dst, size, op?\}} --- not \mc{load/store} in a hand-chosen order.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{2 $\cdot$ schedule}{\footnotesize \empy{When \& over which link.} The library link-balances the order from demand + probed XGMI topology --- \empr{the traffic-shaper}.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{3 $\cdot$ execute}{\footnotesize \empy{How it runs.} Lowers to IRIS primitives inside a HipKittens kernel --- bulk-synchronous now, tile-fused later.}
+\end{column}
+\end{columns}
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\begin{lstlisting}
+tile_gather(tiles, src_map)         # dispatch: pull from owners
+tile_scatter(tiles, dst_map)        # push to destinations
+tile_reduce_scatter(tiles, dst,sum) # combine, all-reduce/2
+tile_all_reduce(tiles, sum)         # rs + all-gather
+\end{lstlisting}
+\centering\scriptsize four intents cover the MoE region + the TP collectives
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{The point}{\footnotesize
+The author writes the declaration \empr{once}. Bulk and fused executions are two lowerings of the \emph{same} intent, and the schedule is shared. The permutation space Osama called ``unexplored'' --- how many tiles before you reduce --- becomes a schedule the library \empy{searches}, not a constant a human tunes.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 6
+\begin{frame}{The quadrant --- tile-granular + demand-adaptive + fused is empty}
+\footnotesize
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+ & \textbf{whole-tensor} & \textbf{tile-granular} \\
+\midrule
+\textbf{fixed algorithm} & NCCL / RCCL --- ring, tree; no fusion & --- \\
+\textbf{programmable}     & MSCCL / MSCCL++ --- buffer-level, hand-authored & \empr{TileComm} \\
+\textbf{fused into a kernel} & aiter / MORI --- schedule baked in & \empr{TileComm} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\begin{columns}
+\begin{column}{0.52\textwidth}
+\begin{itemize}\footnotesize
+  \item \empy{IRIS} gives device primitives (\mc{load/store/get/put/atomic}) + one whole-tensor \mc{all\_reduce}. Tile collectives don't exist --- so we hand-roll them.
+  \item \empy{HipKittens} gives a gorgeous \emph{tile compute} abstraction (register/shared tiles, MFMA) and \emph{no communication concept at all}.
+\end{itemize}
+\end{column}
+\begin{column}{0.48\textwidth}
+\examplebox{The missing verb}{\footnotesize
+HipKittens describes \empr{tiles of compute}. IRIS moves \empr{bytes between ranks}. Nothing describes \empy{tiles of communication} that a scheduler can balance and a GEMM can overlap.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 7
+\begin{frame}{Why we \emph{think} order matters --- and an honest caveat}
+\footnotesize
+A window of 16 concurrent remote writes over 8 XGMI links. \empy{Makespan is set by the busiest link} (the tallest bar): sorted piles the window onto one link; round-robin spreads it.
+\begin{center}
+\begin{tikzpicture}[x=0.52cm,y=0.85mm]
+% --- sorted ---
+\begin{scope}[shift={(0,0)}]
+  \node[font=\scriptsize\bfseries,cardinalred] at (2.6,26) {sorted: one link saturated};
+  \foreach \x/\h in {0/16,1/0,2/0,3/0,4/0,5/0,6/0,7/0}
+     \fill[darkorange] (\x,0) rectangle ++(0.68,\h);
+  \draw[gray!60] (-0.2,0) -- (8,0);
+  \draw[dashed,cardinalred] (-0.2,16) -- (8,16);
+  \node[font=\tiny,cardinalred] at (10.3,16) {busiest = 16};
+  \foreach \x in {0,...,7} \node[font=\tiny,gray] at (\x+0.34,-2.6) {\x};
+\end{scope}
+% --- round-robin ---
+\begin{scope}[shift={(13,0)}]
+  \node[font=\scriptsize\bfseries,treegreen] at (2.6,26) {round-robin: all 8 links busy};
+  \foreach \x in {0,...,7}
+     \fill[treegreen] (\x,0) rectangle ++(0.68,2);
+  \draw[gray!60] (-0.2,0) -- (8,0);
+  \draw[dashed,treegreen] (-0.2,2) -- (8,2);
+  \node[font=\tiny,treegreen] at (9.9,2.6) {busiest = 2};
+  \foreach \x in {0,...,7} \node[font=\tiny,gray] at (\x+0.34,-2.6) {\x};
+\end{scope}
+\node[font=\tiny,gray] at (4,-5) {destination link 0\ldots7};
+\node[font=\tiny,gray] at (17,-5) {destination link 0\ldots7};
+\end{tikzpicture}
+\end{center}
+\examplebox{Caveat (honest)}{\footnotesize
+The on-node probe I ran to test this was \empr{issue-bound} --- IRIS stores are fire-and-forget, so it timed \emph{issue rate}, not link bandwidth (implied $\sim$4.7\,TB/s, $>$10$\times$ the fabric) and showed only $\sim$1.05$\times$. So the mechanism is \empy{not yet validated} in isolation. The 2.4$\times$ is a real \emph{region} result; whether it's link-spreading or the combine's read/reduction structure is still being isolated. Fixing the probe's completion fence is next.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 8
+\begin{frame}{The cost model --- calibrated, and an honest read of where it wins}
+\footnotesize
+A wave-based link-contention model (\mc{tilecomm/tilesched.py}), calibrated so uniform combine reproduces the measured 934 / 386\,$\mu$s. Three schedulers: \empr{sorted} (naive), round-robin (today), \empy{proportional} (byte-weighted, demand-aware).
+\begin{columns}
+\begin{column}{0.45\textwidth}
+\centering\scriptsize A $\cdot$ uniform combine (a \emph{fit}, not a prediction)
+\begin{tabular}{lrr}
+\toprule
+schedule & model $\mu$s & measured \\
+\midrule
+\empr{sorted} & 927.8 & 934 \\
+round-robin & 388.2 & 386 \\
+\empy{proportional} & 388.3 & (= rr) \\
+\bottomrule
+\end{tabular}
+\end{column}
+\begin{column}{0.55\textwidth}
+\centering\scriptsize B $\cdot$ imbalanced gather --- makespan vs expert skew
+\begin{tabular}{rrr}
+\toprule
+skew (max/mean) & round-robin & \empy{proportional} (= LB) \\
+\midrule
+1.00 & 780.4 & 780.4 \\
+1.37 & 1065.8 & 1031.5 \\
+1.94 & 1441.3 & 1411.5 \\
+3.94 & 2696.7 & 2659.8 \\
+\bottomrule
+\end{tabular}
+\end{column}
+\end{columns}
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.33\textwidth}
+\examplebox{2.4--6$\times$}{\scriptsize scheduling vs the naive order a kernel author writes by default --- the big lever, now impossible to miss.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{= lower bound}{\scriptsize proportional stays optimal across every skew; round-robin drifts 1--4\% and grows with imbalance.}
+\end{column}
+\begin{column}{0.33\textwidth}
+\examplebox{honest cap}{\scriptsize reorder alone is bounded by the hottest link --- the \emph{unbounded} win is comm/compute overlap.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 9
+\begin{frame}{Grounded --- every intent already exists hand-rolled in the kernel}
+\footnotesize
+\begin{center}
+\scriptsize
+\begin{tabular}{p{0.40\textwidth} l p{0.27\textwidth}}
+\toprule
+today, hand-rolled in \mc{fused\_moe/} & TileComm intent & the hard-coded schedule \\
+\midrule
+\mc{combine\_pull} (\mc{interleave=True}) & \empy{tile\_reduce\_scatter} & literally \mc{sched\_round\_robin} \\
+\mc{gather\_pack} + multi-source route & \empy{tile\_gather} & implicit expert-major order \\
+future GEMM + all-reduce \emph{(Osama's prize)} & \empy{tile\_reduce\_scatter} & \empr{the schedule space to search} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\examplebox{The concrete first step is a drop-in}{\footnotesize
+Replace the \mc{interleave=True} argument with \mc{tilecomm.schedule(transfer\_set, topology)}. Regression-gate: reproduce 386\,$\mu$s on uniform traffic. Then beat round-robin on a real load-imbalanced routing trace. \empy{Same \mc{combine\_pull\_kernel}} --- low risk, directly measured against a number we already trust.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 10
+\begin{frame}{MXFP4 --- memory is a non-issue; the blocker is a legitimate baseline}
+\footnotesize
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{``Will R1 fit on 8 GPUs?'' --- checked}{\footnotesize
+\begin{itemize}\scriptsize
+  \item MI350X = \empy{309\,GB} HBM each $\to$ \empy{2.47\,TB} across 8.
+  \item R1 MXFP4 (403\,GB) = \empr{16\% of HBM}; fp8 ($\sim$671\,GB) = 27\%. Fits with huge headroom.
+  \item The old wall was \emph{disk}, not HBM --- 666\,GB free on \mc{/data2}, model already cached, live SGLang-MXFP4 container on the node.
+\end{itemize}}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{status of the fp4 kernel work}{\footnotesize
+\begin{itemize}\scriptsize
+  \item \empr{Route-1 W4A16 decode done \& shipped} --- MXFP4 weights, hardware \mc{cvt\_scalef32\_pk\_bf16\_fp4} unpack: \empy{1.6$\times$ GEMM}, 1.11$\times$ region over fp8. Weight-only fp4 is the \emph{right} decode choice (decode is weight-bound).
+  \item The honest gap: our fp4 comparison replayed a \empr{buggy, untuned} captured aiter kernel. Beating it means nothing.
+\end{itemize}}
+\end{column}
+\end{columns}
+\examplebox{The plan --- measure against the real stack, in the realistic config}{\footnotesize
+Run AMD's reproducible \empy{SGLang DeepSeek-R1-FP4} benchmark (already on this node), profile the MoE region under \empr{TP4$\times$DP2 + DP-attention + EP} --- \emph{not} TP8, which inflates the all-reduce --- and iterate against that trace. Simran offered to run the e2e: the gold denominator. Rule: never iterate against a kernel we captured ourselves.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 11
+\begin{frame}{Roadmap \& asks --- from a hand-rolled line to a tile-fused collective}
+\footnotesize
+\begin{columns}
+\begin{column}{0.56\textwidth}
+\begin{enumerate}\footnotesize
+  \item \empr{Fix the on-node XGMI probe} --- tonight's run was issue-bound; add a completion fence + back-pressure so it tests the mechanism. Control link BW = 47\,GiB/s.
+  \item \empy{Drop-in into combine} --- \mc{tilecomm.schedule()} replaces \mc{interleave}; gate at 386\,$\mu$s, win on an imbalanced trace.
+  \item \empy{reduce\_scatter as a real IRIS collective} --- the TP-decomposition stepping stone (bulk-synchronous first).
+  \item \empr{Tile-fused execution} --- emit the reduce-scatter \emph{inside} the GEMM tile loop. The unbounded comm/compute-overlap win --- Osama's prize.
+  \item \empr{Multi-path routing under skew} --- relay a hot flow through an idle rank. Ordering-only $\to$ full traffic engineering.
+\end{enumerate}
+\end{column}
+\begin{column}{0.44\textwidth}
+\examplebox{What I'd like from you}{\footnotesize
+\begin{itemize}\scriptsize
+  \item \empy{Simran} --- the per-expert token-count routing trace, and the e2e SGLang-R1-FP4 run as the gold baseline.
+  \item \empy{Osama} --- a gut check on the tile-fused reduce\_scatter as the ``tiles-before-reduce'' schedule-search target.
+  \item \empy{Awad} --- is \emph{declare / schedule / execute} the right shape, and is the drop-in the right first milestone?
+\end{itemize}}
+\empr{Honest limits:} reorder-only buys 2.4--6$\times$ over the naive order but $\sim$1--4\% over the good hand-roll; the big win is Step 4. The cost model rests on one measured point until Step 1 lands.
+\end{column}
+\end{columns}
+\end{frame}
+
+% ================================================================== BACKUP
+\begin{frame}{Backup --- anticipated questions (1/3)}
+\footnotesize
+\begin{itemize}\footnotesize
+  \item \empr{``Is 1--4\% over round-robin worth a whole abstraction?''} The 1--4\% isn't the pitch --- the pitch is \empy{2.4--6$\times$ over the naive order made automatic and correct-by-construction}, robustness to imbalance for free, reuse across gather/combine/reduce\_scatter, and the substrate for the tile-fused overlap win. Reorder-only is the \emph{floor} of the value, not the ceiling.
+  \item \empr{``Why not just always use round-robin?''} It balances \emph{count, not bytes} --- under imbalance it drifts, and it can't express the tile-fused schedule at all. And ``always round-robin'' is itself a per-kernel human decision the naive path doesn't give you.
+  \item \empr{``How is this different from MSCCL / MSCCL++?''} MSCCL programs collectives at \emph{buffer} granularity with \emph{hand-authored} schedules, standalone. TileComm is \empy{tile-granular, demand-adaptive} (the schedule is \emph{computed}, not written), and designed to \empy{fuse into the compute kernel's tile loop}. The fusion + auto-scheduling is the delta.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Backup --- anticipated questions (2/3)}
+\footnotesize
+\begin{itemize}\footnotesize
+  \item \empr{``Your cost model is calibrated to one point --- is it real?''} Upfront: it's a fit to one measured region number (combine, 934/386); the mechanism isn't validated yet. The on-node XGMI probe was \empy{issue-bound} (IRIS stores are fire-and-forget $\Rightarrow$ measured issue rate, implying $\sim$4.7\,TB/s, $>$10$\times$ the fabric) and showed $\sim$1.05$\times$. So it's \emph{inconclusive, not a refutation}. It's a design-space tool calibrated to a real number; fixing the completion fence is the immediate next step.
+  \item \empr{``Does scheduling even matter, if the probe shows $\sim$1$\times$?''} The probe couldn't test it (issue-bound). The 2.4$\times$ is a real region measurement; what's open is \emph{why} --- pure link-spreading, or the combine's read/reduction structure. Either way the case holds: scheduling should be \empy{empirical and library-owned} precisely because the mechanism behind a hand-tuned win isn't obvious. And the big prize (tile-fused overlap) doesn't depend on this at all.
+  \item \empr{``On an all-to-all fabric, can ordering beat the hottest link?''} No --- reorder-only is \empy{capped by the hottest link's bytes} (slide 8). Multi-path routing (roadmap step 5) moves that floor, and only when the demand matrix is skewed onto specific links. The unbounded win before that is hiding comm under compute (tile-fusion).
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Backup --- anticipated questions (3/3)}
+\footnotesize
+\begin{itemize}\footnotesize
+  \item \empr{``Does the fp4 GEMM help decode?''} The tensor cores get faster but you still \emph{stream all the experts' weights}, so decode barely moves --- \empy{weight-only fp4 halves the weight bytes}, the actual decode bottleneck, so that's the lever, and it's the Route-1 choice.
+  \item \empr{``Did you get a new end-to-end MXFP4 speedup?''} No --- \emph{deliberately}. Route-1 is shipped; the missing piece is a \empy{legitimate external baseline}, which needs the real SGLang serve. I didn't brute-force that on a shared node tonight; the design + cost model was the higher-value use of the time, and the e2e is the clean way to get the real number.
+\end{itemize}
+\vspace{0.5ex}
+\examplebox{Numbers at a glance}{\scriptsize
+combine: \empy{386\,$\mu$s} pull (round-robin) vs 934\,$\mu$s (sorted) vs 398\,$\mu$s MORI \;$\cdot$\; scheduling lever \empy{2.4--6$\times$} over naive, $\sim$1--4\% over the hand-roll \;$\cdot$\; probe $\sim$1.05$\times$ (issue-bound) \;$\cdot$\; R1 MXFP4 = 403\,GB = 16\% of 2.47\,TB \;$\cdot$\; Route-1 fp4 GEMM \empy{1.6$\times$}, 1.11$\times$ region \;$\cdot$\; code: \mc{irisx/tilecomm/}}
+\end{frame}
+
+\end{document}
