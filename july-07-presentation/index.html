@@ -1,0 +1,598 @@
+<style>
+  /* ============================ TileComm deck ============================ */
+  /* Palette: "instrumentation" — teal = balanced/scheduled, amber = hot/contended,
+     slate neutrals biased toward the teal accent, on a deep blue-black ground.   */
+  :root {
+    --ground:      #f4f5f6;
+    --panel:       #ffffff;
+    --panel-2:     #eceef1;
+    --ink:         #0d1218;
+    --body:        #333d47;
+    --muted:       #616d78;
+    --border:      #dce0e4;
+    --border-strong:#c3cad1;
+    --teal:        #0b877a;
+    --teal-bright: #12a595;
+    --teal-soft:   #e2f2f0;
+    --amber:       #c1741a;
+    --amber-soft:  #f6ebdb;
+    --win:         #0b877a;
+    --shadow:      0 1px 2px rgba(13,18,24,.06), 0 8px 30px rgba(13,18,24,.06);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:  #0d1117;
+      --panel:   #141b22;
+      --panel-2: #1a232c;
+      --ink:     #eef3f7;
+      --body:    #c1ccd6;
+      --muted:   #7e8b97;
+      --border:  #232e39;
+      --border-strong:#31404c;
+      --teal:        #2bc0ae;
+      --teal-bright: #3ad4c1;
+      --teal-soft:   #10312e;
+      --amber:       #e0932f;
+      --amber-soft:  #2c2313;
+      --win:         #2bc0ae;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 12px 40px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --ground:#f4f5f6; --panel:#ffffff; --panel-2:#eceef1; --ink:#0d1218; --body:#333d47;
+    --muted:#616d78; --border:#dce0e4; --border-strong:#c3cad1; --teal:#0b877a;
+    --teal-bright:#12a595; --teal-soft:#e2f2f0; --amber:#c1741a; --amber-soft:#f6ebdb;
+    --win:#0b877a; --shadow:0 1px 2px rgba(13,18,24,.06), 0 8px 30px rgba(13,18,24,.06);
+  }
+  :root[data-theme="dark"] {
+    --ground:#0d1117; --panel:#141b22; --panel-2:#1a232c; --ink:#eef3f7; --body:#c1ccd6;
+    --muted:#7e8b97; --border:#232e39; --border-strong:#31404c; --teal:#2bc0ae;
+    --teal-bright:#3ad4c1; --teal-soft:#10312e; --amber:#e0932f; --amber-soft:#2c2313;
+    --win:#2bc0ae; --shadow:0 1px 2px rgba(0,0,0,.3), 0 12px 40px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0; background: var(--ground); color: var(--body);
+    font-family: var(--sans); font-size: 16px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .deck { scroll-snap-type: y proximity; }
+  .slide {
+    position: relative; min-height: 100vh; scroll-snap-align: start;
+    padding: 68px clamp(20px, 6vw, 96px) 84px;
+    display: flex; flex-direction: column; justify-content: center;
+    border-bottom: 1px solid var(--border);
+    max-width: 1180px; margin: 0 auto;
+  }
+  .slide > * { max-width: 1000px; }
+
+  /* ---- type ---- */
+  .eyebrow {
+    font-family: var(--mono); font-size: 12.5px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--teal); font-weight: 600;
+    display: flex; align-items: center; gap: 12px; margin: 0 0 20px;
+  }
+  .eyebrow .num { color: var(--muted); }
+  .eyebrow::before {
+    content: ""; width: 26px; height: 2px; background: var(--teal); display: inline-block;
+  }
+  h1 { font-family: var(--sans); font-weight: 800; letter-spacing: -.03em;
+       font-size: clamp(2.1rem, 5.4vw, 4rem); line-height: 1.02; color: var(--ink);
+       margin: 0 0 22px; text-wrap: balance; }
+  h2 { font-weight: 780; letter-spacing: -.02em; font-size: clamp(1.5rem, 3.4vw, 2.4rem);
+       line-height: 1.08; color: var(--ink); margin: 0 0 16px; text-wrap: balance; }
+  h3 { font-weight: 700; font-size: 1.06rem; color: var(--ink); margin: 0 0 6px; letter-spacing: -.01em; }
+  p { margin: 0 0 14px; max-width: 66ch; }
+  .lead { font-size: clamp(1.05rem, 1.9vw, 1.32rem); color: var(--body); max-width: 60ch; }
+  strong { color: var(--ink); font-weight: 680; }
+  .teal { color: var(--teal); }
+  .amber { color: var(--amber); }
+  code, .m { font-family: var(--mono); font-size: .9em; }
+  code { background: var(--panel-2); padding: .1em .4em; border-radius: 4px; color: var(--ink);
+         border: 1px solid var(--border); }
+  a { color: var(--teal); }
+
+  /* ---- structural bits ---- */
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 22px 24px; box-shadow: var(--shadow);
+  }
+  .grid { display: grid; gap: 16px; }
+  .g2 { grid-template-columns: repeat(2, 1fr); }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 760px) { .g2, .g3 { grid-template-columns: 1fr; } }
+  .kicker { font-family: var(--mono); font-size: 11.5px; letter-spacing: .12em;
+            text-transform: uppercase; color: var(--muted); margin-bottom: 10px; }
+  .stat { font-family: var(--mono); font-weight: 600; letter-spacing: -.02em;
+          color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  /* pills / tags */
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono);
+          font-size: 12px; letter-spacing: .04em; padding: 3px 10px; border-radius: 999px;
+          border: 1px solid var(--border-strong); color: var(--muted); }
+  .pill.good { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); }
+  .pill.hot  { color: var(--amber); border-color: var(--amber); background: var(--amber-soft); }
+
+  ul.clean { list-style: none; padding: 0; margin: 0; display: grid; gap: 12px; }
+  ul.clean li { display: grid; grid-template-columns: 20px 1fr; gap: 12px; align-items: start; }
+  ul.clean li::before { content: ""; width: 8px; height: 8px; margin-top: 8px; border-radius: 2px;
+                        background: var(--teal); transform: rotate(45deg); }
+
+  /* tables */
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; background: var(--panel); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  thead th { font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--muted); font-weight: 600; background: var(--panel-2); }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: none; }
+  .row-hi td { background: var(--teal-soft); }
+  .row-bad td { background: var(--amber-soft); }
+
+  /* progress rail */
+  .rail { position: fixed; top: 50%; right: 18px; transform: translateY(-50%); z-index: 40;
+          display: flex; flex-direction: column; gap: 11px; }
+  .rail button { all: unset; cursor: pointer; width: 10px; height: 10px; border-radius: 50%;
+                 border: 1.5px solid var(--border-strong); transition: all .2s; }
+  .rail button[aria-current="true"] { background: var(--teal); border-color: var(--teal); transform: scale(1.3); }
+  .rail button:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+  @media (max-width: 900px) { .rail { display: none; } }
+
+  /* top bar */
+  .topbar { position: fixed; top: 0; left: 0; right: 0; height: 46px; z-index: 45;
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 0 18px; background: color-mix(in srgb, var(--ground) 82%, transparent);
+            backdrop-filter: blur(10px); border-bottom: 1px solid var(--border);
+            font-family: var(--mono); font-size: 12px; letter-spacing: .04em; color: var(--muted); }
+  .topbar .brand { color: var(--ink); font-weight: 600; }
+  .topbar .brand b { color: var(--teal); }
+  .toggle { all: unset; cursor: pointer; padding: 5px 10px; border: 1px solid var(--border-strong);
+            border-radius: 7px; color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
+  .toggle:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+  .progressbar { position: fixed; top: 46px; left: 0; height: 2px; background: var(--teal);
+                 z-index: 46; width: 0; transition: width .15s; }
+
+  /* diagram helpers */
+  .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; }
+  @media (max-width: 760px){ .flow { grid-template-columns: 1fr; } .flow .arrow { transform: rotate(90deg); justify-self: center; } }
+  .flow .arrow { align-self: center; color: var(--muted); font-family: var(--mono); font-size: 20px; }
+  .stage { background: var(--panel); border: 1px solid var(--border); border-radius: 11px; padding: 16px; }
+  .stage .lbl { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--teal); margin-bottom: 8px; }
+  .stage.mut .lbl { color: var(--muted); }
+
+  .svgwrap { width: 100%; overflow-x: auto; }
+  figcaption { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 10px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; }
+
+  .note { font-size: 13.5px; color: var(--muted); border-left: 2px solid var(--border-strong);
+          padding-left: 14px; margin-top: 8px; }
+  .foot { position: absolute; bottom: 26px; left: clamp(20px,6vw,96px); font-family: var(--mono);
+          font-size: 11.5px; color: var(--muted); letter-spacing: .06em; }
+</style>
+
+<div class="topbar">
+  <div class="brand">Tile<b>Comm</b> · tile-level communication for fused multi-GPU inference</div>
+  <button class="toggle" id="themeBtn" aria-label="Toggle theme">◐ theme</button>
+</div>
+<div class="progressbar" id="pbar"></div>
+<nav class="rail" id="rail" aria-label="Slides"></nav>
+
+<main class="deck" id="deck">
+
+  <!-- 0 — TITLE ---------------------------------------------------------------->
+  <section class="slide" id="s0">
+    <div class="eyebrow"><span class="num">IRIS × HipKittens</span> · research update · 2026-07-07</div>
+    <h1>Tile-level communication<br>for fused multi-GPU inference</h1>
+    <p class="lead">Make the cross-GPU <em>communication schedule</em> a first-class, demand-aware
+      library concern — so a fused kernel <strong>declares which tiles go to which ranks</strong> and
+      the library picks the link-balanced schedule, instead of every kernel hand-rolling its own.</p>
+    <div class="grid g3" style="margin-top:30px">
+      <div class="card"><div class="kicker">Where I was</div><h3>Fused DeepSeek-R1 MoE region</h3>
+        <p style="margin:0;font-size:14px;color:var(--muted)">1.56× prefill over the MORI→aiter→MORI baseline. HipKittens compute + IRIS comm.</p></div>
+      <div class="card"><div class="kicker">Where I'm going</div><h3>The comm abstraction</h3>
+        <p style="margin:0;font-size:14px;color:var(--muted)">A tile-granular collective the library schedules — the paper Awad + Osama pointed at.</p></div>
+      <div class="card"><div class="kicker">Hardware</div><h3>8× MI350X · gfx950</h3>
+        <p style="margin:0;font-size:14px;color:var(--muted)">All-to-all XGMI. DeepSeek-R1 MXFP4, config TP4×DP2 + DP-attention + EP.</p></div>
+    </div>
+    <div class="foot">01 / 11 — use ↓ / → or click the dots</div>
+  </section>
+
+  <!-- 1 — RECAP ---------------------------------------------------------------->
+  <section class="slide" id="s1">
+    <div class="eyebrow"><span class="num">01</span> · recap</div>
+    <h2>The fused region works — the win is real, and it told me where to look next</h2>
+    <div class="grid g2" style="margin-top:8px">
+      <div>
+        <ul class="clean">
+          <li><span><strong>Prefill: 1.56×</strong> over the unfused MORI-dispatch → aiter-fmoe → MORI-combine baseline (1247 µs vs 1941 µs), correctness-gated.</span></li>
+          <li><span>We fuse the expert <em>region</em>: the gather produces the GEMM's layout, so 7 kernels collapse to 3 — no sort, no standalone quant, no scatter-combine.</span></li>
+          <li><span><strong>Decode is a weight wall</strong> — the GEMM streams all 32 local experts' ~1.4 GB fp8 weights every step; fusion caps at ~1.25× there. That's why fp4 + the comm work matter more than more GEMM tuning.</span></li>
+        </ul>
+      </div>
+      <div class="card" style="align-self:start">
+        <div class="kicker">The thread I'm pulling on</div>
+        <p style="margin:0 0 10px">Our biggest single communication win didn't come from a better algorithm. It came from <strong>changing the order</strong> in which thread blocks issue their remote writes.</p>
+        <p style="margin:0;color:var(--muted);font-size:14px">That's a scheduling decision — and right now it's hand-rolled. Making it a library concern is the contribution.</p>
+      </div>
+    </div>
+    <div class="foot">02 / 11</div>
+  </section>
+
+  <!-- 2 — THE HOOK ------------------------------------------------------------->
+  <section class="slide" id="s2">
+    <div class="eyebrow"><span class="num">02</span> · the observation</div>
+    <h2>The combine collective got 2.4× faster from one hand-rolled line</h2>
+    <p>Same kernel, same bytes, same reduction. The only change: how destination rows are ordered across the 8 XGMI links.</p>
+    <div class="grid g3" style="margin:20px 0 6px">
+      <div class="card" style="border-color:var(--amber)">
+        <span class="pill hot">sorted by dst rank</span>
+        <div class="stat" style="font-size:2.7rem;margin:14px 0 2px">934 µs</div>
+        <p style="margin:0;font-size:13.5px;color:var(--muted)">the natural CSR order — a window of concurrent blocks all hammers one link</p>
+      </div>
+      <div class="card" style="border-color:var(--teal)">
+        <span class="pill good">round-robin cells</span>
+        <div class="stat teal" style="font-size:2.7rem;margin:14px 0 2px">386 µs</div>
+        <p style="margin:0;font-size:13.5px;color:var(--muted)">spread the window across all 8 links — <code>interleave=True</code>, one argument</p>
+      </div>
+      <div class="card">
+        <div class="kicker">delta</div>
+        <div class="stat" style="font-size:2.7rem;margin:14px 0 2px">2.42×</div>
+        <p style="margin:0;font-size:13.5px;color:var(--muted)">and our pull-combine now beats AMD's own MORI EpCombine (386 vs 398 µs)</p>
+      </div>
+    </div>
+    <p class="note"><span class="m">irisx/fused_moe/example.py → build_combine_pull(rev, world, interleave=True)</span> — a human noticed the link imbalance and hand-wrote a round-robin. That instinct is worth 2.4×. The question is why a human had to have it.</p>
+    <div class="foot">03 / 11</div>
+  </section>
+
+  <!-- 3 — THE PROBLEM ---------------------------------------------------------->
+  <section class="slide" id="s3">
+    <div class="eyebrow"><span class="num">03</span> · the problem with hand-rolling it</div>
+    <h2>That round-robin is right by luck, and it doesn't generalize</h2>
+    <div class="grid g3" style="margin-top:12px">
+      <div class="card">
+        <div class="kicker" style="color:var(--amber)">workload-blind</div>
+        <h3>Balances count, not bytes</h3>
+        <p style="margin:0;font-size:14.5px;color:var(--body)">Round-robin assumes every destination carries equal bytes. Under the expert load imbalance Simran flagged — some experts get 8× the tokens — a hot expert's tile is far bigger, and cycling ranks equally leaves links unbalanced.</p>
+      </div>
+      <div class="card">
+        <div class="kicker" style="color:var(--amber)">not reusable</div>
+        <h3>Re-derived per collective</h3>
+        <p style="margin:0;font-size:14.5px;color:var(--body)">The gather has its own hand-rolled ordering. A future reduce-scatter will need a third. Every collective re-invents link balancing from scratch, with its own bugs.</p>
+      </div>
+      <div class="card">
+        <div class="kicker" style="color:var(--amber)">a cliff, not a slope</div>
+        <h3>The default is pathological</h3>
+        <p style="margin:0;font-size:14.5px;color:var(--body)">The order you get "for free" from a CSR grouped by destination is the 934 µs one. Miss the hand-tuning and you're 2.4× slow — silently. The good schedule is opt-in.</p>
+      </div>
+    </div>
+    <p class="lead" style="margin-top:26px">The schedule should be <span class="teal">computed by the library</span> from the declared demand and the measured link topology — not authored by hand, per kernel, once per collective.</p>
+    <div class="foot">04 / 11</div>
+  </section>
+
+  <!-- 4 — THE ABSTRACTION ------------------------------------------------------>
+  <section class="slide" id="s4">
+    <div class="eyebrow"><span class="num">04</span> · the abstraction</div>
+    <h2>TileComm: declare the transfer, let the library schedule &amp; execute it</h2>
+    <div class="flow" style="margin:14px 0 20px">
+      <div class="stage"><div class="lbl">1 · declare</div><h3 style="margin-bottom:6px">What moves</h3>
+        <p style="margin:0;font-size:13.5px;color:var(--muted)">a set of tile transfers <span class="m">{tile, src, dst, size, op?}</span> — not <span class="m">load/store</span> in a hand-chosen order</p></div>
+      <div class="arrow">→</div>
+      <div class="stage" style="border-color:var(--teal)"><div class="lbl">2 · schedule</div><h3 style="margin-bottom:6px">When &amp; over which link</h3>
+        <p style="margin:0;font-size:13.5px;color:var(--muted)">the library link-balances the order from demand + probed XGMI topology — <em>the traffic-shaper</em></p></div>
+      <div class="arrow">→</div>
+      <div class="stage mut"><div class="lbl">3 · execute</div><h3 style="margin-bottom:6px">How it runs</h3>
+        <p style="margin:0;font-size:13.5px;color:var(--muted)">lowers to IRIS primitives inside a HipKittens kernel — bulk-synchronous now, tile-fused later</p></div>
+    </div>
+    <div class="grid g2">
+      <div class="card">
+        <div class="kicker">four intents cover the MoE region + the TP collectives</div>
+        <pre style="margin:0;font-family:var(--mono);font-size:13px;line-height:1.9;color:var(--ink);overflow-x:auto"><span class="teal">tile_gather</span>(tiles, src_map)              <span style="color:var(--muted)"># dispatch: pull from owners</span>
+<span class="teal">tile_scatter</span>(tiles, dst_map)             <span style="color:var(--muted)"># push to destinations</span>
+<span class="teal">tile_reduce_scatter</span>(tiles, dst, op=sum) <span style="color:var(--muted)"># combine, all-reduce/2</span>
+<span class="teal">tile_all_reduce</span>(tiles, op=sum)          <span style="color:var(--muted)"># rs + all-gather</span></pre>
+      </div>
+      <div class="card" style="background:var(--teal-soft);border-color:var(--teal)">
+        <div class="kicker" style="color:var(--teal)">the point</div>
+        <p style="margin:0 0 8px">The author writes the declaration <strong>once</strong>. The bulk and fused executions are two lowerings of the same intent, and the schedule is shared across both.</p>
+        <p style="margin:0;font-size:14px;color:var(--body)">The permutation space Osama called "insane and unexplored" — how many tiles to produce before you reduce — becomes a schedule the library <em>searches</em>, not a constant a human tunes.</p>
+      </div>
+    </div>
+    <div class="foot">05 / 11</div>
+  </section>
+
+  <!-- 5 — THE QUADRANT --------------------------------------------------------->
+  <section class="slide" id="s5">
+    <div class="eyebrow"><span class="num">05</span> · why this is unoccupied</div>
+    <h2>Tile-granular + demand-adaptive + fused into compute is the empty cell</h2>
+    <div class="tbl-wrap" style="margin:10px 0 16px">
+      <table>
+        <thead><tr><th></th><th>whole-tensor</th><th>tile-granular</th></tr></thead>
+        <tbody>
+          <tr><td><strong>fixed algorithm</strong></td><td>NCCL / RCCL — ring, tree; no fusion</td><td style="color:var(--muted)">—</td></tr>
+          <tr><td><strong>programmable</strong></td><td>MSCCL / MSCCL++ — buffer-level, hand-authored</td><td class="row-hi" style="color:var(--teal);font-weight:600">TileComm</td></tr>
+          <tr><td><strong>fused into a kernel</strong></td><td>aiter / MORI — schedule baked in</td><td class="row-hi" style="color:var(--teal);font-weight:600">TileComm</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="grid g2">
+      <ul class="clean">
+        <li><span><strong>IRIS</strong> gives device primitives (<span class="m">load/store/get/put/atomic</span>) + one whole-tensor <span class="m">all_reduce</span>. Tile collectives don't exist — so we hand-roll them.</span></li>
+        <li><span><strong>HipKittens</strong> gives a gorgeous <em>tile compute</em> abstraction (register/shared tiles, MFMA) and <em>no communication concept at all</em>.</span></li>
+      </ul>
+      <div class="card" style="align-self:start">
+        <div class="kicker">the gap, in one line</div>
+        <p style="margin:0">HipKittens describes <span class="teal">tiles of compute</span>. IRIS moves <span class="teal">bytes between ranks</span>. Nothing describes <strong>tiles of communication</strong> that a scheduler can balance and a GEMM can overlap. TileComm is that missing verb.</p>
+      </div>
+    </div>
+    <div class="foot">06 / 11</div>
+  </section>
+
+  <!-- 6 — WHY ORDER MATTERS (LIVE VIZ) ----------------------------------------->
+  <section class="slide" id="s6">
+    <div class="eyebrow"><span class="num">06</span> · the intuition, live</div>
+    <h2>Order decides how many links stay busy at once</h2>
+    <p style="margin-bottom:6px">Each tick is one remote write, colored by its destination link (0–7). The moving box is the concurrency window — the blocks in flight together. The bar under each row is the window's <strong>busiest-link load</strong>: taller = more contention.</p>
+    <div class="card" id="vizCard" style="margin:14px 0 8px;padding:20px 22px">
+      <div id="viz"></div>
+      <div class="legend" style="margin-top:14px">
+        <span><span class="swatch" style="background:var(--amber)"></span> sorted → one link saturates</span>
+        <span><span class="swatch" style="background:var(--teal)"></span> spread → all 8 links share the load</span>
+        <span style="color:var(--muted)">destination link 0…7 = hue</span>
+      </div>
+    </div>
+    <p class="note">Sorted keeps ~1 link busy per window (the rest idle); round-robin and proportional keep all 8 busy. Same total bytes — 2.4× less wall-clock. This is the whole mechanism.</p>
+    <div class="foot">07 / 11</div>
+  </section>
+
+  <!-- 7 — COST MODEL ----------------------------------------------------------->
+  <section class="slide" id="s7">
+    <div class="eyebrow"><span class="num">07</span> · the cost model &amp; results</div>
+    <h2>A calibrated scheduler — and an honest read of where it wins</h2>
+    <p style="margin-bottom:14px">A wave-based link-contention model (<span class="m">tilecomm/tilesched.py</span>), calibrated so uniform combine reproduces the measured 934 / 386 µs. Three schedulers: <span class="amber">sorted</span> (naive), <span style="color:var(--muted)">round-robin</span> (today), <span class="teal">proportional</span> (byte-weighted, demand-aware).</p>
+    <div class="grid g2" style="align-items:start">
+      <figure style="margin:0" class="card">
+        <div class="kicker">A · uniform combine — reproduces the measurement</div>
+        <div class="svgwrap" id="chartA"></div>
+        <figcaption>model: sorted 927.8 · rr 388.2 · prop 388.3 µs — matches measured 934 / 386.</figcaption>
+      </figure>
+      <figure style="margin:0" class="card">
+        <div class="kicker">B · imbalanced gather — makespan vs expert skew</div>
+        <div class="svgwrap" id="chartB"></div>
+        <figcaption>proportional (teal) tracks the link lower bound at every skew; round-robin drifts above it. sorted is 4–5× higher — off scale.</figcaption>
+      </figure>
+    </div>
+    <div class="grid g3" style="margin-top:16px">
+      <div class="card"><div class="stat teal" style="font-size:1.7rem">2.4–6×</div><p style="margin:4px 0 0;font-size:13.5px;color:var(--muted)">scheduling vs the naive order a kernel author writes by default — the big lever, now impossible to miss</p></div>
+      <div class="card"><div class="stat teal" style="font-size:1.7rem">= lower bound</div><p style="margin:4px 0 0;font-size:13.5px;color:var(--muted)">proportional stays optimal across every skew; round-robin drifts 1–4% and grows with imbalance</p></div>
+      <div class="card"><div class="stat" style="font-size:1.7rem">honest cap</div><p style="margin:4px 0 0;font-size:13.5px;color:var(--muted)">reorder alone is bounded by the hottest link — the unbounded win is comm/compute overlap (slide 11)</p></div>
+    </div>
+    <div class="foot">08 / 11</div>
+  </section>
+
+  <!-- 8 — GROUNDED ------------------------------------------------------------->
+  <section class="slide" id="s8">
+    <div class="eyebrow"><span class="num">08</span> · not vaporware</div>
+    <h2>Every intent already exists as a hand-rolled special case in our kernel</h2>
+    <div class="tbl-wrap" style="margin:10px 0 14px">
+      <table>
+        <thead><tr><th>today, hand-rolled in <span class="m">fused_moe/</span></th><th>TileComm intent</th><th>the schedule that's hard-coded</th></tr></thead>
+        <tbody>
+          <tr><td><span class="m">combine_pull</span> + <span class="m">build_combine_pull(interleave=True)</span></td><td class="teal">tile_reduce_scatter</td><td>literally <span class="m">sched_round_robin</span></td></tr>
+          <tr><td><span class="m">gather_pack</span> + multi-source route</td><td class="teal">tile_gather</td><td>an implicit expert-major order</td></tr>
+          <tr><td>future GEMM + all-reduce <span style="color:var(--muted)">(Osama's prize)</span></td><td class="teal">tile_reduce_scatter</td><td class="row-hi" style="color:var(--teal)">the schedule space to search</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="card" style="background:var(--teal-soft);border-color:var(--teal)">
+      <div class="kicker" style="color:var(--teal)">the concrete first step is a drop-in</div>
+      <p style="margin:0">Replace the <code>interleave=True</code> argument with <span class="m">tilecomm.schedule(transfer_set, topology)</span>. Regression-gate: reproduce 386 µs on uniform traffic. Then beat round-robin on a real load-imbalanced routing trace. Same <span class="m">combine_pull_kernel</span> — low risk, directly measured against a number we already trust.</p>
+    </div>
+    <div class="foot">09 / 11</div>
+  </section>
+
+  <!-- 9 — MXFP4 + MEMORY ------------------------------------------------------->
+  <section class="slide" id="s9">
+    <div class="eyebrow"><span class="num">09</span> · the second direction · MXFP4 DeepSeek-R1</div>
+    <h2>Memory is a non-issue — the blocker is a legitimate baseline</h2>
+    <div class="grid g2" style="align-items:start">
+      <div class="card">
+        <div class="kicker">"will R1 even fit on 8 GPUs?" — checked</div>
+        <ul class="clean" style="gap:9px">
+          <li><span>MI350X = <strong>309 GB</strong> HBM each → <strong>2.47 TB</strong> across 8.</span></li>
+          <li><span>R1 MXFP4 (403 GB) = <span class="teal">16% of HBM</span>; fp8 (~671 GB) = 27%. Fits with enormous headroom.</span></li>
+          <li><span>The old wall was <em>disk</em>, not HBM — the node has 666 GB free on <span class="m">/data2</span>, the model's already cached, and a live SGLang-MXFP4 container is on it.</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="kicker">status of the fp4 kernel work</div>
+        <ul class="clean" style="gap:9px">
+          <li><span><strong>Route-1 W4A16 decode is done &amp; shipped</strong> — MXFP4 weights, hardware <span class="m">cvt_scalef32_pk_bf16_fp4</span> unpack: <span class="teal">1.6× GEMM</span>, 1.11× region over fp8. Weight-only fp4 is the <em>right</em> decode choice (decode is weight-bound).</span></li>
+          <li><span>The honest gap: our fp4 comparison replayed a <span class="amber">buggy, untuned</span> captured aiter kernel. Beating it means nothing.</span></li>
+        </ul>
+      </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="kicker">the plan — measure against the real production stack, in the realistic config</div>
+      <p style="margin:0;font-size:14.5px">Run AMD's reproducible <strong>SGLang DeepSeek-R1-FP4</strong> benchmark (already on this node), profile the MoE region under <span class="teal">TP4 × DP2 + DP-attention + EP</span> — <em>not</em> TP8, which inflates the all-reduce and isn't how R1 is served on AMD — and iterate the fused region against that trace. Simran offered to run the e2e; that's the gold denominator. <span style="color:var(--muted)">Rule: never iterate against a kernel we captured ourselves.</span></p>
+    </div>
+    <div class="foot">10 / 11</div>
+  </section>
+
+  <!-- 10 — ROADMAP + ASKS ------------------------------------------------------>
+  <section class="slide" id="s10">
+    <div class="eyebrow"><span class="num">10</span> · roadmap &amp; asks</div>
+    <h2>From a hand-rolled line to a tile-fused collective</h2>
+    <div class="grid g2" style="align-items:start">
+      <div>
+        <ol style="margin:0;padding-left:0;list-style:none;display:grid;gap:11px;counter-reset:r">
+          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px;align-items:start"><span class="stat teal" style="font-size:14px">01</span><span><strong>On-node XGMI probe</strong> — a 2nd measured point to validate the cost model (running now).</span></li>
+          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat teal" style="font-size:14px">02</span><span><strong>Drop-in into combine</strong> — <span class="m">tilecomm.schedule()</span> replaces <code>interleave</code>; gate at 386 µs, win on an imbalanced trace.</span></li>
+          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat teal" style="font-size:14px">03</span><span><strong>reduce_scatter as a real IRIS collective</strong> — the TP-decomposition stepping stone (bulk-synchronous first).</span></li>
+          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat" style="font-size:14px;color:var(--amber)">04</span><span><strong>Tile-fused execution</strong> — emit the reduce-scatter <em>inside</em> the GEMM tile loop. The unbounded comm/compute-overlap win — Osama's prize.</span></li>
+          <li style="display:grid;grid-template-columns:28px 1fr;gap:12px"><span class="stat" style="font-size:14px;color:var(--amber)">05</span><span><strong>Multi-path routing under skew</strong> — relay a hot flow through an idle rank. Ordering-only → full traffic engineering.</span></li>
+        </ol>
+      </div>
+      <div class="card" style="background:var(--panel-2);align-self:start">
+        <div class="kicker">what I'd like from you</div>
+        <ul class="clean" style="gap:11px">
+          <li><span><strong>Simran</strong> — the real text-distribution routing trace (per-expert token counts) to drive the imbalance case, and the e2e SGLang-R1-FP4 run as the gold baseline.</span></li>
+          <li><span><strong>Osama</strong> — a sanity check on the tile-fused reduce_scatter as the target for the "tiles-before-reduce" schedule search.</span></li>
+          <li><span><strong>Awad</strong> — is <em>declare / schedule / execute</em> the right shape for the abstraction, and is the drop-in the right first milestone?</span></li>
+        </ul>
+        <p class="note" style="margin-top:14px">Honest limits: reorder-only buys 2.4–6× over the naive order but ~1–4% over the good hand-roll; the big win is Step 4. The cost model rests on one measured point until Step 1 lands.</p>
+      </div>
+    </div>
+    <div class="foot">11 / 11 · code: irisx/tilecomm/ · thesis: "Tile-Level Communication for Fused Multi-GPU Inference"</div>
+  </section>
+</main>
+
+<script>
+  // ---- theme toggle ----
+  const root = document.documentElement;
+  document.getElementById('themeBtn').addEventListener('click', () => {
+    const cur = root.getAttribute('data-theme')
+      || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+    root.setAttribute('data-theme', cur === 'dark' ? 'light' : 'dark');
+    draw(); // recolor charts from CSS vars
+  });
+  const cssv = n => getComputedStyle(root).getPropertyValue(n).trim();
+
+  // ---- progress rail + scroll ----
+  const slides = [...document.querySelectorAll('.slide')];
+  const rail = document.getElementById('rail');
+  slides.forEach((s,i) => {
+    const b = document.createElement('button');
+    b.setAttribute('aria-label', 'Slide ' + (i+1));
+    b.addEventListener('click', () => s.scrollIntoView({behavior:'smooth', block:'start'}));
+    rail.appendChild(b);
+  });
+  const dots = [...rail.children];
+  const pbar = document.getElementById('pbar');
+  const io = new IntersectionObserver(es => {
+    es.forEach(e => { if (e.isIntersecting) {
+      const i = slides.indexOf(e.target);
+      dots.forEach((d,j) => d.setAttribute('aria-current', j===i ? 'true':'false'));
+      pbar.style.width = ((i)/(slides.length-1)*100) + '%';
+    }});
+  }, {threshold: 0.55});
+  slides.forEach(s => io.observe(s));
+
+  // keyboard nav
+  addEventListener('keydown', e => {
+    const cur = slides.findIndex(s => { const r=s.getBoundingClientRect(); return r.top>=-5 && r.top < innerHeight*0.6; });
+    let i = cur < 0 ? 0 : cur;
+    if (e.key==='ArrowDown'||e.key==='ArrowRight'||e.key===' ') { e.preventDefault(); slides[Math.min(i+1,slides.length-1)].scrollIntoView({behavior:'smooth'}); }
+    if (e.key==='ArrowUp'||e.key==='ArrowLeft') { e.preventDefault(); slides[Math.max(i-1,0)].scrollIntoView({behavior:'smooth'}); }
+  });
+
+  // ---- schedule-contention viz (slide 6) ----
+  const W = 8, N = 96, WIN = 16;
+  function palette(){ // 8 hues; dst 0 = amber anchor, spread through teal
+    const out=[]; for(let k=0;k<W;k++){ const h = 20 + k*28; out.push(`hsl(${h} 62% 52%)`);} return out; }
+  const dstUniform = Array.from({length:N}, (_,i)=> (Math.floor(i*2654435761 % 100)%W)); // pseudo-uniform
+  function orderSorted(d){ return [...d.keys()].sort((a,b)=>d[a]-d[b]); }
+  function orderRR(d){ const per=Array.from({length:W},()=>[]); d.forEach((r,i)=>per[r].push(i)); const o=[]; let rem=d.length,idx=Array(W).fill(0); while(rem>0){for(let r=0;r<W;r++){if(idx[r]<per[r].length){o.push(per[r][idx[r]++]);rem--;}}} return o; }
+  const rows = [
+    {name:'sorted',      ord: orderSorted(dstUniform)},
+    {name:'round-robin', ord: orderRR(dstUniform)},
+    {name:'proportional',ord: orderRR(dstUniform)}, // uniform => same as RR (that's the point)
+  ];
+  function buildViz(){
+    const host = document.getElementById('viz'); host.innerHTML='';
+    const cols = palette();
+    rows.forEach(row => {
+      const wrap = document.createElement('div'); wrap.style.marginBottom='16px';
+      const lab = document.createElement('div');
+      lab.style.cssText='font-family:var(--mono);font-size:12px;letter-spacing:.06em;margin-bottom:6px;color:var(--muted)';
+      lab.innerHTML = row.name;
+      wrap.appendChild(lab);
+      const track = document.createElement('div');
+      track.style.cssText='display:grid;grid-template-columns:repeat('+N+',1fr);gap:1px;height:22px';
+      row.seq = row.ord.map(i=>dstUniform[i]);
+      row.seq.forEach(r=>{ const c=document.createElement('div'); c.style.background=cols[r]; c.style.borderRadius='1px'; track.appendChild(c); });
+      wrap.appendChild(track);
+      host.appendChild(wrap);
+      row.trackEl = track;
+    });
+    // contention meter under all rows
+    const meter = document.createElement('div');
+    meter.id='meter'; meter.style.cssText='display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:4px';
+    rows.forEach(row=>{ const m=document.createElement('div');
+      m.innerHTML='<div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:4px">busiest link in window</div>'+
+                  '<div style="height:8px;background:var(--panel-2);border-radius:4px;overflow:hidden"><div class="fill" style="height:100%;width:0;background:var(--teal);transition:width .12s,background .12s"></div></div>'+
+                  '<div class="val" style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:3px"></div>';
+      meter.appendChild(m); row.meterEl=m.querySelector('.fill'); row.valEl=m.querySelector('.val'); });
+    host.appendChild(meter);
+  }
+  let vizPos=0, vizTimer=null;
+  function stepViz(){
+    const start = vizPos % (N-WIN);
+    rows.forEach(row=>{
+      // highlight window
+      [...row.trackEl.children].forEach((c,i)=>{ c.style.outline = (i>=start && i<start+WIN) ? '2px solid var(--ink)' : 'none'; c.style.outlineOffset='-1px'; c.style.opacity=(i>=start&&i<start+WIN)?'1':'0.32'; });
+      // count busiest link in window
+      const cnt=Array(W).fill(0); for(let i=start;i<start+WIN;i++) cnt[row.seq[i]]++;
+      const mx=Math.max(...cnt);
+      const frac = mx/WIN;
+      row.meterEl.style.width=(frac*100)+'%';
+      row.meterEl.style.background = frac>0.6 ? cssv('--amber') : cssv('--teal');
+      row.valEl.textContent = mx+' / '+WIN+' writes on one link';
+    });
+    vizPos++;
+  }
+  // start viz when slide 6 visible
+  const vizIO = new IntersectionObserver(es=>es.forEach(e=>{
+    if(e.isIntersecting){ if(!vizTimer){ buildViz(); vizPos=0; if(!matchMedia('(prefers-reduced-motion: reduce)').matches){ vizTimer=setInterval(stepViz, 420);} else {stepViz();} } }
+    else { clearInterval(vizTimer); vizTimer=null; }
+  }), {threshold:0.4});
+  vizIO.observe(document.getElementById('s6'));
+
+  // ---- charts (slide 7) ----
+  function barChartA(){
+    const el=document.getElementById('chartA');
+    const data=[{n:'sorted',v:927.8,c:cssv('--amber')},{n:'round-robin',v:388.2,c:cssv('--muted')},{n:'proportional',v:388.3,c:cssv('--teal')}];
+    const w=440,h=230,pad=46,mx=1000;
+    let s=`<svg viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" font-family="${cssv('--mono')}">`;
+    [0,250,500,750,1000].forEach(g=>{const y=h-pad-(g/mx)*(h-pad-20);s+=`<line x1="${pad}" y1="${y}" x2="${w-14}" y2="${y}" stroke="${cssv('--border')}"/><text x="${pad-8}" y="${y+3}" text-anchor="end" font-size="10" fill="${cssv('--muted')}">${g}</text>`;});
+    const bw=78, gap=(w-pad-14-data.length*bw)/(data.length+1);
+    data.forEach((d,i)=>{const x=pad+gap+i*(bw+gap);const bh=(d.v/mx)*(h-pad-20);const y=h-pad-bh;
+      s+=`<rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="3" fill="${d.c}"/>`;
+      s+=`<text x="${x+bw/2}" y="${y-7}" text-anchor="middle" font-size="12.5" font-weight="600" fill="${cssv('--ink')}">${d.v}</text>`;
+      s+=`<text x="${x+bw/2}" y="${h-pad+15}" text-anchor="middle" font-size="10.5" fill="${cssv('--muted')}">${d.n}</text>`;});
+    s+=`<text x="${w-14}" y="14" text-anchor="end" font-size="10" fill="${cssv('--muted')}">µs</text></svg>`;
+    el.innerHTML=s;
+  }
+  function lineChartB(){
+    const el=document.getElementById('chartB');
+    const sk=[1.00,1.11,1.37,1.94,2.87,3.94];
+    const rr=[780.4,902.7,1065.8,1441.3,1997.6,2696.7];
+    const pr=[780.4,871.1,1031.5,1411.5,1968.9,2659.8];
+    const w=440,h=230,pad=48, xmin=1, xmax=4, ymin=600, ymax=2800;
+    const X=v=>pad+((v-xmin)/(xmax-xmin))*(w-pad-16);
+    const Y=v=>h-pad-((v-ymin)/(ymax-ymin))*(h-pad-24);
+    let s=`<svg viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" font-family="${cssv('--mono')}">`;
+    [800,1400,2000,2600].forEach(g=>{const y=Y(g);s+=`<line x1="${pad}" y1="${y}" x2="${w-16}" y2="${y}" stroke="${cssv('--border')}"/><text x="${pad-7}" y="${y+3}" text-anchor="end" font-size="10" fill="${cssv('--muted')}">${g}</text>`;});
+    [1,2,3,4].forEach(g=>{const x=X(g);s+=`<text x="${x}" y="${h-pad+15}" text-anchor="middle" font-size="10" fill="${cssv('--muted')}">${g}×</text>`;});
+    // realistic band
+    s+=`<rect x="${X(1.5)}" y="20" width="${X(3)-X(1.5)}" height="${h-pad-20}" fill="${cssv('--teal')}" opacity="0.07"/>`;
+    s+=`<text x="${(X(1.5)+X(3))/2}" y="34" text-anchor="middle" font-size="9.5" fill="${cssv('--muted')}">realistic EP imbalance</text>`;
+    const path=(arr,col,dash)=>{let p=`<path d="M`;sk.forEach((x,i)=>p+=`${X(x).toFixed(1)},${Y(arr[i]).toFixed(1)} `);p=p.trimEnd()+`" fill="none" stroke="${col}" stroke-width="2.4" ${dash?`stroke-dasharray="5 4"`:''}/>`;arr.forEach((v,i)=>p+=`<circle cx="${X(sk[i]).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="3" fill="${col}"/>`);return p;};
+    s+=path(rr,cssv('--muted'),true);
+    s+=path(pr,cssv('--teal'),false);
+    s+=`<text x="${X(3.94)-4}" y="${Y(2696.7)-9}" text-anchor="end" font-size="10.5" fill="${cssv('--muted')}">round-robin</text>`;
+    s+=`<text x="${X(3.94)-4}" y="${Y(2659.8)+16}" text-anchor="end" font-size="10.5" font-weight="600" fill="${cssv('--teal')}">proportional = LB</text>`;
+    s+=`<text x="${pad}" y="14" font-size="10" fill="${cssv('--muted')}">µs</text>`;
+    s+=`<text x="${w-16}" y="${h-8}" text-anchor="end" font-size="10" fill="${cssv('--muted')}">link load imbalance (max/mean)</text></svg>`;
+    el.innerHTML=s;
+  }
+  function draw(){ barChartA(); lineChartB(); if(document.getElementById('meter')) stepViz(); }
+  draw();
+  addEventListener('resize', ()=>{ /* svg is responsive; nothing needed */ });
+</script>
