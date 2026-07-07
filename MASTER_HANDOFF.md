@@ -1,6 +1,8 @@
 # MASTER HANDOFF — Fused DeepSeek-R1 MoE expert region on AMD MI355X
 
-> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-06.
+> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-07.
+>
+> **⚡ NEW AGENT: read §0.5 (2026-07-07 session) FIRST** — it supersedes the "tiled communication abstraction" framing with a measured finding (traffic-shaping is a weak lever) and a ranked fork of higher-ceiling directions to try instead.
 
 ---
 
@@ -13,6 +15,88 @@
 - **The final kernel lives in** `irisx/fused_moe/` (formerly `b1_dispatch`). **Baselines** in `irisx/baselines/`. **Everything else** is archived in `irisx/development/`.
 - **The authoritative results log is `irisx/EXPERIMENT_LEDGER.md`** — read it for every measured number, every dead end, and the build recipe.
 - **The cluster (Rainier SLURM, MI355X) is in §7.** The login IP **changes** — if it's unreachable, ask the user for the current one.
+
+---
+
+## 0.5 — 2026-07-07 session: the TileComm comm abstraction (explored) + the abstraction fork ★ READ THIS FIRST
+
+**What this session did.** Pivoted from the fused MoE *kernel* to the *abstraction* Awad/Osama asked
+for (the "tile-level communication abstraction"). Designed and prototyped **TileComm** — a kernel
+**declares** tile transfers → the library **schedules** them link-balanced → **executes** on IRIS
+primitives inside a HipKittens kernel. Built a calibrated cost model, a design doc, a talk, and an
+on-node validation probe. Paper working title: *"Tile-Level Communication for Fused Multi-GPU
+Inference."* **Everything lives in `irisx/tilecomm/` and `july-07-presentation/`** (map at the end of
+this section).
+
+### The honest result — comm *scheduling* (traffic-shaping) is a WEAK lever. Do not re-invest in it.
+The seed was the combine kernel's **2.4× win (934→386 µs)** from one hand-rolled schedule
+(`build_combine_pull(..., interleave=True)` round-robining cells across XGMI links). We tried to turn
+that into a general demand-aware scheduler. Two structural reasons it under-delivers:
+1. **On a fully-connected 8-GPU XGMI fabric, a scatter/gather's bytes-per-link are fixed by the demand
+   matrix.** Reordering *when* blocks fire can only avoid the pathological *sorted* order — it can
+   never beat the hottest-link floor. The cost model (`tilesched.py`, calibrated to the real 934/386)
+   shows the schedule is worth **2.4–6× over the naive order but only 1–4% over the good hand-rolled
+   round-robin.** The 1–4% is the actual ceiling, not a tuning gap.
+2. **Decode — the serving-latency-critical path — is weight-memory-bound; comm is only ~18% of it.**
+   So ANY comm-centric abstraction caps decode at ~1.22×. Comm is the wrong target for the path that
+   matters most for serving R1.
+
+### The on-node probe — INCONCLUSIVE, and exactly why (`irisx/tilecomm/xgmi_probe_results.md`)
+Ran `xgmi_probe.py` on the 8× MI350X. Two takeaways:
+- **A real `iris.store` gotcha (worth knowing):** it faults ("write access to read-only page") on a
+  **data-dependent, memory-loaded `to_rank`**. You MUST select the destination through a constexpr
+  `tl.static_range(WORLD)` loop, exactly like `examples/07_gemm_all_scatter`. After that fix it runs.
+- **The probe is issue-bound, so it neither confirms nor refutes the 2.4×.** IRIS stores are
+  fire-and-forget and `iris.do_bench` timed *issue rate*, not link bandwidth (it implied ~4.7 TB/s,
+  >10× the fabric), so all three schedules looked identical (~1.05×). The `examples/01_store` control
+  gave a real **47 GiB/s/link**. **To make the probe a valid 2nd data point:** add a store-completion
+  fence + push enough bytes/link to back-pressure the issue queue + time MAX-over-ranks, then re-run.
+  Until then the combine 2.4× stays a real *region* number whose mechanism (link-spread vs the
+  combine's read/reduction structure) is **not yet isolated**; the cost model is a calibrated design
+  tool, **not** a mechanistically-validated predictor.
+
+### Memory feasibility for DeepSeek-R1 — SETTLED. It fits. Stop worrying about it.
+MI350X = **309 GB HBM each → 2.47 TB across 8** (verified via `rocm-smi`). R1 MXFP4 (403 GB) = **16% of
+HBM**; fp8 (~671 GB) = 27%. The historical wall was DISK (403 GB download), not HBM.
+
+### The strategic fork — what the NEW AGENT should pick from (ranked by R1's real bottlenecks)
+Traffic-shaping is out. The higher-ceiling tile-level abstractions:
+1. **Quant-tile** — a tile that carries its own format + scale (fp4 / fp8 / MX), unpacked in-register
+   at MFMA time. Attacks the **dominant decode weight wall** (the *only* high-ceiling decode lever is
+   fewer weight bytes). Builds directly on the shipped Route-1 MXFP4 work (§10.1). HK currently
+   hard-codes per-format kernels (`fp8fp32`, `mxfp8`), so a unified quant-tile is a genuine HK-paradigm
+   contribution. **Highest R1-serving impact + still novel.**
+2. **Comm/compute OVERLAP** — the *fusion* half of TileComm (NOT the scheduling half): tile-fused
+   all-reduce + GEMM on the **TP4 prefill** path. This is Osama's "fuse inside the GEMM" prize and
+   Simran's "no AMD engine fuses the all-reduce with anything — either fusion has huge production
+   impact." Keeps Awad's comm-abstraction framing, re-pointed to the layer that actually has headroom.
+   Depends on the producer/consumer-warp GEMM body (the open item in §6).
+3. **Sparse-expert / conditional-tile** — skip streaming weights for local experts that received zero
+   tokens at decode. Real at small batch; bounded ceiling.
+4. ~~Comm traffic-shaping / demand-aware scheduling~~ — **weakest, capped by the fabric. Done
+   exploring — don't repeat it.**
+
+### The decision rule (the discipline we skipped — do NOT pick from priors again)
+We picked comm-scheduling from a prior and it was weak. **Get the realistic-config profile FIRST**
+(decode: quantify the weight wall vs the ~18% comm; prefill: quantify the TP4 all-reduce share) under
+**TP4×DP2 + DP-attention + EP**, *then* commit to an abstraction. Predicted shape: decode → attack
+weights (quant-tile / sparse-expert); prefill → fuse the all-reduce. This realistic-config profile is
+the SAME §10 open item — do it once and it decides both the abstraction AND the fp4 baseline.
+
+### Where it lives / how to run
+- `irisx/tilecomm/DESIGN.md` — the abstraction spec + paper framing (declare/schedule/execute, the 4
+  intents, the quadrant vs NCCL/MSCCL/aiter/IRIS/HK, mapping onto `fused_moe`, roadmap, honest limits).
+- `irisx/tilecomm/tilesched.py` — `python3 tilesched.py` — the cost model + 3 schedulers + skew sweep (laptop-ok, numpy).
+- `irisx/tilecomm/xgmi_probe.py` + `xgmi_probe_results.md` — the on-node probe + the honest read (issue-bound).
+- `irisx/tilecomm/README.md` — the directory guide.
+- `july-07-presentation/index.html` + `SCRIPT.md` — the talk (abstraction-first) with prepped Q&A incl. the probe caveat.
+- **Node (NEW, different from §7 Rainier and the older Node A):** `ssh -i ~/.ssh/muhammad-gpu subvadla@10.190.161.47`
+  — host `cv350-rck-g03-f03-18`, 8× MI350X gfx950, **shared** (do NOT disturb other tenants'
+  containers `rkarhila_*`, `pedaniel-*`), **already GPU-ready** (no modprobe/docker-start needed).
+  Container `subha_tilecomm_probe` is left running with `iris` pip-installed from `~/iris_lib` (torch
+  2.9.1+rocm7.2, triton 3.6). DeepSeek models cached in `/data2/huggingface/hub`. See Claude memory
+  `mi350x-node-access` (Node B) + `tilecomm-abstraction`.
+- Commits pushed to `subha/moe-dispatch-v0` (through `5953fec`).
 
 ---
 
