@@ -1,0 +1,267 @@
+\documentclass[pdf,aspectratio=169]{beamer}
+
+\usepackage{amssymb,amsmath,amsthm,enumerate}
+\usepackage[utf8]{inputenc}
+\usepackage{array}
+\usepackage[parfill]{parskip}
+\usepackage{graphicx}
+\usepackage{caption}
+\captionsetup[figure]{labelformat=empty}
+\usepackage{subcaption}
+\usepackage{bm}
+\usepackage{amsfonts,amscd}
+\usepackage[]{units}
+\usepackage{listings}
+\usepackage{multicol}
+\usepackage{tcolorbox}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{tikz}
+
+\newcommand{\empy}[1]{{\color{darkorange}\emph{#1}}}
+\newcommand{\empr}[1]{{\color{cardinalred}\emph{#1}}}
+\newcommand{\examplebox}[2]{%
+\begin{tcolorbox}[colframe=darkcardinal,colback=boxgray,title={#1}]
+#2
+\end{tcolorbox}}
+
+\usetheme{Stanford}
+\input{./style_files_stanford/my_beamer_defs.sty}
+\logo{}
+
+% compact monospace for kernel chains
+\lstset{basicstyle=\ttfamily\scriptsize,breaklines=true,columns=fullflexible,frame=none}
+\newcommand{\mc}[1]{{\ttfamily\small #1}}
+
+\title[HK $\times$ IRIS m3]{HipKittens $\times$ IRIS --- Meeting 3}
+\subtitle{progress update: profiling the two collective ideas, and building QuantTile}
+
+\beamertemplatenavigationsymbolsempty
+
+\begin{document}
+
+\author[Subha]{Subha}
+\institute{8$\times$MI350X (gfx950) \,$\cdot$\, DeepSeek-R1 \,$\cdot$\, HipKittens $+$ IRIS}
+\date{\today}
+
+\begin{noheadline}
+\begin{frame}\maketitle\end{frame}
+\end{noheadline}
+
+% ------------------------------------------------------------------ Slide 2: since last time
+\begin{frame}{Since last time}
+\small
+\begin{itemize}
+  \item Last meeting was the fused MoE region: \empr{1.56$\times$} on prefill (1247 vs 1941\,$\mu$s, correctness-gated). Decode barely moved, and I said that was because decode is weight-bound, not boundary-bound.
+  \item This week I stopped arguing from priors and measured. I got time on the dedicated 8$\times$MI350X node and profiled the two comm-abstraction directions we keep circling back to.
+  \item I also built \empy{QuantTile} and validated it on that same node.
+  \item Where it landed: the decode lever is \empy{fewer weight bytes} (that's QuantTile, working today). The prefill lever is \empy{fusing the all-reduce} (real ceiling, but the substrate to hit it isn't there yet).
+\end{itemize}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 3: profiling result
+\begin{frame}{What I profiled, and what came out}
+\small
+TP4, bf16, MI350X node. Unfused reference = a full-256-CU torch GEMM per rank's K-slice, then a separate RCCL all-reduce (what production does). Median-of-30, MAX over the 4 ranks (the slowest rank gates the collective).
+\begin{center}
+\scriptsize\setlength{\tabcolsep}{5pt}
+\begin{tabular}{l r r r r r}
+\toprule
+GEMM $(M,N,K)$ --- R1 role & GEMM 256CU & RCCL AR & serial GEMM+AR & AR share & overlap ceiling \\
+ & (ms) & (ms) & (ms) & & (serial$/$AR) \\
+\midrule
+\mc{8192,7168,18432} --- down-proj     & 0.565 & 1.148 & 1.641 & \empr{70\%} & \empy{1.43$\times$} \\
+\mc{8192,7168,7168}  --- attn out-proj & 0.252 & 1.147 & 1.357 & \empr{85\%} & \empy{1.18$\times$} \\
+\mc{8192,4608,36864} --- example       & 0.606 & 0.750 & 1.269 & \empr{59\%} & \empy{1.69$\times$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+\examplebox{The all-reduce is the expensive half}{\small
+On prefill the AR is \empr{59--85\%} of the GEMM+AR it sits after, so comm isn't a rounding error next to the matmul. Hide the GEMM under it and the ceiling is \empy{1.4--1.7$\times$}.}
+
+Decode is different: DP-attention means \empr{no TP all-reduce}, so nothing to fuse --- it just streams all 32 experts' weights per step. Decode and prefill need different fixes.
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 4: HK current state
+\begin{frame}{Where HipKittens is today on quantized loads}
+\small
+HK hard-codes a \empr{separate GEMM per quant format} --- \mc{kernels/gemm/fp8fp32} and \mc{kernels/gemm/mxfp8} are two different bodies. And fp8 can't load bytes straight to registers: the fast \mc{buffer\_load} path is a hard \empr{\mc{static\_assert("Unsupported type for load")}}, so HK's fp8 kernels go the long way through LDS.
+\vspace{0.3ex}
+\begin{columns}
+\begin{column}{0.55\textwidth}
+\examplebox{HK's fp8 decode path (staged through LDS)}{\small
+\mc{global $\to$ shared} (\mc{buffer\_load}) \\
+\mc{$\to$ register} (\mc{ds\_read\_b128}) \\
+\mc{$\to$ fp8 MFMA}
+\vspace{0.5ex}\\
+I measured this LDS-staged path at \empr{$\sim$2.6\,TB/s} on the skinny BM=16 decode tile.}
+\end{column}
+\begin{column}{0.45\textwidth}
+\examplebox{The LDS hop is the thing to cut}{\small
+This is HK working as designed, not a bug. But that extra shared-memory hop is exactly what to skip when the tile is tiny and you're memory-bound. That's what \mc{sat} skips (next slide).}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 5: the sat trick
+\begin{frame}{What I built --- the \mc{sat} trick, and why it's faster}
+\small
+Keep the weights \empy{compressed in HBM} (fp8 is half the bf16 bytes, fp4 a quarter), but load them through the \empr{fast bf16 global$\to$register path} instead of staging through LDS. Reinterpret the packed bytes as a half- or quarter-width bf16 tile, pre-swizzled offline into fragment order, unpack in-register, and hand a clean bf16 tile to a normal MFMA.
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{The \mc{sat} path}{\small
+\mc{global $\to$ register}, \\
+bytes read as bf16 ({\ttfamily\scriptsize buffer\_load\_b128}) \\
+\mc{$\to$ in-register unpack:} \\
+\hspace{1.5ex}fp8 --- apply the per-block scale \\
+\hspace{1.5ex}fp4 --- hardware {\ttfamily\scriptsize cvt\_scalef32\_pk\_bf16\_fp4} \\
+\mc{$\to$ bf16 MFMA}}
+\end{column}
+\begin{column}{0.5\textwidth}
+\centering\footnotesize thor-4 (MI355X) anchor node
+\begin{tabular}{l r}
+\toprule
+weight path & throughput \\
+\midrule
+HK fp8 (LDS-staged) & 2.6\,TB/s \\
+\empy{\mc{sat} fp8} (bf16 reg path) & \empr{3.97\,TB/s} \\
+\empy{\mc{sat} fp4} & \empr{$\sim$1.6$\times$ over fp8} \\
+\bottomrule
+\end{tabular}
+\end{column}
+\end{columns}
+\vspace{0.5ex}
+\footnotesize This table is the thor-4 (MI355X) anchor --- a faster box than the MI350X the rest of the deck runs on. I didn't re-verify it this week, but the ratios hold on both nodes. \mc{sat} fp8 also clears a dense bf16 load by \empy{1.46$\times$}; fp4's extra win comes from carrying \empy{half the bytes of fp8}.
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 6: QuantTile
+\begin{frame}{QuantTile --- the primitive, and the validation}
+\small
+The two decode kernels I hand-wrote (\mc{fp8-sat}, \mc{mxfp4-sat}) are about \empy{90\% the same code}. They diverge in three spots: the packed-tile width, the scale layout, and the in-register unpack. That's a copy-paste fork waiting to rot.
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\begin{itemize}
+  \item QuantTile makes the \empr{format a compile-time property of the tile} --- one descriptor carries width, scale layout, and unpack.
+  \item So \empy{one GEMM body} serves both fp8 and mxfp4, instead of the per-format fork HK ships today.
+\end{itemize}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{Validated on the MI350X node, identical inputs}{\small
+\begin{itemize}
+  \item fp8: unified body within \empr{0.07\%} of the original --- \empr{2.874\,TB/s} here, a wash. The abstraction is free.
+  \item mxfp4: keeps \empr{1.63$\times$} over fp8.
+  \item RMS matches the pre-unification kernels to \empy{5 d.p.}
+\end{itemize}}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 7: MXFP4 port
+\begin{frame}{MXFP4: porting the fused region to 4-bit weights}
+\small
+\mc{amd/DeepSeek-R1-MXFP4} is OCP MXFP4 \empr{W4A4} --- fp4 weights \emph{and} activations, group size 32, E8M0 scale per 32-element K-block. Route-1 keeps activations \empy{bf16} (\empy{weight-only fp4}): more accurate, and the right decode choice since decode is weight-bound.
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.46\textwidth}
+\centering\footnotesize fused decode region, 8$\times$MI350, same node, TOTAL\_M$=512$
+\begin{tabular}{l r}
+\toprule
+weights & region ($\mu$s) \\
+\midrule
+bf16  & 881.3 \\
+fp8   & 578.9 \\
+\empy{MXFP4} & \empr{520.6} \\
+\bottomrule
+\end{tabular}
+\vspace{0.6ex}\\
+\footnotesize MXFP4: \empr{1.11$\times$} over fp8, \empy{1.69$\times$} over bf16. Expert GEMM \emph{alone} is 1.16$\times$\,/\,1.96$\times$; the region dilutes it with the shared act-dequant and the gather/act/combine boundaries. FFN \empy{PASS}, RMS 0.018.
+\end{column}
+\begin{column}{0.54\textwidth}
+\examplebox{The GEMM already exists --- the work is the MX wiring}{\small
+Reuses HK's mxfp8 8-wave scaled-MFMA body (\mc{mma\_ABt\_scaled} already reads the MX per-32-block E8M0 scale), wrapped with our expert-grouping and the IRIS gather/combine.}
+\end{column}
+\end{columns}
+\vspace{0.6ex}
+
+{\footnotesize \empy{Honest caveat:} no fp4-vs-SOTA number yet --- aiter's \mc{a4w4} EP path is untuned/buggy for our shape. The trusted baseline is the SGLang R1-MXFP4 e2e run (being set up); fp4's activation-quant win is really a \empr{prefill} effect, weight-only fp4 is the decode variant.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 8: prefill collective
+\begin{frame}{The other lever --- fusing the prefill all-reduce}
+\small
+The prefill idea is to fold the TP4 all-reduce \empy{into} the GEMM: reduce output tiles as they're produced, so the short GEMM hides under the long all-reduce. Slide 3 says the ceiling is real, \empy{1.4--1.7$\times$}. This is the tiles-before-reduce idea --- how many tiles you accumulate before you reduce --- as one knob.
+\vspace{0.5ex}
+\begin{columns}
+\begin{column}{0.5\textwidth}
+\examplebox{Honest status: the substrate isn't ready}{\small
+The IRIS fused-collective examples I actually ran are \empr{4.7$\times$ to 280$\times$ slower} than plain unfused today. They're pedagogical --- a slow Triton GEMM plus a naive in-kernel AR.}
+\end{column}
+\begin{column}{0.5\textwidth}
+\examplebox{What it would take}{\small
+A real HK producer/consumer GEMM body at torch rate whose epilogue emits tile transfers, plus an in-kernel reduce-scatter at RCCL bandwidth. Both are substantial, and it's \empr{prefill-only}. Not done --- this is the harder direction.}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 9: tile_reduce_scatter
+\begin{frame}{The communication abstraction: \mc{tile\_reduce\_scatter}}
+\small
+The combine hand-writes a loop of \mc{iris.store} calls: each destination token locally reduces its up-to-8 rows in \empy{fp32} (weighted, no cross-rank atomics), writes one bf16 row home, over a hand-rolled order of tiles across the 8 links.
+\vspace{0.3ex}
+\begin{columns}
+\begin{column}{0.53\textwidth}
+\examplebox{Declare the transfer, the library lowers it}{\footnotesize
+Declares a \mc{TileTransferSet} (destination map, a CSR grouping of each tile's source rows, the src/weight/dst payload, the IRIS handle) and calls \mc{tile\_reduce\_scatter}. The library (\mc{tilecomm\_device.h}) does the fp32 reduce, the \mc{ctx.store} home (local-write short-circuit), and \empr{owns the store order} --- a bad hand-written schedule can't happen. No hand-written \mc{iris.load/store}.}
+\end{column}
+\begin{column}{0.47\textwidth}
+\examplebox{Why this shape}{\footnotesize
+The \empy{residency-axis} analog of QuantTile (the format axis): declare the intent, the library lowers it. Bulk-synchronous first --- a standalone combine kernel, a low-risk drop-in; the \emph{same} declaration later goes inside the GEMM tile loop for overlap. Store granularity is a knob (2\,/\,4\,/\,16\,B).}
+\end{column}
+\end{columns}
+\vspace{0.4ex}
+
+{\footnotesize \empy{Status:} code written, combine refactored onto it (original body kept for a same-build A/B). \empr{Not yet profiled} --- GPU on the QuantTile-vs-SOTA run; the bar is \empy{zero cost} (June-30 combine 386\,$\mu$s vs MORI's 398\,$\mu$s). \empy{Gap:} fire-and-forget stores need a real completion primitive.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 10: how they fit
+\begin{frame}{How the two fit together}
+\small
+Both are the same trick on the tile: QuantTile touches \empr{format}, the collective touches \empr{residency}. Two lowerings of the same tile.
+\vspace{1ex}
+\begin{center}
+\footnotesize\setlength{\tabcolsep}{8pt}
+\begin{tabular}{l l l}
+\toprule
+the tile carries\ldots & lowers to\ldots & regime \\
+\midrule
+\empy{FORMAT} (QuantTile) & in-register unpack $+$ bf16 MFMA & decode weight wall \\
+\empy{RESIDENCY} (collective) & in-kernel reduce-scatter over IRIS & prefill all-reduce \\
+\bottomrule
+\end{tabular}
+\end{center}
+\vspace{1ex}
+I'm not pretending these get tuned by one knob --- format and residency stay two separate problems. They just share the tile descriptor.
+\vspace{0.8ex}
+
+{\footnotesize \empy{Positioning:} the residency side is a general tile-level RMA collective over IRIS --- reusable for both the MoE gather/combine \emph{and} the TP reduce-scatter/all-reduce --- not a claim to be first at MoE communication (DeepEP and NCCL-EP already exist). The bet is the abstraction, not the transport.}
+\end{frame}
+
+% ------------------------------------------------------------------ Slide 11: open questions
+\begin{frame}{Open questions for the experts}
+\small
+This room knows distributed algorithms better than I do. Seven things I'd like to argue about --- questions I'm bringing, not answers I have:
+\vspace{0.2ex}
+\begin{enumerate}\footnotesize\setlength{\itemsep}{1pt}
+  \item \empy{Completion.} What proves a device-initiated remote store has landed and is visible --- kernel exit, a fence, an atomic release, a readback, an SHMEM-style \emph{quiet}? Ours look fire-and-forget.
+  \item \empy{Which algorithm.} For our TP4 message sizes on 8 fully-connected MI350X, what wins --- direct all-push, ring, recursive-halving/doubling, or whatever RCCL picks?
+  \item \empy{Relay routing.} Under expert skew, can 2-hop relay beat direct point-to-point once you pay injection, relay, and sync --- or is the fabric already saturated?
+  \item \empy{Deadlock.} What makes in-kernel arrival-counter waits provably deadlock-free when not all producer blocks are even resident yet?
+  \item \empy{Scheduling model.} What's the right formal model for finite-wave tile scheduling with issue queues and uneven tile sizes?
+  \item \empy{Batching.} Does ``accumulate $G$ tiles, then reduce'' still hold for IRIS stores over XGMI, or does async completion change the latency term?
+  \item \empy{Novelty.} Next to MSCCL++, SCCL, NCCL-EP, and DeepEP --- which framing would you accept: the API, the schedule ownership, the memory-model safety, or the fused tile execution?
+\end{enumerate}
+\end{frame}
+
+\end{document}

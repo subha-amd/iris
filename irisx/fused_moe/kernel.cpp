@@ -49,6 +49,7 @@
 #include <iris/iris.hpp>
 #include <hip/hip_fp8.h>
 #include "ep8_gather.h"     // VERIFIED multi-source row resolver (Agent 03) — included, not edited.
+#include "../tilecomm/tilecomm_device.h"   // tile-level COMMUNICATION abstraction (tile_reduce_scatter)
 #include <cstdio>
 #include <cstdlib>
 using namespace kittens;
@@ -1664,8 +1665,13 @@ __device__ __forceinline__ float combine_reduce_elem(
     return acc;
 }
 
+// ------------------------------------------------------------------------------------------------
+// ORIGINAL hand-rolled body (kept VERBATIM as the head-to-head reference for the tile_reduce_scatter
+// zero-cost gate). This is the June-30 combine that measured 386 us (< MORI EpCombine 398 us). The
+// author here hand-writes the local reduce + the three ctx.store granularities inline.
+// ------------------------------------------------------------------------------------------------
 __global__ __launch_bounds__(256, 1)
-void combine_pull_kernel(combine_pull_globals g) {
+void combine_pull_orig(combine_pull_globals g) {
     const int c = blockIdx.x;
     if (c >= g.num_cells) return;
 
@@ -1722,9 +1728,41 @@ void combine_pull_kernel(combine_pull_globals g) {
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// REFACTORED body — the SAME combine, but the author declares a tilecomm::TileTransferSet and calls
+// ONE primitive, tilecomm::tile_reduce_scatter(...), instead of hand-writing the local reduce + the
+// three ctx.store granularities + the link-balanced order. The store loop now lives in the reusable
+// library (irisx/tilecomm/tilecomm_device.h). This is the tile-level COMMUNICATION abstraction; the
+// gate is that it is ZERO-COST vs combine_pull_orig above (like QuantTile v0 for the format axis).
+// ------------------------------------------------------------------------------------------------
+__global__ __launch_bounds__(256, 1)
+void combine_pull_kernel(combine_pull_globals g) {
+    // Aggregate/designated init (C++20): iris::iris_device_view has no default ctor, so we copy-init
+    // `.ctx` here rather than default-construct-then-assign (fields in declaration order).
+    tilecomm::TileTransferSet ts{
+        .cell_dst        = reinterpret_cast<const int*>(&g.cell_dst[{0, 0, 0, 0}]),
+        .cell_ptr        = reinterpret_cast<const int*>(&g.cell_ptr[{0, 0, 0, 0}]),
+        .cell_rows       = reinterpret_cast<const int*>(&g.cell_rows[{0, 0, 0, 0}]),
+        .src             = reinterpret_cast<const bf16*>(&g.c2[{0, 0, 0, 0}]),
+        .wgt             = reinterpret_cast<const float*>(&g.wgt[{0, 0, 0, 0}]),
+        .dst             = reinterpret_cast<bf16*>(&g.accb[{0, 0, 0, 0}]),
+        .num_tiles       = g.num_cells,
+        .width           = g.H,
+        .dst_token_limit = g.Tlocal,
+        .ctx             = g.iris_ctx,
+    };
+    // one block == one destination tile; store_gran (1/2/8) picks the remote-store transaction width.
+    tilecomm::tile_reduce_scatter(ts, blockIdx.x, g.store_gran, tilecomm::reduce_op::sum);
+}
+
 void dispatch_combine_pull(combine_pull_globals g) {
     if (g.num_cells <= 0) return;
-    combine_pull_kernel<<<g.grid(), g.block(), 0, g.stream>>>(g);
+    combine_pull_kernel<<<g.grid(), g.block(), 0, g.stream>>>(g);   // refactored (tile_reduce_scatter)
+}
+
+void dispatch_combine_pull_orig(combine_pull_globals g) {
+    if (g.num_cells <= 0) return;
+    combine_pull_orig<<<g.grid(), g.block(), 0, g.stream>>>(g);     // hand-rolled reference (A/B gate)
 }
 
 // ================================================================================================
@@ -1836,6 +1874,21 @@ PYBIND11_MODULE(tk_kernel, m) {
     // LOCAL fc2 output, reduces in fp32 (no atomics), stores ONE bf16 row to the origin rank's accb
     // over IRIS. Halves the XGMI write bytes (combine is write-BW-bound) AND correct for real top-k.
     py::bind_function<dispatch_combine_pull>(m, "combine_pull",
+        &combine_pull_globals::c2,
+        &combine_pull_globals::accb,
+        &combine_pull_globals::wgt,
+        &combine_pull_globals::cell_dst,
+        &combine_pull_globals::cell_ptr,
+        &combine_pull_globals::cell_rows,
+        &combine_pull_globals::iris_ctx,
+        &combine_pull_globals::num_cells,
+        &combine_pull_globals::H,
+        &combine_pull_globals::Tlocal,
+        &combine_pull_globals::store_gran
+    );
+    // COMBINE (PULL) — HAND-ROLLED reference body, identical signature. Kept for the tile_reduce_scatter
+    // zero-cost A/B: example.py selects it with COMBINE_IMPL=orig (default 'tilecomm' calls combine_pull).
+    py::bind_function<dispatch_combine_pull_orig>(m, "combine_pull_orig",
         &combine_pull_globals::c2,
         &combine_pull_globals::accb,
         &combine_pull_globals::wgt,

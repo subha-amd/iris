@@ -462,13 +462,19 @@ def phase_fc2():
     else:
         _gemm_b0(A2_bf16, A2_sc, B_fc2, C2, TASKS_fc2, Mpacked, N_FC2, K_FC2, num_tasks_fc2)
 
+# COMBINE_IMPL selects the PULL-combine body: 'tilecomm' (default) = the refactored kernel that calls
+# the tilecomm::tile_reduce_scatter primitive (the tile-level COMMUNICATION abstraction); 'orig' = the
+# hand-rolled body kept verbatim for the zero-cost A/B gate. Both take the identical signature.
+COMBINE_IMPL = os.environ.get("COMBINE_IMPL", "tilecomm").lower()
+
 def phase_combine():
     # EpCombine: combine the fc2 output back to origin tokens over IRIS, weighted, accumulating top-k.
     out = C2 if FFN == "full" else C
     if COMBINE_MODE == "pull":
         # PULL/gather-reduce: dst cells gather their <=k rows, reduce fp32, ONE bf16 remote store.
-        tk_kernel.combine_pull(out, ACC, WGT, CELL_DST, CELL_PTR, CELL_ROWS, iris_ctx,
-                               NUM_CELLS, H_COMB, Tlocal, COMBINE_GRAN)
+        pull_fn = tk_kernel.combine_pull_orig if COMBINE_IMPL == "orig" else tk_kernel.combine_pull
+        pull_fn(out, ACC, WGT, CELL_DST, CELL_PTR, CELL_ROWS, iris_ctx,
+                NUM_CELLS, H_COMB, Tlocal, COMBINE_GRAN)
     else:
         tk_kernel.combine_scatter(out, ACC, REV, WGT, iris_ctx, Mpacked, H_COMB, Tlocal, COMBINE_ATOMIC)
 
