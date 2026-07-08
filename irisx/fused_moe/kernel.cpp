@@ -205,6 +205,244 @@ void dispatch_gather_pack(gatherpack_globals g) {
 }
 
 // ================================================================================================
+// PHASE 1b — gather_pack over a FLAT ROW MAP instead of the route_segment ABI.  [FAIRNESS BENCH]
+//
+// WHY.  `route_segment` describes a CONTIGUOUS RUN of source rows.  That is only a compact encoding
+// when the router happens to send consecutive source tokens to the same expert — which the synthetic
+// `build_multisource_route` guarantees (monotone per-rank cursors, runs of 1..40) but a REAL top-k
+// router does not: measured over `fused_topk` output (256 experts, top-8) the mean run length is
+// 1.03, so Nseg ~= Mpacked, `tile_is_single_source()` (Path 2) fires for 3 of 200 tiles, and
+// `build_row_seg_map()` degenerates into a 64-iteration SERIAL scan per tile with one active thread
+// per iteration.  That cost is an artefact of the ABI, not of the pull gather.
+//
+// This variant takes the natural production ABI — one (src_rank, src_row) pair per packed row —
+// which is also exactly what an on-device plan builder can emit (a counting sort with atomics has no
+// notion of "runs").  Padding / unrouted rows carry src_rank = -1 and get the fp8 zero sentinel.
+//
+// Identical data movement to `gather_pack_kernel` (uint4 fp8 chunk + one fp32 scale per 128-group,
+// local short-circuit when src_rank == cur_rank).  ONLY the row->source resolution differs:
+//     segments:  LDS row_seg[] built by a serial scan, then a 20-byte global route_segment load/chunk
+//     rowmap:    one int2 LDS load per chunk
+// ================================================================================================
+struct gatherpack_rowmap_globals {
+    gl<bf16,  -1, -1, -1, -1> a_src;    // [Msrc, K/2] fp8-as-bf16 on EACH source rank (IRIS heap)
+    gl<float, -1, -1, -1, -1> sc_src;   // [Msrc, K/128] fp32 scales on each source rank (IRIS heap)
+    gl<bf16,  -1, -1, -1, -1> a_dst;    // [Mpacked, K/2] LOCAL packed fp8-as-bf16 (IRIS heap)
+    gl<float, -1, -1, -1, -1> sc_dst;   // [Mpacked, K/128] LOCAL packed scales (IRIS heap)
+    gl<int,   -1, -1, -1, -1> rowmap;   // [Mpacked, 2] = (src_rank, src_row); (-1,*) = unrouted/padding
+    iris::iris_device_view iris_ctx;
+    int Msrc, Mpacked, K;
+    hipStream_t stream;
+    dim3 grid()  { int nt = (Mpacked + GP_BM - 1) / GP_BM; return dim3(nt > 0 ? nt : 1, GP_SPLIT); }
+    dim3 block() { return dim3(GP_THREADS); }
+};
+
+__global__ __launch_bounds__(GP_THREADS, 1)
+void gather_pack_rowmap_kernel(gatherpack_rowmap_globals g) {
+    __shared__ int rm_rank[GP_BM];
+    __shared__ int rm_row[GP_BM];
+
+    const int m_tile   = blockIdx.x;
+    const int split    = blockIdx.y;
+    const int tid      = threadIdx.x;
+    const int nthreads = GP_THREADS;
+    const int K        = g.K;
+    const int NG       = K / QGROUP;
+    const int cur_rank = g.iris_ctx.cur_rank();
+    iris::iris_device_view ctx = g.iris_ctx;
+
+    const int tile_dst0 = m_tile * GP_BM;
+    if (tile_dst0 >= g.Mpacked) return;
+
+    // one int2 per packed row of this tile, staged in LDS (replaces build_row_seg_map's serial scan)
+    for (int i = tid; i < GP_BM; i += nthreads) {
+        const int r = tile_dst0 + i;
+        if (r < g.Mpacked) { rm_rank[i] = g.rowmap[{0, 0, r, 0}]; rm_row[i] = g.rowmap[{0, 0, r, 1}]; }
+        else               { rm_rank[i] = -1;                     rm_row[i] = -1; }
+    }
+    __syncthreads();
+
+    const fp8_t* a_src_base  = reinterpret_cast<const fp8_t*>(&g.a_src[{0, 0, 0, 0}]);
+    const float* sc_src_base = &g.sc_src[{0, 0, 0, 0}];
+    fp8_t* a_dst_base  = reinterpret_cast<fp8_t*>(&g.a_dst[{0, 0, 0, 0}]);
+    float* sc_dst_base = &g.sc_dst[{0, 0, 0, 0}];
+
+    const int chunks_per_row = K / 16;                 // 16 fp8 bytes (uint4) per thread, as in B1
+    const long total_chunks  = (long)GP_BM * chunks_per_row;
+
+    for (long ci = (long)split * nthreads + tid; ci < total_chunks; ci += (long)GP_SPLIT * nthreads) {
+        const int r  = (int)(ci / chunks_per_row);
+        const int kc = (int)(ci % chunks_per_row) * 16;
+        const int dst_row = tile_dst0 + r;
+        if (dst_row >= g.Mpacked) continue;
+
+        const int src_rank = rm_rank[r];
+        const int src_row  = rm_row[r];
+        const bool valid   = (src_rank >= 0);
+
+        uint4 vbytes;
+        if (valid && src_row < g.Msrc && (kc + 16) <= K) {
+            const uint4* sp = reinterpret_cast<const uint4*>(a_src_base + (size_t)src_row * K + kc);
+            vbytes = (src_rank == cur_rank) ? *sp : ctx.load(sp, src_rank);
+        } else {
+            vbytes = make_uint4(0u, 0u, 0u, 0u);       // ZERO SENTINEL
+        }
+        *reinterpret_cast<uint4*>(a_dst_base + (size_t)dst_row * K + kc) = vbytes;
+
+        const int grp = kc / QGROUP;
+        if (grp < NG) {
+            float scale = 0.0f;
+            if (valid && src_row < g.Msrc) {
+                const float* spc = sc_src_base + (size_t)src_row * NG + grp;
+                scale = (src_rank == cur_rank) ? *spc : ctx.load(spc, src_rank);
+            }
+            sc_dst_base[(size_t)dst_row * NG + grp] = scale;   // idempotent (same value per group)
+        }
+    }
+}
+
+void dispatch_gather_pack_rowmap(gatherpack_rowmap_globals g) {
+    if (g.Mpacked <= 0) return;
+    gather_pack_rowmap_kernel<<<g.grid(), g.block(), 0, g.stream>>>(g);
+}
+
+// ================================================================================================
+// TIER-2 FAIRNESS — build the pull gather's routing plan ON DEVICE, the way MORI's EpDispatch builds
+// its placement on device (atomicAdd slot assignment, `intranode.hpp:145-170`).
+//
+// Today `example.py` hands gather_pack a SEG/TILE plan built on the HOST, off the timed clock. A real
+// router cannot do that: topk_ids only exists on the GPU and changes every token, every layer, every
+// step. This kernel trio closes that gap so the fused path pays what the baseline pays.
+//
+//   plan_count_kernel   : histogram (token,expert) pairs owned by this rank      -> counts[E]
+//   plan_scan_kernel    : 256-padded exclusive prefix over counts (1 block)      -> erb[E], cursor[E]
+//   plan_scatter_kernel : atomicAdd(cursor[e]) slot per pair                     -> rowmap[Mpacked,2]
+//
+// `all_ids` is [world, T, TOPK] GLOBAL expert ids, already all-gathered onto this rank (see
+// plan_allgather_ids_kernel below — the IRIS collective that mirrors the routing metadata MORI's
+// dispatch pushes). Slot order within an expert is atomics-nondeterministic; the pull gather does not
+// care (any permutation of an expert's rows is a valid packing), which is exactly why the ROWMAP ABI
+// and not the run-encoded route_segment ABI is the right target for a device-built plan.
+// ================================================================================================
+#ifndef PLAN_PAD
+#define PLAN_PAD 256          // per-expert packed-region padding (b0_tasks.B0_BM)
+#endif
+
+// All plan tensors are 2-D (the pyutils gl<> maps a torch tensor's last two dims):
+//   all_ids [world*T*TOPK, 1] · counts/cursor [E,1] · erb [E+1,1] · rowmap [Mpacked_max, 2]
+struct plan_globals {
+    gl<int, -1, -1, -1, -1> all_ids;   // [world*T*TOPK, 1] global expert ids (flattened, rank-major)
+    gl<int, -1, -1, -1, -1> counts;    // [E,1] scratch
+    gl<int, -1, -1, -1, -1> cursor;    // [E,1] scratch
+    gl<int, -1, -1, -1, -1> erb;       // [E+1,1] out: expert_row_begin; erb[E] = Mpacked
+    gl<int, -1, -1, -1, -1> rowmap;    // [Mpacked_max, 2] out: (src_rank, src_row); (-1,-1) = padding
+    int world, T, TOPK, E, dst_rank, Mpacked_max;
+    hipStream_t stream;
+    dim3 grid()  { return dim3(1); }
+    dim3 block() { return dim3(256); }
+};
+
+__global__ void plan_reset_kernel(plan_globals g) {
+    const int stride = gridDim.x * blockDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < g.E; i += stride)
+        g.counts[{0, 0, i, 0}] = 0;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < g.Mpacked_max; i += stride) {
+        g.rowmap[{0, 0, i, 0}] = -1;    // padding / unrouted -> zero sentinel in the gather
+        g.rowmap[{0, 0, i, 1}] = -1;
+    }
+}
+
+__global__ void plan_count_kernel(plan_globals g) {
+    const int n = g.world * g.T * g.TOPK;
+    const int lo = g.dst_rank * g.E, hi = lo + g.E;
+    int* counts = &g.counts[{0, 0, 0, 0}];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const int gid = g.all_ids[{0, 0, i, 0}];
+        if (gid >= lo && gid < hi) atomicAdd(counts + (gid - lo), 1);
+    }
+}
+
+// one block: 256-padded exclusive prefix sum. erb[E] = Mpacked. E is clamped to PLAN_MAX_E (the LDS
+// staging array) -- silently truncating instead would corrupt the packed layout.
+#define PLAN_MAX_E 1024
+__global__ void plan_scan_kernel(plan_globals g) {
+    __shared__ int s[PLAN_MAX_E];
+    const int tid = threadIdx.x;
+    if (g.E > PLAN_MAX_E) { if (tid == 0) g.erb[{0, 0, 0, 0}] = -1; return; }   // host must check erb[0] >= 0
+    for (int e = tid; e < g.E; e += blockDim.x) s[e] = g.counts[{0, 0, e, 0}];
+    __syncthreads();
+    if (tid == 0) {
+        int acc = 0;
+        for (int e = 0; e < g.E; ++e) {
+            g.erb[{0, 0, e, 0}] = acc;
+            g.cursor[{0, 0, e, 0}] = acc;
+            acc += ((s[e] + PLAN_PAD - 1) / PLAN_PAD) * PLAN_PAD;   // pad each expert up to PLAN_PAD
+        }
+        g.erb[{0, 0, g.E, 0}] = acc;                                 // = Mpacked
+    }
+}
+
+__global__ void plan_scatter_kernel(plan_globals g) {
+    const int n = g.world * g.T * g.TOPK;
+    const int lo = g.dst_rank * g.E, hi = lo + g.E;
+    const int per_rank = g.T * g.TOPK;
+    int* cursor = &g.cursor[{0, 0, 0, 0}];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const int gid = g.all_ids[{0, 0, i, 0}];
+        if (gid < lo || gid >= hi) continue;
+        const int src_rank = i / per_rank;
+        const int src_row  = (i % per_rank) / g.TOPK;    // token index on that rank
+        const int dst = atomicAdd(cursor + (gid - lo), 1);
+        if (dst < g.Mpacked_max) {
+            g.rowmap[{0, 0, dst, 0}] = src_rank;
+            g.rowmap[{0, 0, dst, 1}] = src_row;
+        }
+    }
+}
+
+void dispatch_build_plan(plan_globals g) {
+    const int n = g.world * g.T * g.TOPK;
+    if (n <= 0 || g.E <= 0 || g.Mpacked_max <= 0) return;   // a 0-block grid is hipErrorInvalidConfiguration
+    const int reset_n = (n > g.Mpacked_max) ? n : g.Mpacked_max;
+    const int blocks = (reset_n + 255) / 256;
+    const int nblk = (n + 255) / 256;
+    plan_reset_kernel<<<blocks, 256, 0, g.stream>>>(g);
+    plan_count_kernel<<<nblk, 256, 0, g.stream>>>(g);
+    plan_scan_kernel<<<1, PLAN_MAX_E, 0, g.stream>>>(g);
+    plan_scatter_kernel<<<nblk, 256, 0, g.stream>>>(g);
+}
+
+// IRIS all-gather of this rank's topk_ids into every rank's `all_ids` — the device-side routing
+// metadata exchange that MORI's dispatch folds into its own kernel. One int per lane.
+struct plan_ag_globals {
+    gl<int, -1, -1, -1, -1> my_ids;    // [T*TOPK, 1]  this rank's topk_ids (IRIS heap, symmetric)
+    gl<int, -1, -1, -1, -1> all_ids;   // [world*T*TOPK, 1] out (local)
+    iris::iris_device_view iris_ctx;
+    int world, n_per_rank;
+    hipStream_t stream;
+    dim3 grid()  { return dim3((n_per_rank + 255) / 256); }
+    dim3 block() { return dim3(256); }
+};
+
+__global__ void plan_allgather_ids_kernel(plan_ag_globals g) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= g.n_per_rank) return;
+    const int cur = g.iris_ctx.cur_rank();
+    iris::iris_device_view ctx = g.iris_ctx;
+    const int* src = &g.my_ids[{0, 0, 0, 0}];
+    int* dst = &g.all_ids[{0, 0, 0, 0}];
+    // runtime peer id is fine for the C++ ctx.load (gather_pack_kernel already relies on it); the
+    // constexpr-peer restriction in tilecomm/xgmi_probe_results.md is a Triton iris.store issue.
+    for (int r = 0; r < g.world; ++r)
+        dst[r * g.n_per_rank + i] = (r == cur) ? src[i] : ctx.load(src + i, r);
+}
+
+void dispatch_plan_allgather_ids(plan_ag_globals g) {
+    if (g.n_per_rank <= 0 || g.world <= 0) return;          // a 0-block grid is hipErrorInvalidConfiguration
+    plan_allgather_ids_kernel<<<g.grid(), g.block(), 0, g.stream>>>(g);
+}
+
+// ================================================================================================
 // PHASE 2 — grouped 32-expert GEMM over the LOCAL packed buffer.
 //
 // EVERYTHING from here to the pybind block is COPIED VERBATIM FROM irisx/v5_grouped/kernel.cpp
@@ -1782,6 +2020,43 @@ PYBIND11_MODULE(tk_kernel, m) {
         &gatherpack_globals::K,
         &gatherpack_globals::Nseg,
         &gatherpack_globals::Ntile
+    );
+    // PHASE 1b [FAIRNESS BENCH]: same gather, flat (src_rank, src_row)-per-packed-row ABI instead of
+    // route_segment runs. Under REAL top-k routing runs collapse to length 1, so the segment encoding
+    // buys nothing and costs a serial per-tile scan. This is also what an on-device plan can emit.
+    py::bind_function<dispatch_gather_pack_rowmap>(m, "dispatch_gather_pack_rowmap",
+        &gatherpack_rowmap_globals::a_src,
+        &gatherpack_rowmap_globals::sc_src,
+        &gatherpack_rowmap_globals::a_dst,
+        &gatherpack_rowmap_globals::sc_dst,
+        &gatherpack_rowmap_globals::rowmap,
+        &gatherpack_rowmap_globals::iris_ctx,
+        &gatherpack_rowmap_globals::Msrc,
+        &gatherpack_rowmap_globals::Mpacked,
+        &gatherpack_rowmap_globals::K
+    );
+    // TIER-2 FAIRNESS: build the pull gather's routing plan ON DEVICE (count -> 256-padded scan ->
+    // atomic scatter), mirroring MORI's on-device placement. Emits erb[E+1] + rowmap[Mpacked,2].
+    py::bind_function<dispatch_build_plan>(m, "build_plan",
+        &plan_globals::all_ids,
+        &plan_globals::counts,
+        &plan_globals::cursor,
+        &plan_globals::erb,
+        &plan_globals::rowmap,
+        &plan_globals::world,
+        &plan_globals::T,
+        &plan_globals::TOPK,
+        &plan_globals::E,
+        &plan_globals::dst_rank,
+        &plan_globals::Mpacked_max
+    );
+    // TIER-2 FAIRNESS: IRIS all-gather of topk_ids (the routing metadata MORI's dispatch pushes).
+    py::bind_function<dispatch_plan_allgather_ids>(m, "plan_allgather_ids",
+        &plan_ag_globals::my_ids,
+        &plan_ag_globals::all_ids,
+        &plan_ag_globals::iris_ctx,
+        &plan_ag_globals::world,
+        &plan_ag_globals::n_per_rank
     );
     // PHASE 2: local grouped 32-expert GEMM (serial baseline path) over the packed buffer.
     py::bind_function<dispatch_grouped_gemm>(m, "grouped_gemm",

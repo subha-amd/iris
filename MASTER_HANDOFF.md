@@ -1,24 +1,122 @@
 # MASTER HANDOFF — Fused DeepSeek-R1 MoE expert region on AMD MI355X
 
-> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-07.
+> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-08.
 >
-> **⚡ NEW AGENT: read §0.5 (2026-07-07 session) FIRST** — it supersedes the "tiled communication abstraction" framing with a measured finding (traffic-shaping is a weak lever) and a ranked fork of higher-ceiling directions to try instead.
+> **🛑 NEW AGENT: read §0.4 (2026-07-08 FAIRNESS AUDIT) FIRST.** The headline `1.56×` and the
+> `combine 386 vs 398 µs` numbers in §0/§3/§4 are **under audit and must not be quoted**. One kernel
+> (`combine_pull`) is **outright incorrect** under real EP routing — confirmed on device.
+>
+> Then read §0.5 (2026-07-07) — it supersedes the "tiled communication abstraction" framing with a
+> measured finding (traffic-shaping is a weak lever) and a ranked fork of higher-ceiling directions.
 
 ---
 
 ## 0. TL;DR (the 60-second version)
 
 - **Goal:** take the production DeepSeek-R1 MoE expert region and make it faster by **fusing it** with **HipKittens** (on-GPU tile compute) + **IRIS** (cross-GPU XGMI comm), beating the unfused **MORI-dispatch → aiter-fmoe → MORI-combine** baseline. Thesis: *"aiter fuses the expert math; we fuse the expert region."*
-- **Current result (8 full MI355X, same-node, correctness-gated):**
-  - **PREFILL: 1.56× faster** (fused 1247 µs vs unfused 1941 µs) — the headline, solid. Our pull-combine even **beats AMD's own MORI EpCombine** (386 vs 398 µs).
-  - **DECODE: ~2–3% faster** (516.5 vs 527 µs) at **matched fp8 precision** — marginal, honest. Decode is a **weight-memory wall** (see §5) that caps fusion there.
+- 🛑 **The results below are UNDER AUDIT (§0.4, 2026-07-08). Do not quote them.** They were measured with
+  **one rank executing** (`example.py:644`), pre-quantized activations, a host-built routing plan, and a
+  synthetic route that gives **zero** BM=256 padding where real routing gives 35.4%. The combine number is
+  **void**: `combine_pull` drops cross-rank contributions (confirmed on device, expected 36 got 8).
+- **Result as previously reported (8 full MI355X, correctness-gated *against the synthetic route*):**
+  - **PREFILL: 1.56× faster** (fused 1247 µs vs unfused 1941 µs) — ⚠️ see §0.4 breaks 1–5. ~~Our pull-combine even **beats AMD's own MORI EpCombine** (386 vs 398 µs).~~ **← retracted, §0.4.**
+  - **DECODE: ~2–3% faster** (516.5 vs 527 µs) at **matched fp8 precision** — marginal, honest. Decode is a **weight-memory wall** (see §5) that caps fusion there. ⚠️ same concurrency/quant/plan caveats.
+  - ⚠️ Both denominators are from **thor-4 on Rainier**, not the MI350 node — and `b3` has never completed on the MI350 node. §11 warns the cluster varies ~1.8×.
 - **The final kernel lives in** `irisx/fused_moe/` (formerly `b1_dispatch`). **Baselines** in `irisx/baselines/`. **Everything else** is archived in `irisx/development/`.
 - **The authoritative results log is `irisx/EXPERIMENT_LEDGER.md`** — read it for every measured number, every dead end, and the build recipe.
 - **The cluster (Rainier SLURM, MI355X) is in §7.** The login IP **changes** — if it's unreachable, ask the user for the current one.
 
 ---
 
-## 0.5 — 2026-07-07 session: the TileComm comm abstraction (explored) + the abstraction fork ★ READ THIS FIRST
+## 0.4 — 2026-07-08 FAIRNESS AUDIT 🛑 the headline numbers do not survive contact ★ READ THIS FIRST
+
+**Full writeup: `irisx/fused_moe/fairbench/FAIRNESS_AUDIT.md`.** User-initiated after noticing that
+`gather_pack` and MORI's `EpDispatch` "start at different points". They do — and that turned out to be
+the *smallest* of six problems. Nothing below is a guess; each is a source line or an on-device result.
+
+### ✅ CONFIRMED ON DEVICE — `combine_pull` is WRONG under real EP routing (correctness, not fairness)
+`combine_pull_kernel` → `tilecomm::tile_reduce_scatter` reduces a destination cell's **local** rows in
+fp32 and then does a **plain `ctx.store`** (`irisx/tilecomm/tilecomm_device.h:123/135/151`; the header
+says it: *"No atomics — a private accumulator per (tile, element)"*). That is correct only if every
+contribution to a token lives on ONE producer rank.
+
+Real top-8 routing over 256 experts / 32 per rank: **100% of tokens** have their experts on ≥2 ranks
+(mean **5.33**, `real_route.combine_fanout`). So ≥2 ranks each store a partial sum to the same
+`accb[token]` — last writer wins.
+
+`fairbench/probe_combine_fanout.py` (8 ranks, no aiter/MORI): 8 ranks each contribute value `r+1` to one
+cell. **Expected 36, got 8.** fanout=1 passes; fanout=8 drops 7 of 8 contributions.
+
+⇒ **The "our pull-combine beats AMD's own MORI EpCombine (386 vs 398 µs)" claim is void.** MORI's
+`EpCombineIntraNodeKernel` pulls-and-accumulates from every peer (`intranode.hpp:674-698`, `WarpAccum`).
+The cross-rank-correct kernel we already have is `combine_scatter` (`ctx.fetch_add`) at **788 µs** — which
+*loses* to MORI's 398 µs.
+
+### Source-verified fairness breaks in the 1.56× prefill number
+1. **`example.py:643-649` runs the region on `rank == CONSUMER` ONLY.** Ranks 0–6 idle at a barrier. The
+   gather pulls from seven *idle* peers: no all-to-all contention, no straggler. `b3` runs the real 8-way
+   collective and reduces with MAX over ranks. → new `ALL_RANKS=1` env in `example.py` fixes this.
+2. **The fused path never quantizes.** `A_src` is fp8 + scales, produced on the host off the clock
+   (`example.py:352-355`). `b3` dispatches bf16 and pays `dynamic_quant` inside `fused_moe`
+   (`aiter_ref/fused_moe.py:1766-1773`). Free fp8 also halves the fused side's XGMI bytes.
+3. **The routing plan (`SEG`/`TILE`) is host-built, off the clock.** MORI builds placement on device every
+   dispatch (`intranode.hpp:145-170`, atomicAdd slot alloc). MORI *does* expose a cached/replay path
+   (`dispatch(..., routing=...)`) — the honest tier-1 analog. Tier-2 needs an on-device plan builder
+   (now written: `plan_count/scan/scatter` + `plan_allgather_ids` in `kernel.cpp`).
+4. **The synthetic route flatters the gather.** `build_multisource_route` walks monotone per-rank cursors:
+   | | synthetic | **real top-8** |
+   |---|---|---|
+   | mean `route_segment` run | ~20.5 | **1.03** (so `tile_is_single_source` Path-2 is dead code) |
+   | source-token reuse (`dup`) | **1.000** (⇒ top-1!) | **1.506** (a pull re-reads; a push dedups) |
+   | BM=256 padding | **0.0%** | **35.4%** |
+
+   The padding one is lethal for prefill: `ROUTE=uniform` + `TOTAL_M=8192` + `E=32` puts **exactly 256
+   rows in every expert** — one perfect tile, zero waste. Real routing gives `rows_per_expert ~ Bin(8192,
+   1/32)` (mean 258, σ≈15.8), so most experts pad to 512 and `Mpacked` goes **8192 → 12800**. The prefill
+   GEMM (`build_b0_tasks`, `ceil(m_e/256)`) then does **1.56× more MFMA** — the same size as the claimed
+   win. (Decode is immune: `build_b0_tasks_decode` tiles at BM=16.)
+5. **The two sides don't produce the same artifact.** `moe_sorting` emits **index arrays only**; the
+   unfused fmoe GEMM applies the permutation for free in its A-load. `gather_pack` materializes
+   `Mpacked × 7168` fp8 bytes. "3 kernels fused into 1" is not a kernel-for-kernel identity — the only
+   defensible boundary is "router → fc1 MFMA". *(MORI already ships a fused dispatch+sort emitting an
+   expert-major buffer: `dispatch_standard_moe` → `packedRecvX`. Not compiled in our container.)*
+
+### Two bugs that INFLATE the b3 baseline (they cut the other way)
+- `b3:111` `max_num_inp_token_per_rank=max(8192, 4*T)` → `MaxNumTokensToRecv()=65536`, and aiter's
+  `moe_sorting` takes its **static** token count from `topk_ids.size(0)`, which picks the kernel
+  (`moe_sorting_is_oneshot`), sizes the `[E × pad32(65536)]` mesh workspace and the grid/LDS
+  (`moe_sorting_opus.h:1382, :1132-1138, :536-541`). → new `MAX_INP=real` env.
+- MORI's `totalRecvTokenNum` **accumulates across dispatches**: `atomicAdd` every call
+  (`intranode.hpp:236`), `hipMemset` once at construction (`dispatch_combine.cpp:328`), `LaunchReset` is
+  an **empty stub** (`:460`), and `dispatch()` never resets. b3 hands the growing `drn` view straight to
+  `fused_moe(num_local_tokens=drn_)` each iteration. → new `FIX_DRN=1` env. *(source-verified; confirm
+  with `fairbench/probe_drn.py` before quoting)*
+
+### Also: the canonical baseline is from a DIFFERENT MACHINE
+`b3` has **never completed on this node** (`~/b3_sweep.log` stops at the RCCL banner; `~/b3_t64_retry.log`
+dies with `HIP failure: 'invalid argument'`). The canonical `1941 / 533 µs` came from **thor-4 on
+Rainier**. §11 of this file warns the cluster varies ~1.8× node-to-node. A same-node baseline is required.
+
+### Where the audit lives / how to run it
+- `irisx/fused_moe/fairbench/FAIRNESS_AUDIT.md` — the full writeup, with every source line.
+- `fairbench/real_route.py` — real top-8 plan builder + the distortion stats above (`python3 real_route.py`).
+- `fairbench/probe_combine_fanout.py` — the 8-rank combine correctness demo (**run this first**).
+- `fairbench/bench_dispatch_prefix.py` — the fair `gather_pack` vs `EpDispatch+quant+moe_sorting` race,
+  same inputs, all 8 ranks, MAX over ranks, correctness-gated, two routing tiers.
+- `fairbench/probe_drn.py` — confirms the `totalRecvTokenNum` accumulation.
+- New kernels in `kernel.cpp`: `gather_pack_rowmap` (flat `(src_rank,src_row)` ABI — the run-encoded
+  `route_segment` buys nothing at mean run 1.03) and the on-device plan builder.
+- **Build trap:** the `distributed-kernels/build/` cmake cache had `DK_BUILD=b1_tilecomm`, so
+  `do_build.sh` returned rc=0 and compiled **nothing**. Always run `cfg_build.sh` first, then check the
+  `.so` mtime.
+
+### Status
+Region/stage **timings are NOT yet collected** — `bench_dispatch_prefix.py` is blocked on a MORI
+`shmem_init_attr` deadlock under `mpirun` (under investigation). Everything above stands without them.
+
+---
+
+## 0.5 — 2026-07-07 session: the TileComm comm abstraction (explored) + the abstraction fork
 
 **What this session did.** Pivoted from the fused MoE *kernel* to the *abstraction* Awad/Osama asked
 for (the "tile-level communication abstraction"). Designed and prototyped **TileComm** — a kernel
@@ -164,7 +262,7 @@ All in `irisx/fused_moe/kernel.cpp`. The shipped path is `FFN=full COMBINE=1` (p
 | fc1/fc2 | `grouped_b0_gemm` [HK] | the expert matmul: **8-wave, 256×256×64, double-buffered shared→reg ping-pong, `mma_ABt` (16×16×32 MFMA), fp32 accum.** **One block per per-expert tile**, flat task list → all 32 local experts in one launch. Prefill is **bf16-precision** (RMS 0.018). | `num_tasks`, 512 thr (2×4 warps) |
 | activation | `silu_quant_kernel` / `_mtile` [HK] | reads fc1 out (gate‖up), computes SiLU(gate)·up, **requant to fp8** (per-128 amax/448) for fc2. The 127→38.6 µs win was local-amax (16-way vs 128-way `atomicMax`). **Not a matmul.** | `Mpacked` (decode: real m-tiles), 256 thr |
 | decode GEMM | `grouped_b0_gemm_decode` / `_fp8_sat` [HK] | **a *different* GEMM for decode: skinny BM=16 tile** (vs prefill's 256) so small experts don't grind padding; **fp8-weight-streamed** — store weights fp8 (½ the HBM bytes), load via the *fast bf16 path* + offline pre-swizzle + in-register unpack → **bf16 MFMA** (math is bf16, memory is fp8; see §5.6). 3.97 TB/s standalone. A true native-fp8 MFMA path exists behind `DECODE_SAT=0` but coarsens scales (RMS 0.073). Critical: a `s_waitcnt lgkmcnt(0)` + `sched_barrier(0)` before the mma (compiler was hoisting the mma above the data wait). | `num_tasks`, 512 thr |
-| combine | `combine_pull_kernel` [IRIS] | the **reverse** of gather: each *destination token* gathers its ≤8 fc2 rows from local memory, **sums in fp32 locally (no atomics)**, writes **one bf16** row home via `ctx.store`. Beats MORI by **round-robining cells across dst-ranks** (spreads XGMI links: 934→386 µs). The rejected scatter version (`combine_scatter_kernel`) used IRIS `ctx.fetch_add` and was 788 µs (XGMI write-bandwidth bound, 234 MB). | `num_cells`, 256 thr |
+| combine | `combine_pull_kernel` [IRIS] 🛑 **INCORRECT under real EP routing — see §0.4** | each *destination cell* reduces the ≤8 fc2 rows **that are on THIS rank** in fp32, then **plain-stores** one bf16 row via `ctx.store` (no atomics). ⚠️ **A token's experts live on ~5.33 different ranks under real top-8 routing (100% of tokens have fanout>1), so every other rank's partial sum is overwritten and lost.** Only correct at fanout=1, which is all the synthetic route and the single-rank timing loop ever produce. The round-robin dst-rank interleave (934→386 µs) is real, but the kernel is doing less work than MORI's. The "rejected" `combine_scatter_kernel` (IRIS `ctx.fetch_add`, 788 µs) is the **cross-rank-correct** one. | `num_cells`, 256 thr |
 
 **Per-stage time** (decode, thor-4, the fair gate ≈516 µs): gather 41.5 · fc1 274 · act 7.2 · fc2 150 · combine 47 → **fc1+fc2 = 82% (the weight wall)**.
 
@@ -176,7 +274,7 @@ All in `irisx/fused_moe/kernel.cpp`. The shipped path is `FFN=full COMBINE=1` (p
 |---|---|---|---|
 | **prefill** (TOTAL_M=8192) | **1247 µs** (RMS 0.018) | 1941 µs | **1.56× WIN** ✅ |
 | **decode** (TOTAL_M=512, warm) | **516.5 µs** (RMS 0.057) | 527 µs (533 canonical) | ~2–3% win |
-| combine | 386 µs (pull) | 398 µs (MORI) | we win |
+| combine | ~~386 µs (pull)~~ **VOID — drops cross-rank sums (§0.4)** | 398 µs (MORI) | ~~we win~~ the correct variant (`combine_scatter`, fetch_add) is **788 µs** → **we lose** |
 | decode GEMM (standalone) | 3.97 TB/s, 1.46× over bf16, RMS 0.0037 | aiter parity (171.0 vs 171.6 TFLOP/s) | parity |
 
 Latest commits on origin: `0d0abf7` (decode round-1) ← `de876b5` (task-driven silu_quant) ← `aaa678b2` (sat integration) ← `53a454f` (fair gate) ← `78a8a185` (decode fp8 GEMM). **All measured numbers + dead ends are in `irisx/EXPERIMENT_LEDGER.md`.**

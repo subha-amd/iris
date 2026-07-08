@@ -57,6 +57,21 @@ ITERS   = int(os.environ.get("ITERS", "50"))
 WARMUP  = int(os.environ.get("WARMUP", "10"))
 SEED    = int(os.environ.get("SEED", "1234"))
 CONSUMER= int(os.environ.get("CONSUMER", "7"))     # the rank that packs + computes (any rank)
+# ALL_RANKS=1 : EVERY rank runs the whole region every iteration, and the reported time is the MAX
+#   over the 8 ranks -- the same denominator baselines/b3_ep8_unfused.py uses.
+#   DEFAULT (0) reproduces the historical behaviour: ONLY rank==CONSUMER executes while the other 7
+#   ranks idle at a barrier, so the gather pulls from seven IDLE peers with no all-to-all contention
+#   and no straggler. That is NOT comparable to b3 (which runs the real 8-way collective). Every
+#   number in the june-30 deck was taken with ALL_RANKS=0. See fairbench/FAIRNESS_AUDIT.md §1.1.
+ALL_RANKS = int(os.environ.get("ALL_RANKS", "0"))
+# ⚠️ ALL_RANKS + COMBINE: every rank builds the SAME synthetic route (same SEED), so all 8 ranks
+#   ctx.store IDENTICAL reduced rows into the same accb cells. The stores are idempotent, so the
+#   COMBINE gate still passes -- but it proves nothing about cross-rank accumulation, which
+#   combine_pull cannot do (it stores, it does not fetch_add; tilecomm_device.h:123/135/151).
+#   Under a REAL top-8 route 100% of tokens have contributions on >=2 producer ranks (mean 5.33), and
+#   all but one partial sum would be silently dropped. See fairbench/FAIRNESS_AUDIT.md §1.6.
+#   Use ALL_RANKS to measure gather/fc1/act/fc2 under real 8-way XGMI contention; do NOT read the
+#   ALL_RANKS combine number as a validated EpCombine replacement.
 CSV     = os.environ.get("CSV", "results.csv")
 QGROUP  = 128
 assert K % QGROUP == 0
@@ -141,6 +156,7 @@ rank = iris.rank()
 world = iris.world_size()
 assert world == 8, f"B1-dispatch V0 expects np=8 (EP8), got world={world}"
 torch.cuda.set_device(rank)
+ACTIVE = ALL_RANKS or (rank == CONSUMER)     # does THIS rank execute the region?
 
 # ---- host: build the 32-expert MULTI-SOURCE routing (deterministic across ranks) -------------
 # rows_per_expert + the BM-padded expert-major packed layout (v5_grouped), THEN per-packed-row
@@ -364,7 +380,9 @@ Bfull = (torch.randn(E * N, K, dtype=torch.bfloat16, device='cuda') / 8.0)
 B.copy_(Bfull)
 
 # FFN=full weights: W13 (fc1 g1u1) and W2 (fc2 down), same /8 scale as B (bf16; only A is fp8).
-if FFN == "full" and rank == CONSUMER:
+# Under ALL_RANKS every rank runs the GEMMs, so every rank needs its weights filled (the seeds are
+# fixed, so all ranks hold identical weights -- as in EP, where each rank owns its own 32 experts).
+if FFN == "full" and ACTIVE:
     torch.manual_seed(778); B_fc1.copy_(torch.randn(E * N_FC1, K_FC1, dtype=torch.bfloat16, device='cuda') / 8.0)
     torch.manual_seed(779); B_fc2.copy_(torch.randn(E * N_FC2, K_FC2, dtype=torch.bfloat16, device='cuda') / 8.0)
     if DECODE_FP8:
@@ -376,7 +394,7 @@ if FFN == "full" and rank == CONSUMER:
         _p1, _e1, _d1 = _quant_b_mxfp4(B_fc1, N_FC1); B_fc1_mxfp4.copy_(_p1); sBe_fc1.copy_(_e1); B_fc1.copy_(_d1)
         _p2, _e2, _d2 = _quant_b_mxfp4(B_fc2, N_FC2); B_fc2_mxfp4.copy_(_p2); sBe_fc2.copy_(_e2); B_fc2.copy_(_d2)
 
-if rank == CONSUMER:
+if ACTIVE:
     SEG.copy_(torch.from_numpy(seg_arr).cuda())
     TILE.copy_(torch.from_numpy(tile_arr).cuda())
     A_pk_fp8.view(torch.uint8).zero_()    # padding/unrouted packed rows MUST start (and stay) zero
@@ -530,7 +548,7 @@ def build_ffn_reference(A_deq_np):
 def run_both():
     if COMBINE:                                 # every origin rank clears its own scatter target
         ACC.zero_(); torch.cuda.synchronize(); iris.barrier()
-    if rank == CONSUMER:
+    if ACTIVE:
         A_pk_fp8.view(torch.uint8).zero_(); A_pk_sc.zero_()
         if FFN == "full":
             C1.zero_(); C2.zero_()
@@ -641,12 +659,12 @@ def _region_once():
 
 def timed():
     for _ in range(WARMUP):
-        if rank == CONSUMER:
+        if ACTIVE:
             _region_once()
     torch.cuda.synchronize(); iris.barrier()
     acc = dict(gather=0.0, fc1=0.0, act=0.0, fc2=0.0, comb=0.0, total=0.0)
     for _ in range(ITERS):
-        if rank == CONSUMER:
+        if ACTIVE:
             _region_once()
             torch.cuda.synchronize()
             acc["gather"] += EV["start"].elapsed_time(EV["gather"])    # ms
@@ -663,8 +681,18 @@ def timed():
         else:
             torch.cuda.synchronize()
         iris.barrier()
+    if not ALL_RANKS:
+        return {k: v / ITERS * 1e3 for k, v in acc.items()} if rank == CONSUMER else None
+    # ALL_RANKS: reduce with MAX over the 8 ranks -- the production denominator (the step waits for the
+    # slowest rank), matching b3_ep8_unfused.py's `mx = lambda j: max(r[j] for r in rows)`.
+    mine = {k: v / ITERS * 1e3 for k, v in acc.items()}                # us, this rank
+    keys = ("gather", "fc1", "act", "fc2", "comb", "total")
+    mx = comm.allreduce(np.array([mine[k] for k in keys], dtype=np.float64), op=MPI.MAX)
+    av = comm.allreduce(np.array([mine[k] for k in keys], dtype=np.float64), op=MPI.SUM) / world
     if rank == CONSUMER:
-        return {k: v / ITERS * 1e3 for k, v in acc.items()}           # us
+        print(f"  [ALL_RANKS] per-stage mean-over-ranks us: "
+              + " ".join(f"{k}={av[i]:.1f}" for i, k in enumerate(keys)), flush=True)
+        return {k: float(mx[i]) for i, k in enumerate(keys)}
     return None
 
 res = timed()

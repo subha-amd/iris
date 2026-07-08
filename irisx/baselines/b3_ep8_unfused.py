@@ -49,6 +49,21 @@ QUANT = os.environ.get("QUANT", "per_1x128")          # C4/ATOM production = per
 DISPATCH = os.environ.get("DISPATCH", "bf16")
 NWARM = int(os.environ.get("NWARM", "10"))
 NITER = int(os.environ.get("NITER", "50"))
+# ---- fairness fixes (default 0 = the historical behaviour that produced the canonical numbers) ----
+# MAX_INP=real : size MORI's recv buffer to the ACTUAL per-rank token count instead of
+#   max(8192, 4*T). The old value makes MaxNumTokensToRecv()=8*8192=65536, and aiter's moe_sorting
+#   takes its STATIC token count from topk_ids.size(0)=65536 -- which selects the kernel
+#   (moe_sorting_is_oneshot), sizes the [num_experts x pad32(65536)] mesh workspace, and sets the LDS
+#   footprint + grid (moe_sorting_opus.h:1382, :1132-1138, :536-541). A real serving stack passes the
+#   actual max batch. See irisx/fused_moe/fairbench/FAIRNESS_AUDIT.md §2.1.
+MAX_INP = os.environ.get("MAX_INP", "b3")            # b3 | real
+# FIX_DRN=1 : MORI's dispatch kernel does atomicAdd(totalRecvTokenNum, ...) on every call
+#   (intranode.hpp:236); the counter is hipMemset to 0 exactly ONCE at handle construction
+#   (dispatch_combine.cpp:328-329), LaunchReset is an EMPTY STUB (dispatch_combine.cpp:460), and
+#   dispatch() never resets. So the `drn` view this loop hands to fused_moe as `num_local_tokens`
+#   GROWS every iteration. With FIX_DRN=1 we snapshot the true value once and pass a constant tensor.
+#   See FAIRNESS_AUDIT.md §2.2 (verify with fairbench/probe_drn.py before trusting either number).
+FIX_DRN = int(os.environ.get("FIX_DRN", "0"))
 
 def qtype():
     return {"per_1x128":   aiter.QuantType.per_1x128,
@@ -108,7 +123,8 @@ def worker(rankID, tokens_per_rank):
         data_type=disp_inp.dtype, rank=rankID, world_size=WORLD, hidden_dim=HID,
         scale_dim=scdim, scale_type_size=scsz,
         max_token_type_size=dtypes.bf16.itemsize,
-        max_num_inp_token_per_rank=max(8192, tokens_per_rank * 4),
+        max_num_inp_token_per_rank=(tokens_per_rank if MAX_INP == "real"
+                                    else max(8192, tokens_per_rank * 4)),
         num_experts_per_rank=Eloc, num_experts_per_token=TOPK,
         kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode)  # single-node, matches C4
     op = mori.ops.EpDispatchCombineOp(cfg)
@@ -132,20 +148,23 @@ def worker(rankID, tokens_per_rank):
     # keep all ranks in lockstep. dist.barrier() bookends a clean window.
     import statistics
     dist = torch.distributed
+
+    do, dw, ds, di, drn = do_dispatch()          # FIRST dispatch: drn is the true recv count here
+    recv = int(drn.item()) if hasattr(drn, "item") else int(drn)
+    # snapshot BEFORE any further dispatch pollutes the accumulating counter (see FIX_DRN above)
+    drn_fixed = torch.tensor([recv], dtype=dtypes.i32, device=dev)
+
     def timed_iter():
         e = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         e[0].record()
         do_, dw_, ds_, di_, drn_ = op.dispatch(disp_inp, topk_weights, disp_scale_in, topk_ids)
         e[1].record()
-        out_ = do_fmoe(do_, dw_, ds_, di_, drn_)
+        out_ = do_fmoe(do_, dw_, ds_, di_, (drn_fixed if FIX_DRN else drn_))
         e[2].record()
         _ = op.combine(out_, topk_weights, topk_ids)
         e[3].record()
         torch.cuda.synchronize()
         return (e[0].elapsed_time(e[1]), e[1].elapsed_time(e[2]), e[2].elapsed_time(e[3]))
-
-    do, dw, ds, di, drn = do_dispatch()
-    recv = int(drn.item()) if hasattr(drn, "item") else int(drn)
     for _ in range(NWARM):
         timed_iter()
     dist.barrier()
@@ -173,7 +192,8 @@ def run_point(tokens_per_rank):
     av = lambda j: sum(r[j] for r in rows)/len(rows)
     recv_mean = sum(r[1] for r in rows)/len(rows)
     print(f"\n### per-rank tokens={tokens_per_rank}  recv/rank≈{recv_mean:.0f}  "
-          f"(world={WORLD}, E={E_GLOBAL}, topk={TOPK}, {QUANT}, dispatch={DISPATCH}) ###")
+          f"(world={WORLD}, E={E_GLOBAL}, topk={TOPK}, {QUANT}, dispatch={DISPATCH}, "
+          f"MAX_INP={MAX_INP}, FIX_DRN={FIX_DRN}) ###")
     print(f"{'stage':12} {'MAX us':>9} {'mean us':>9}   (MAX over ranks = the production denominator)")
     for nm, j in [("dispatch",2),("fmoe(local)",3),("combine",4),("REGION(d+f+c)",5)]:
         print(f"{nm:12} {mx(j):>9.2f} {av(j):>9.2f}")
