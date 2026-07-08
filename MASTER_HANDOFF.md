@@ -70,11 +70,14 @@ The cross-rank-correct kernel we already have is `combine_scatter` (`ctx.fetch_a
    | source-token reuse (`dup`) | **1.000** (⇒ top-1!) | **1.506** (a pull re-reads; a push dedups) |
    | BM=256 padding | **0.0%** | **35.4%** |
 
-   The padding one is lethal for prefill: `ROUTE=uniform` + `TOTAL_M=8192` + `E=32` puts **exactly 256
-   rows in every expert** — one perfect tile, zero waste. Real routing gives `rows_per_expert ~ Bin(8192,
-   1/32)` (mean 258, σ≈15.8), so most experts pad to 512 and `Mpacked` goes **8192 → 12800**. The prefill
-   GEMM (`build_b0_tasks`, `ceil(m_e/256)`) then does **1.56× more MFMA** — the same size as the claimed
-   win. (Decode is immune: `build_b0_tasks_decode` tiles at BM=16.)
+   The padding one is the sharpest: `ROUTE=uniform` + `TOTAL_M=8192` + `E=32` puts **exactly 256 rows in
+   every expert** — one perfect tile, **zero waste**. Real routing gives `rows_per_expert ~ Bin(8192, 1/32)`
+   (mean 258, σ≈15.8), so most experts pad to 512. Measured over all 8 ranks (mean rows the GEMM computes,
+   per rank, for 8192 real rows): **fused BM=256 → 12128 (1.480×)**; aiter `BLOCK_SIZE_M=32` → 8700
+   (1.062×); BM=16 → 8446 (1.031×). So under real routing the fused prefill GEMM does **1.394× the MFMA the
+   baseline pays**, and under the synthetic route it pays **1.000×**. Comparable in size to the whole 1.56×
+   claim. **Fixable** — tile prefill at BM=16 like decode already does — but the published number never
+   paid it. (Decode is immune: `build_b0_tasks_decode` already tiles at BM=16.)
 5. **The two sides don't produce the same artifact.** `moe_sorting` emits **index arrays only**; the
    unfused fmoe GEMM applies the permutation for free in its A-load. `gather_pack` materializes
    `Mpacked × 7168` fp8 bytes. "3 kernels fused into 1" is not a kernel-for-kernel identity — the only

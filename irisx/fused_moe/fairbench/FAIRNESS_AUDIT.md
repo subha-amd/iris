@@ -110,11 +110,26 @@ Three things follow:
 - **A pull gather re-reads each distinct token 1.5×.** MORI's push dedups (`intranode.hpp:141-152`);
   a pull cannot. The synthetic route hides this by never routing a token to two local experts.
 - **`ROUTE=uniform` with `TOTAL_M=8192` and `E=32` puts exactly 256 rows in every expert** — precisely
-  one BM=256 tile, zero padding. Real routing gives `rows_per_expert ~ Binomial(8192, 1/32)`, mean 258,
-  σ≈15.8, so **most experts land just over 256 and pad to 512.** `Mpacked` goes 8192 → 12800.
-  The prefill GEMM (`build_b0_tasks`, `n_m_tiles = ceil(m_e/256)`) then does **1.56× more MFMA work.**
-  That is the same size as the claimed win. (Decode is unaffected: `build_b0_tasks_decode` tiles at
-  BM=16 over the same 256-padded buffer, so it computes `ceil(m_e/16)*16` rows, not the padded region.)
+  one BM=256 tile, **zero padding**. Real routing gives `rows_per_expert ~ Binomial(8192, 1/32)`, mean 258,
+  σ≈15.8, so most experts land just over 256 and pad to 512. Measured over all 8 ranks:
+
+  | | rows the GEMM computes | vs real rows |
+  |---|---|---|
+  | real rows routed (mean/rank) | 8192 | 1.000× |
+  | **fused, BM=256** (`build_b0_tasks`, `ceil(m_e/256)`) | **12128** | **1.480×** |
+  | baseline, aiter `BLOCK_SIZE_M=32` | 8700 | 1.062× |
+  | fused, BM=16 (what `build_b0_tasks_decode` already does) | 8446 | 1.031× |
+
+  ⇒ under real routing the fused prefill GEMM does **1.394× the MFMA the baseline pays**, purely from
+  BM=256 padding. Under the synthetic uniform route it pays **1.000×**. The magnitude is comparable to
+  the entire 1.56× claim — whether it erases the win depends on fc1+fc2's share of the 1247 µs, which
+  this audit must measure.
+
+  **This is a fixable, self-inflicted handicap, not a fundamental defeat** (MASTER_HANDOFF §5.2 already
+  says so): tiling prefill at BM=16 the way decode already does brings it to 1.031×. But the *published*
+  1.56× was measured on a route that never paid it.
+  (Decode is unaffected: `build_b0_tasks_decode` tiles at BM=16 over the same 256-padded buffer, so it
+  computes `ceil(m_e/16)*16` rows, not the padded region.)
 
 ### 1.5 The two sides do not produce the same artifact
 
@@ -228,11 +243,18 @@ only ~336 tokens actually arrive. `fused_moe` then calls `moe_sorting(topk_ids=d
 What *does* honour the real count: the `moe_buf` zeroing (`tokens_ = p_local_tokens[0]`, `:1087-1103`)
 and — via the `is_local_token` branch of `maybe_clear_workspace` (`:3528-3536`) — the workspace clear.
 
-So the *allocation, kernel selection, LDS footprint and grid* are sized for 65536 tokens on every decode
-step, while the actual data movement is not. **Whether that costs measurable µs is an empirical
-question** — `bench_dispatch_prefix.py` runs `MAX_INP=real` (=`T`) and `MAX_INP=b3` (=`max(8192,4T)`)
-so the delta is measured, not assumed. A real serving stack sets `max_num_inp_token_per_rank` to the
-actual max batch.
+Concretely, the static count `moe_sorting` sees is `di.size(0) = MaxNumTokensToRecv() = world ×
+max_num_inp_token_per_rank`, vs the true per-rank recv `R`:
+
+| `T` | `MAX_INP=b3` static | `MAX_INP=real` static | true `R` (measured) | b3 oversizing |
+|---|---|---|---|---|
+| 64 (decode) | **65536** | 512 | ~357 | **183×** |
+| 1024 (prefill) | 65536 | 8192 | ~5479 | 12× |
+
+So the *allocation, kernel selection, LDS footprint and grid* are sized for 65536 tokens, worst at decode.
+**Whether that costs measurable µs is an empirical question** — `bench_unfused_prefix.py` runs `MAX_INP=real`
+and `MAX_INP=b3` so the `moe_sorting` delta is measured, not assumed. A real serving stack sets
+`max_num_inp_token_per_rank` to the actual max batch.
 
 ### 2.2 ⚠️ MORI's `totalRecvTokenNum` accumulates across dispatches — so `b3`'s `fmoe` time grows every iteration
 
@@ -255,8 +277,35 @@ successive dispatches). Do not put this in the deck until measured.
 
 ## 3. The corrected benchmark
 
-`fairbench/bench_dispatch_prefix.py`. One process per rank under `mpirun -np 8`, hosting IRIS +
-`tk_kernel` + MORI + aiter together, so both paths race on the **same tensors, same GPUs, same iteration**.
+The comparison is **two processes on the same node**, not one:
+- **`fairbench/bench_unfused_prefix.py`** — the MORI+aiter side, under `mp.Pool` (b3's proven bootstrap
+  recipe: `aiter.init_dist_env` + `shmem_torch_process_group_init`). Times `EpDispatch` cache-mode,
+  `EpDispatch` **replay-mode** ("already cached"), `dynamic_quant[R]`, and `moe_sorting`.
+- **`fairbench/bench_gather_only.py`** — the fused side, under `mpirun` (IRIS + `tk_kernel`, no MORI).
+  Times `gather_pack` (SEG), `gather_pack_rowmap`, `plan_allgather_ids`, and `build_plan`.
+
+Both use the **same node, the same per-rank route (same `SEED` → identical top-8 `topk_ids` fed to both),
+the same `T`, and MAX over the 8 ranks**, so the two prefix totals are directly comparable — we give up
+only "same iteration", which does not matter because every stage is timed in isolation between barriers.
+
+**A quant-count asymmetry both sides' numbers must state honestly.** The fused prefix charges `quant[T]`
+— each rank quantizes its **own T tokens once, at origin** (T=1024/rank). The unfused bf16-dispatch prefix
+charges `quant[R]` — the **R≈5479 received tokens** (a token landing on k local-expert ranks is quantized
+once per rank). So `sum_ranks R > sum_ranks T`: pre-dispatch quant genuinely does less total quant work.
+That is a *real* property of the fused design, not a measurement trick — but the two `quant` stages are
+different token counts, so they are reported **separately**, never cancelled. (The tightest unfused
+variant is `DISPATCH=fp8`: quantize T at origin, dispatch fp8. That is not the C4/`b3`-default bf16 path,
+so it is a secondary bar, not the primary one.)
+
+**Why two processes:** a single process hosting IRIS + MORI + aiter **cannot bootstrap MORI under
+`mpirun`** — `shmem_init_attr` deadlocks (§3 trap 4, root cause still open). The one-process version
+`bench_dispatch_prefix.py` remains in the tree for when that is fixed, but the two-process split is what
+produces numbers today, and it is strictly *more* faithful to production (the unfused stack really does
+run under `mp.Pool`/torchrun, not `mpirun`).
+
+### (superseded) one-process design — `fairbench/bench_dispatch_prefix.py`
+One process per rank under `mpirun -np 8`, hosting IRIS + `tk_kernel` + MORI + aiter together, so both
+paths would race on the **same tensors, same GPUs, same iteration**. Blocked on the MORI bootstrap hang.
 
 - **Inputs (both):** `tokens[T,7168]` bf16, `topk_ids[T,8]`, `topk_weights[T,8]` from real `fused_topk`.
 - **Boundary (both):** fc1's A operand is ready.
@@ -294,13 +343,36 @@ Stages timed:
    subsequent MORI bootstrap on the node spun forever. `rocm-smi --showmemuse` also showed 80% VRAM held
    by defunct `sglang::schedul` processes whose container PID 1 (`sleep infinity`) never reaped them.
    Both cleared; `probe_boot.py` then bootstraps MORI repeatedly, back-to-back, without issue.
-4. **`shmem_init_attr()` still hangs inside `bench_dispatch_prefix.py` — ROOT CAUSE NOT YET FOUND.**
-   All 8 ranks spin at 100% CPU, 0% GPU, stack pinned at `mori/shmem/api.py:157`. `probe_boot.py`
-   performs the *same* call sequence and succeeds. Ruled out so far: orphan processes (node is clean);
-   IRIS heap size (hangs at both 256 MB and 2048 MB); **`import aiter` ordering** (moving every aiter
-   import after the bootstrap did *not* fix it — an earlier hypothesis, now disproven). Under
-   investigation; the remaining candidate is `import torch` vs `import iris_py`/`tk_kernel` ordering
-   (`example.py` and `probe_boot.py` both import torch first, and both work).
+4. **`shmem_init_attr()` hangs inside `bench_dispatch_prefix.py` — ROOT CAUSE: NODE STATE, not code
+   (isolated by a debug subagent + codex, 2026-07-08).** rocgdb on a hung rank shows the spin is inside
+   MORI C++: `shmem_init_attr → ShmemInit → MemoryStatesInit → SymmMemManager::RegisterSymmMemObj →
+   hipMalloc/hipIpcOpenMemHandle/hipDeviceEnablePeerAccess/hipMemcpy → HSA busy-wait` (100% CPU / 0% GPU
+   fits exactly). **Decisive test:** the byte-identical bench prefix (`dbg_repro.py`) **PASSED** on all
+   ranks in a clean window and **HUNG** in a contended one — same bytes, opposite outcome ⇒ set by node
+   state, not the script. Ruled out at code level: device ordinal (probed device == rank throughout,
+   incl. after `import mori`; codex's top hypothesis, disproven), heap size (256 & 2048 both pass),
+   import order (torch-first already in the file; not load-bearing), and a full bisection ladder from
+   the working probe to the bench. **Mechanism:** MORI's symmetric-heap registration re-runs all-to-all
+   IPC-open + peer-access + a metadata `hipMemcpy` on GPUs where IRIS already set up all-to-all IPC;
+   under concurrent 8-GPU activity or leaked GPU state (stale IPC handles / allocations from prior
+   `SIGKILL`'d jobs) the memcpy's HSA completion never gets serviced. `np≥4` widens the peer surface
+   (np=1/2 always passed). **Operational fix: exclusive GPU access + a clean node.** No source edit
+   defeats external contention; an optional robustness edit (reassert `set_device` + `synchronize` +
+   `comm.Barrier()` right before the bootstrap) quiesces the queues but does not defeat contention.
+
+5. **Dirty GPU state from `SIGKILL`'d jobs wedges *everything*, including the `mp.Pool` unfused side.**
+   `pkill -9` on a hung MORI/IRIS job does **not** release device allocations, IPC handles, or peer
+   mappings, and (with a container PID 1 of `sleep infinity`) leaves zombies that are never reaped. The
+   symptom on the next job is `aiter: Failed to initialize PyNcclCommunicator … NCCL error: unhandled
+   cuda error` at RCCL init — a wedged HIP context, not RCCL-internal corruption. **Two `pkill` traps
+   that made this worse:** (a) `pkill -f <script>.py` does **not** match `mp.Pool` **spawn** workers,
+   whose cmdline is `python3 -c "from multiprocessing.spawn import spawn_main…"` — kill them by PID or
+   process group; (b) a job launched under `mpirun` and killed mid-`RegisterSymmMemObj` leaks symmetric-
+   heap IPC. Clearing, in increasing severity: reap/kill every straggler until `rocm-smi --showpids` is
+   empty of the job's PIDs → `NCCL_P2P_DISABLE=1` (workaround, alters the comm path) → `docker restart`
+   the container (reaps zombies, frees allocations, keeps the FS) → a device reset (needs no other
+   tenants). `probe_mori_pool.py` passing the same `init_dist_env` recipe *before* the churn and failing
+   *after* is the tell that the delta is accumulated dirty state, not code.
 
 ---
 
@@ -343,3 +415,20 @@ seconds and rebuilt nothing** — `b1_dispatch` is not even a target under that 
   completed on this node** — `b3_sweep.log` stops at the RCCL banner, `b3_t64_retry.log` crashed).
 
 Until then, **the 1.56× should not be quoted.**
+
+---
+
+## 6. Slides in `june-30-presentation/moe_fused_talk.tex` that must change
+
+| line | current claim | required change |
+|---|---|---|
+| 36 (title) | "a **1.56× prefill win**" | qualify or replace once re-measured all-ranks / real-route |
+| 62 | "Prefill: 1.56× … our pull-combine **beats AMD's own MORI EpCombine** (386 vs 398 µs)" | **delete the combine clause** (kernel is incorrect at fanout>1); re-derive the prefill number |
+| 257–270 (Kernel 4) | "**beating MORI's own combine**", 386 vs 398 µs table | **retract** — `combine_pull` drops cross-rank sums; the correct `combine_scatter` is 788 µs and loses |
+| 290–295 | "Compare regions, not kernels … define the region by its I/O boundary" | the boundary was measured on ONE rank with a synthetic route — restate honestly |
+| 300–308 (PREFILL result) | 1247 vs 1941 µs, 1.56× | re-measure: all-ranks, real route (35% pad), quant on-clock, same node |
+| 138–139 (decode cap) | 1.03×, "even if every boundary were free, decode caps at 1.25×" | the *argument* stands; the 1.03× number carries the same caveats |
+
+The **thesis** ("aiter fuses the expert math; we fuse the expert region") and the structural story
+(dispatch/combine is the all-to-all; decode is a weight wall) survive intact — it is the **quantitative
+claims and the combine correctness** that do not.
