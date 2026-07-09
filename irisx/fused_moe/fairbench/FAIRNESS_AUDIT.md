@@ -1,8 +1,9 @@
 # Fairness audit — `gather_pack` vs `EpDispatch + moe_sorting`
 
-**Status: IN PROGRESS (2026-07-08).** Source findings below are verified against the code and are
-final. **Timing numbers are not yet collected** — every `TBD` is a number this document must not
-assert until it has been measured on the 8× MI350 node (`smci350-rck-g03-f16-03`).
+**Status: MEASURED (2026-07-08).** Source findings are verified against the code; dispatch-prefix
+timings are measured on a fresh 8× MI350X node (`smci350-odcdh2-a08-2`), warm, all 8 ranks, MAX over
+ranks, real top-8 route — see §5. The full *region* (with the expert GEMM + combine) is still pending
+and gated on the `combine_pull` correctness bug (§1.6).
 
 The june-30 deck claims the three fused kernels give **1.56× over the unfused AITER/MORI baseline**
 (prefill, `1247 µs` vs `1941 µs`). This document establishes what that number actually compares, and
@@ -534,7 +535,93 @@ on-device. The bigger "vs bf16" ratios include the fp8-movement advantage a prod
 **None of these is the deck's 1.56× — that is the full *region* (with the expert GEMM + combine), a
 different denominator (§5.7).**
 
-### 5.7 Results still pending
+### 5.7 ★ tier-1 vs tier-2: the input discrepancy, and why only tier-2 is a valid drop-in
+
+**The user's requirement (2026-07-08):** for `gather_pack` to drop into the production MoE region, its
+**input must be exactly what the router hands the region** — per rank, `(tokens bf16 [T,H], topk_ids
+[T,topk], topk_weights [T,topk])`. Intermediate representation may differ (materialized buffer vs
+indices, §1.5); the *inputs* may not. This is the correct standard, and it decides which tier counts.
+
+| | tier-1 | tier-2 (drop-in) |
+|---|---|---|
+| activation input | fp8, quantized **off-clock** | **bf16 tokens** (quantized on-clock, in-region) |
+| routing input | a **precomputed** `SEG`/`rowmap` plan | **raw `topk_ids`** → `plan_allgather_ids` + `build_plan` on device |
+| matches the router's output? | **NO** — production has no precomputed plan | **YES** — identical to what `EpDispatch` consumes |
+| valid as a drop-in? | **no** | **yes** |
+
+So **tier-1 is not a legitimate comparison** — it hands the fused path a routing plan that does not exist
+in production (the router only emits `topk_ids`; the plan must be *derived*, on the clock). Only tier-2,
+where the fused path builds its plan from raw `topk_ids` on device, is a valid drop-in. The two kernels
+that close the gap — `plan_allgather_ids` (IRIS all-gather of `topk_ids`) + `build_plan` (device
+count/scan/scatter → `expert_row_begin` + `rowmap`) — were written for exactly this, and their cost is
+what separates the tiers.
+
+**One structural asymmetry the input-match exposes:** a **pull** gather forces the consumer to know the
+*global* routing (to know what to pull), so the drop-in path needs an **all-gather of `topk_ids`**
+(`plan_allgather_ids`). MORI's **push** never does this — each rank pushes on its own `topk_ids`. It is
+cheap (topk_ids is tiny) but it is an intrinsic cost of choosing pull-gather, and it lives in the tier-2
+number, not tier-1.
+
+**`bench_dropin.py`** measures the literal drop-in: one on-clock region `fused_dispatch(tokens_bf16,
+topk_ids) → A_pk`, chaining `quant → plan_allgather_ids → build_plan → gather_pack_rowmap`, warm, MAX
+over 8 ranks — and times the tier-1 (host plan) region in the same run so `tier2 − tier1` = the exact
+routing-plan-from-`topk_ids` cost tier-1 hides.
+
+**Measured (`bench_dropin.py`, prefill T=1024, warm, 8 ranks, MAX over ranks, one on-clock region, all
+correctness gates 8/8 PASS — the device plan built from raw `topk_ids` matches the host plan exactly):**
+
+| region | MAX µs |
+|---|---|
+| **tier-2 DROP-IN** (`quant → allgather topk_ids → build_plan → gather`, from raw router output) | **309.4** |
+| tier-1 (host-precomputed plan — NOT a valid drop-in) | 267.1 |
+| — piece: quant + place on heap | 32.8 |
+| — piece: `plan_allgather_ids` | 14.5 |
+| — piece: `build_plan` | 53.1 |
+| — piece: `gather_pack_rowmap` | 226.3 |
+
+**`tier2 − tier1 = 42 µs`** = the routing-plan-from-`topk_ids` cost tier-1 illegitimately hides (the
+`allgather` 14.5 + `build_plan` 53.1 run concurrently with the region's other work, so the *region* delta
+42 < the sum 68). The 309 µs region is measured as one unit (kernels back-to-back), so it is lower than
+the earlier component-sum (320 µs) — 309 is the honest drop-in number.
+
+**The drop-in verdict (prefill T=1024):**
+
+| fused DROP-IN (tier-2) | vs unfused fp8-dispatch (tier-2) | vs unfused bf16-dispatch (b3/C4 default, tier-2) |
+|---|---|---|
+| **309 µs** | 332 µs → **1.07×** | 392 µs → **1.27×** |
+
+So against the **actual production pathway it would replace** (bf16-dispatch): **1.27×**. Isolating the
+fusion from the fp8-movement (vs fp8-dispatch): **1.07×**. Both are *real drop-in numbers* — the input is
+byte-for-byte the router's output, everything on the clock. Decode in §5.8.
+
+### 5.8 Decode drop-in (T=64, one on-clock region, all gates 8/8 PASS)
+
+| region | MAX µs |
+|---|---|
+| **tier-2 DROP-IN** | **103.0** |
+| tier-1 (host plan, not valid) | 82.5 |
+| — quant+place 32.1 · `plan_allgather_ids` 9.9 · `build_plan` 19.5 · `gather_pack_rowmap` 43.6 | |
+
+Note the **quant fixed cost (32 µs) is ~31% of the decode region** — at 64 tokens the per_1x128 quant is
+dominated by launch/fixed overhead, not token count.
+
+### 5.9 ★ The drop-in verdict (both regimes, input = router output, everything on-clock)
+
+| | prefill T=1024 | decode T=64 |
+|---|---|---|
+| **fused drop-in** (tier-2 region) | **309 µs** | **103 µs** |
+| vs **production bf16-dispatch** (the path it replaces) | **1.27×** | **1.27×** |
+| vs **fp8-dispatch** (isolated fusion, format held constant) | **1.07×** | **1.12×** |
+
+**A drop-in `fused_dispatch(tokens_bf16, topk_ids) → A_pk` is a consistent ≈1.27× over the production
+bf16-dispatch region at both prefill and decode**, of which the isolated-fusion part is 1.07–1.12× and the
+remainder is the fp8-at-origin movement advantage (real and shippable, but also available to the unfused
+stack via `DISPATCH=fp8`). This is the honest, production-relevant number: same input signature as
+`EpDispatch`, all routing derived from raw `topk_ids` on-clock, all 8 ranks, MAX over ranks, correctness-
+gated. It is **not** the deck's 1.56× (that is the full region incl. the expert GEMM + combine — a
+different, still-pending denominator, §5.10).
+
+### 5.10 Results still pending
 
 - **The full *region*** (gather + fc1 + act + fc2 + combine) with `ALL_RANKS=1`, to correct the deck's
   `1247 vs 1941 µs` — this dispatch-prefix comparison is only the gather boundary, not the GEMM. The

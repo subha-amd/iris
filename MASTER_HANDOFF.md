@@ -135,9 +135,27 @@ Also measured: **`gather_pack_rowmap` beats the `route_segment` ABI 1.106×** (s
 ≈ 72–73 µs at BOTH `MAX_INP` settings → §2.1 "sort inflation" is REFUTED** (the 174 µs first reading was
 cold JIT; use ≥10 warm-up on this stack). 13/13 correctness gates pass on all 8 ranks.
 
-**Still pending:** the prefill *region* (with the expert GEMM + combine) under `ALL_RANKS=1` to correct
-the deck's `1247 vs 1941 µs`; decode `T=64`. And the combine is still §0.4-incorrect, so any region
-number that includes it is measuring a broken kernel until `combine_pull` is fixed.
+**DROP-IN measured (`fairbench/bench_dropin.py`, 2026-07-08).** The user's requirement: a valid drop-in
+must consume EXACTLY the router's output `(tokens bf16, topk_ids)`, not a pre-quantized/pre-planned input.
+So `bench_dropin.py` times one on-clock region `fused_dispatch(tokens_bf16, topk_ids) → A_pk` =
+`quant → plan_allgather_ids → build_plan → gather_pack_rowmap`, warm, 8 ranks, MAX over ranks, gates 8/8:
+
+| | prefill T=1024 | decode T=64 |
+|---|---|---|
+| **fused DROP-IN** (tier-2, from raw `topk_ids`) | **309 µs** | **103 µs** |
+| vs production **bf16-dispatch** (path it replaces) | **1.27×** | **1.27×** |
+| vs **fp8-dispatch** (isolated fusion) | 1.07× | 1.12× |
+
+**tier-1 (host-precomputed plan) is NOT a valid drop-in** — production has no precomputed plan; the router
+only emits `topk_ids`. The `tier2 − tier1` gap (42 µs prefill / 20 µs decode) is the routing-plan-from-
+`topk_ids` cost tier-1 illegitimately hides (`plan_allgather_ids` + `build_plan`). A pull gather also needs
+an all-gather of `topk_ids` (the consumer must know global routing) that MORI's push does not — intrinsic
+to pull, in the tier-2 number. Full tier-1-vs-tier-2 discrepancy write-up: `FAIRNESS_AUDIT.md §5.7`.
+
+**Still pending:** the full prefill *region* (with the expert GEMM + combine) under `ALL_RANKS=1` to
+correct the deck's `1247 vs 1941 µs` (a different denominator than the dispatch-prefix above). And the
+combine is still §0.4-incorrect, so any region number including it measures a broken kernel until
+`combine_pull` is fixed.
 
 **Build recipe for the fresh node** (the old node's prebuilt `tk_kernel` died with it): clone
 `HazyResearch/HipKittens` (tip `60fd1dd`) + `subha-amd/iris@subha/moe-dispatch-v0`; `cp -a
