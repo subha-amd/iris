@@ -499,15 +499,50 @@ different denominator (§5.5).
 `gather_pack_rowmap` (226 µs) beats `gather_pack` (250 µs) by **1.106×** under real routing — the run-
 encoded `route_segment` ABI is pure overhead when mean run = 1.03 (§1.4). Actionable: ship the rowmap ABI.
 
-### 5.5 Results still pending
+### 5.5 Decode (T=64, warm, real route, all ranks, MAX over ranks) — fusion wins MORE here
 
-- **The prefill *region*** (gather + fc1 + act + fc2 + combine) with `ALL_RANKS=1`, to correct the deck's
-  `1247 vs 1941 µs` full-region 1.56× — the prefix above is only the gather boundary, not the GEMM.
-- **decode `T=64`** for both sides (padding-immune, but sort oversizing is 183× — check §2.1 there).
-- A same-process fused-vs-unfused run (removes cross-run variance) once the MORI+IRIS coexist hang (§3.4)
-  is fixed.
+Same setup, `T=64`/rank, `recv/rank ≈ 335`. All fused correctness gates pass.
 
-Per `T ∈ {64, 1024}`:
+| prefix | tier-1 (routing cached) | tier-2 (routing on device) |
+|---|---|---|
+| **FUSED** `quant[T]` + `gather_pack_rowmap` | `28 + 45 =` **73 µs** | `+31 =` **103 µs** |
+| **UNFUSED fp8-dispatch** (tight) | `28 + 37 + 50 =` **114 µs** | `28 + 37 + 50 =` **115 µs** |
+| **UNFUSED bf16-dispatch** (b3 default) | `49 + 33 + 50 =` **132 µs** | **131 µs** |
+
+- **vs the tight fp8-dispatch baseline: fusion wins 1.58× (cached), 1.11× (routing on device)** — *larger*
+  than prefill's 1.17×/1.04×. Why: at decode the token count is tiny, so `dispatch` collapses to ~37 µs
+  and **`moe_sorting` (50 µs) is the single biggest unfused stage.** The fused gather (45 µs) does the
+  dispatch+sort in one pass — replacing 37+50 = 87 µs — because *placement is the gather*. The on-device
+  plan build (31 µs, cheaper than prefill's 68) erodes less of the win at tier-2.
+- `rowmap` beats the `route_segment` ABI **1.226×** here (vs 1.106× prefill) — the per-tile serial scan is
+  a bigger fraction of the tiny gather. **Ship the rowmap ABI.**
+- **93% of the packed buffer is BM=256 zero-padding at decode** — the gather writes 58.7 MB of mostly
+  zeros locally. The decode *GEMM* is immune (it tiles at BM=16), but the *gather* pays it; a tighter
+  packed layout would cut the 45 µs gather further. (Open optimization, not a fairness issue.)
+
+### 5.6 Summary — the honest fusion win at the dispatch boundary
+
+| | prefill T=1024 | decode T=64 |
+|---|---|---|
+| fusion win vs fp8-dispatch, **cached routing** | **1.17×** | **1.58×** |
+| fusion win vs fp8-dispatch, **routing on device** | ~1.04× | 1.11× |
+| vs the bf16 (b3/C4-default) baseline, cached | 1.46× | 1.81× |
+
+The isolated fusion effect (eliminating the separate `moe_sorting` pass) is **real and larger at decode**
+(where the sort dominates), but at prefill it is modest and nearly vanishes once the routing plan is built
+on-device. The bigger "vs bf16" ratios include the fp8-movement advantage a production stack gets for free.
+**None of these is the deck's 1.56× — that is the full *region* (with the expert GEMM + combine), a
+different denominator (§5.7).**
+
+### 5.7 Results still pending
+
+- **The full *region*** (gather + fc1 + act + fc2 + combine) with `ALL_RANKS=1`, to correct the deck's
+  `1247 vs 1941 µs` — this dispatch-prefix comparison is only the gather boundary, not the GEMM. The
+  region number is also gated on the **`combine_pull` correctness bug (§1.6)** — any region total that
+  includes the current combine is measuring a broken kernel.
+- The `MAX_INP=b3` decode sort check (183× oversizing — the one place §2.1's penalty might still appear).
+- A same-process fused-vs-unfused run (removes the ≲10% cross-run variance) once the MORI+IRIS coexist
+  hang (§3, trap 4) is fixed.
 
 - the per-stage MAX-over-ranks table,
 - tier-1 and tier-2 prefix totals for `{unfused bf16, unfused fp8, fused SEG, fused rowmap}`,

@@ -113,9 +113,40 @@ Rainier**. §11 of this file warns the cluster varies ~1.8× node-to-node. A sam
   `do_build.sh` returned rc=0 and compiled **nothing**. Always run `cfg_build.sh` first, then check the
   `.so` mtime.
 
-### Status
-Region/stage **timings are NOT yet collected** — `bench_dispatch_prefix.py` is blocked on a MORI
-`shmem_init_attr` deadlock under `mpirun` (under investigation). Everything above stands without them.
+### Status — DISPATCH-PREFIX TIMINGS NOW MEASURED (2026-07-08, fresh 8× MI350X `smci350-odcdh2-a08-2`)
+Fair, warm (30 iter / 10 warm-up), all 8 ranks, MAX over ranks, real top-8 route, `T=1024` prefill.
+Two-process design (MORI+aiter under `mp.Pool`; IRIS gather under `mpirun`) — the single-process
+`bench_dispatch_prefix.py` is still blocked on the MORI `shmem_init_attr` node-state hang (§3.4 of the
+audit; the fix is exclusive/clean GPUs, not code). Prefix = "router → fc1 A operand ready":
+
+| prefix | tier-1 (routing cached) | tier-2 (routing on device) |
+|---|---|---|
+| **FUSED** `quant[T]` + `gather_pack_rowmap` | **252 µs** | 320 µs |
+| UNFUSED **fp8-dispatch** (tight) | 295 µs | 332 µs |
+| UNFUSED **bf16-dispatch** (b3/C4 default) | 368 µs | 392 µs |
+
+**The 1.56× decomposes.** At the dispatch boundary the *isolated fusion* win (no separate sort pass —
+placement IS the gather) is **1.17× cached, ~1.04× when the plan is built on-device** (our on-device
+`build_plan` = 68 µs costs MORE than MORI's on-device routing ≈ 37 µs, eating most of the gain). The
+larger 1.46× vs the bf16 baseline is **~half fp8-vs-bf16 movement**, which a production stack gets for
+free with `DISPATCH=fp8`. Full table + decomposition in `fairbench/FAIRNESS_AUDIT.md §5.3`.
+
+Also measured: **`gather_pack_rowmap` beats the `route_segment` ABI 1.106×** (ship rowmap); **`moe_sorting`
+≈ 72–73 µs at BOTH `MAX_INP` settings → §2.1 "sort inflation" is REFUTED** (the 174 µs first reading was
+cold JIT; use ≥10 warm-up on this stack). 13/13 correctness gates pass on all 8 ranks.
+
+**Still pending:** the prefill *region* (with the expert GEMM + combine) under `ALL_RANKS=1` to correct
+the deck's `1247 vs 1941 µs`; decode `T=64`. And the combine is still §0.4-incorrect, so any region
+number that includes it is measuring a broken kernel until `combine_pull` is fixed.
+
+**Build recipe for the fresh node** (the old node's prebuilt `tk_kernel` died with it): clone
+`HazyResearch/HipKittens` (tip `60fd1dd`) + `subha-amd/iris@subha/moe-dispatch-v0`; `cp -a
+iris/irisx/fused_moe/. HipKittens/distributed-kernels/b1_dispatch/` and `iris/irisx/tilecomm/.
+HipKittens/distributed-kernels/tilecomm/`; `cmake -B build -DGPU_TARGET=CDNA4 -DDK_BUILD=b1_dispatch`
+(CPM-fetches the IRIS lib from `ROCm/iris:muhaawd/irisx`); `cmake --build build --target b1_dispatch
+--target iris_py`; `pip install mpi4py`. `.so`s land in `b1_dispatch/` (tk_kernel) + `distributed-kernels/`
+(iris_py) → run with `PYTHONPATH=…/distributed-kernels`. Container `subha_fair` from
+`rocm/atom-dev:nightly_202607061543`. Shared node (tenants `okachur`, `hangy`).
 
 ---
 
