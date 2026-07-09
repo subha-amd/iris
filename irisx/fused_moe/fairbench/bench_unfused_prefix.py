@@ -88,6 +88,21 @@ def worker(rank):
 
     aq = aiter.get_hip_quant(aiter.QuantType.per_1x128)
 
+    # ---- fp8-dispatch variant: pre-quant T tokens at origin, dispatch fp8 (the TIGHT comparison to
+    #      the fused gather, which also moves fp8). Isolates "sort fusion" from "fewer XGMI bytes".
+    tq, tsc = aq(tokens, quant_dtype=dtypes.fp8)
+    torch.cuda.synchronize()
+    cfg8 = mori.ops.EpDispatchCombineConfig(
+        data_type=tq.dtype, rank=rank, world_size=WORLD, hidden_dim=HID,
+        scale_dim=tsc.shape[-1], scale_type_size=tsc.dtype.itemsize,
+        max_token_type_size=dtypes.bf16.itemsize, max_num_inp_token_per_rank=max_inp,
+        num_experts_per_rank=Eloc, num_experts_per_token=TOPK,
+        kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode)
+    op8 = mori.ops.EpDispatchCombineOp(cfg8)
+    op8.dispatch(tq, topk_w, tsc, topk_ids); torch.cuda.synchronize()
+    *_, routing8 = op8.dispatch(tq, topk_w, tsc, topk_ids, return_routing=True)
+    torch.cuda.synchronize()
+
     dist = torch.distributed
 
     def timed(fn):
@@ -104,9 +119,14 @@ def worker(rank):
         return statistics.median(ts)
 
     stages = {
+        # bf16-dispatch path (C4/b3 default): dispatch bf16, quant AFTER at R rows
         "dispatch_cache": lambda: op.dispatch(tokens, topk_w, None, topk_ids),
         "dispatch_replay": lambda: op.dispatch(tokens, topk_w, None, topk_ids, routing=routing),
         "quant_R": lambda: aq(do[:R], quant_dtype=dtypes.fp8),
+        # fp8-dispatch path (tight comparison to the fused fp8 gather): pre-quant T at origin, dispatch fp8
+        "quant_T": lambda: aq(tokens, quant_dtype=dtypes.fp8),
+        "dispatch_fp8_cache": lambda: op8.dispatch(tq, topk_w, tsc, topk_ids),
+        "dispatch_fp8_replay": lambda: op8.dispatch(tq, topk_w, tsc, topk_ids, routing=routing8),
         "moe_sorting": lambda: moe_sorting(di, dw, E_GLOBAL, HID, dtypes.bf16, BLOCK_M,
                                            expert_mask, drn_fixed, 0),
     }
@@ -124,7 +144,8 @@ if __name__ == "__main__":
     with mp.Pool(processes=WORLD) as pool:
         rows = dict(r.get() for r in [pool.apply_async(worker, args=(i,)) for i in range(WORLD)])
 
-    keys = ["dispatch_cache", "dispatch_replay", "quant_R", "moe_sorting"]
+    keys = ["dispatch_cache", "dispatch_replay", "quant_R", "quant_T",
+            "dispatch_fp8_cache", "dispatch_fp8_replay", "moe_sorting"]
     mx = {k: max(rows[r][k] for r in rows) for k in keys}
     av = {k: sum(rows[r][k] for r in rows) / WORLD for k in keys}
     Rmean = sum(rows[r]["R"] for r in rows) / WORLD
@@ -137,6 +158,18 @@ if __name__ == "__main__":
     print(f"{'stage':<26} {'MAX us':>9} {'mean us':>9}    (MAX over 8 ranks = production denominator)")
     for k in keys:
         print(f"{k:<26} {mx[k]:>9.2f} {av[k]:>9.2f}")
+    print(f"{'-'*96}")
+    st = mx["moe_sorting"]
+    print(f"  BF16-DISPATCH prefix (C4/b3 default: dispatch bf16, quant R rows after):")
+    print(f"    tier-1 cached : dispatch_replay {mx['dispatch_replay']:.1f} + quant_R {mx['quant_R']:.1f}"
+          f" + sort {st:.1f} = {mx['dispatch_replay']+mx['quant_R']+st:.1f} us")
+    print(f"    tier-2 device : dispatch_cache  {mx['dispatch_cache']:.1f} + quant_R {mx['quant_R']:.1f}"
+          f" + sort {st:.1f} = {mx['dispatch_cache']+mx['quant_R']+st:.1f} us")
+    print(f"  FP8-DISPATCH prefix (TIGHT vs the fused fp8 gather: pre-quant T at origin, dispatch fp8):")
+    print(f"    tier-1 cached : quant_T {mx['quant_T']:.1f} + dispatch_fp8_replay {mx['dispatch_fp8_replay']:.1f}"
+          f" + sort {st:.1f} = {mx['quant_T']+mx['dispatch_fp8_replay']+st:.1f} us")
+    print(f"    tier-2 device : quant_T {mx['quant_T']:.1f} + dispatch_fp8_cache  {mx['dispatch_fp8_cache']:.1f}"
+          f" + sort {st:.1f} = {mx['quant_T']+mx['dispatch_fp8_cache']+st:.1f} us")
     print(f"{'-'*96}")
     print(f"  UNFUSED PREFIX tier-1 (routing cached): dispatch_replay + quant_R + moe_sorting")
     print(f"     = {mx['dispatch_replay']:.1f} + {mx['quant_R']:.1f} + {mx['moe_sorting']:.1f} "

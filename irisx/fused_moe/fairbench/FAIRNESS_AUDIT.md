@@ -256,6 +256,16 @@ So the *allocation, kernel selection, LDS footprint and grid* are sized for 6553
 and `MAX_INP=b3` so the `moe_sorting` delta is measured, not assumed. A real serving stack sets
 `max_num_inp_token_per_rank` to the actual max batch.
 
+> **⚠️ REFUTED AS A TIMING CLAIM (2026-07-08, T=1024, prefill, warm).** Measured `moe_sorting`:
+> **73.2 µs at `MAX_INP=real`** (8192-static) vs **72.3 µs at `MAX_INP=b3`** (65536-static) — **identical
+> within noise.** b3's `max(8192,4T)` does **not** inflate `moe_sorting`. The first reading that suggested
+> otherwise (174 vs 72) was an artifact of insufficient warm-up (cold aiter JIT), not the static size;
+> with 10 warm-up iters the two configs converge. **The only surviving part of §2.1 is the ABI fact** that
+> the static token count drives `moe_sorting_is_oneshot`/kernel selection and workspace allocation — but
+> that does **not** translate into a measurable prefill-µs penalty here. Removed from the "baseline
+> inflation" list. (Decode `T=64`, where the oversizing is 183× not 12×, is not yet measured — the penalty
+> could still appear there; do not generalize this prefill result to decode without measuring.)
+
 ### 2.2 ⚠️ MORI's `totalRecvTokenNum` accumulates across dispatches — so `b3`'s `fmoe` time grows every iteration
 
 - `intranode.hpp:236`: `atomicAdd(args.totalRecvTokenNum, recvTokenNum)` — every dispatch **adds**.
@@ -404,7 +414,100 @@ seconds and rebuilt nothing** — `b1_dispatch` is not even a target under that 
 
 ## 5. Results
 
-**TBD — nothing measured yet.** This section must contain, per `T ∈ {64, 1024}`:
+### 5.1 Unfused prefix — MORI EpDispatch + aiter quant + moe_sorting (MEASURED, warm)
+
+8× MI350X gfx950 (`smci350-odcdh2-a08-2`), all 8 ranks, median over 30 iters, **10 warm-up iters**,
+**MAX over ranks**, real top-8 route (`E=256`, `topk=8`), `T=1024`/rank (prefill), `MAX_INP=real`,
+`recv/rank ≈ 5412`:
+
+| stage | MAX µs |
+|---|---|
+| EpDispatch (routing built on device) | 276.2 |
+| EpDispatch **replay** (routing cached) | 252.6 |
+| quant[R] (aiter per_1x128 of `dispatch_out[R,H]`) | 42.0 |
+| moe_sorting | 73.2 |
+
+**Unfused prefix (router → fc1 A ready):**
+- **tier-1 (routing cached / "already cached"):** `252.6 + 42.0 + 73.2 = ` **`367.8 µs`**
+- **tier-2 (routing on device, full cost):** `276.2 + 42.0 + 73.2 = ` **`391.4 µs`**
+
+This is the number `gather_pack` (fused prefix `= quant[T] + gather_pack`) must beat. **Fused side pending
+the tk_kernel rebuild on this node** (§5.2). **Dispatch is ~70% of the unfused prefix** — the sort and
+quant are small; the all-to-all is the cost.
+
+> **Warm-up matters.** A first pass with only 6 warm-up iters read `dispatch 287 / quant 92 / sort 174`
+> (prefix 553 µs) — inflated by aiter's cold JIT + first-touch. With 10 warm-up iters the numbers drop to
+> the stable values above and are `MAX_INP`-independent (§2.1). Always use ≥10 warm-up on this stack, and
+> re-confirm on this shared node (tenants `okachur`, `hangy` add run-to-run variance).
+
+> ⚠️ Not yet cross-checked against the `1941 µs` "unfused region" in the deck — that number is the FULL
+> region (dispatch + **fmoe GEMM** + combine), not the prefix. The prefix here excludes the expert GEMM
+> and the combine. The comparable fused prefix is likewise gather-only. Do not conflate the two.
+
+### 5.2 Fused prefix — gather_pack (MEASURED, warm, all correctness gates pass)
+
+Same node/config as §5.1 (8× MI350X, 8 ranks, 30 iters, 10 warm-up, MAX over ranks, real top-8 route,
+`T=1024`). **All 13 correctness gates PASS on all 8 ranks** — `gather_pack_rowmap` and the on-device
+plan builder both produce byte-identical packed output to the shipped SEG gather.
+
+| stage | MAX µs |
+|---|---|
+| `gather_pack` (SEG/TILE ABI, host plan) | 250.3 |
+| `gather_pack_rowmap` (flat plan, host) | **226.2** |
+| `quant[T=1024]` (at origin; single-GPU microbench) | ~23 |
+| `plan_allgather_ids` (IRIS, tier-2) | 14.5 |
+| `build_plan` (on device, tier-2) | 53.5 |
+
+- **`rowmap` is 1.106× faster than the `route_segment` ABI** — confirms §1.4: the run-encoding buys
+  nothing at mean run 1.03 and costs a serial per-tile scan. The rowmap ABI is the one to ship.
+- XGMI moved: **60.1 MB** (8132 rows × 7168 fp8 + scales) — a pull re-reads (dup 1.5×) what a dedup push
+  would not. Local HBM written: **82.6 MB** (11520 × 7168 fp8, **29% BM=256 zero padding**).
+
+**Fused prefix (`quant[T]` + `gather_pack_rowmap`):**
+- **tier-1 (plan precomputed):** `23 + 226.2 = ` **`249.2 µs`**
+- **tier-2 (plan on device):** `23 + 226.2 + 14.5 + 53.5 = ` **`317.2 µs`**
+
+### 5.3 Head-to-head (prefill T=1024, warm, real route, all ranks, MAX over ranks) — THE ANSWER
+
+Three prefixes, all "router → fc1 A ready", same node/route/config. `bf16-dispatch` and `fp8-dispatch`
+were measured in ONE process (directly comparable); the fused gather is a separate process (same node,
+~30 min apart — cross-run variance ≲10%).
+
+| prefix | tier-1 (routing cached) | tier-2 (routing on device) |
+|---|---|---|
+| **FUSED** `quant[T]` + `gather_pack_rowmap` | `26 + 226 =` **252 µs** | `+68 =` **320 µs** |
+| **UNFUSED fp8-dispatch** (tight) `quant[T]`+`disp_fp8`+`sort` | `26 + 202 + 67 =` **295 µs** | `26 + 239 + 67 =` **332 µs** |
+| **UNFUSED bf16-dispatch** (C4/b3 default) `disp_bf16`+`quant[R]`+`sort` | `259 + 42 + 67 =` **368 µs** | `284 + 42 + 67 =` **392 µs** |
+
+**The honest, decomposed result:**
+- **vs the tight fp8-dispatch baseline: `gather_pack` wins 1.17× (cached) and ~1.04× (routing on device).**
+  This is the *isolated fusion* effect — the fused side has **no separate sort pass** (placement *is* the
+  gather), which saves the `sort` (67 µs) minus the pull's re-read/padding overhead. At tier-2 it nearly
+  vanishes: our on-device plan build (68 µs) costs *more* than MORI's on-device routing (dispatch_fp8
+  cache−replay ≈ 37 µs), so building the plan ourselves eats most of the sort-fusion gain.
+- **vs the bf16-dispatch (b3/C4-default) baseline: 1.46× (cached).** But roughly **half** of that gap is
+  the fp8-vs-bf16 *movement* (dispatch 202 vs 259, quant at T vs R), **not** fusion — a production stack
+  gets that half for free by dispatching fp8.
+
+**So the "1.56×" headline resolves, at the dispatch-prefix level, to ≈1.2× of real fusion win (cached
+routing) that shrinks to ≈parity once the routing plan is paid for on-device** — plus a separate,
+legitimately-claimable fp8-movement advantage. The prefill *region* number (with the expert GEMM) is a
+different denominator (§5.5).
+
+### 5.4 The `route_segment` ABI should be replaced by the flat rowmap
+
+`gather_pack_rowmap` (226 µs) beats `gather_pack` (250 µs) by **1.106×** under real routing — the run-
+encoded `route_segment` ABI is pure overhead when mean run = 1.03 (§1.4). Actionable: ship the rowmap ABI.
+
+### 5.5 Results still pending
+
+- **The prefill *region*** (gather + fc1 + act + fc2 + combine) with `ALL_RANKS=1`, to correct the deck's
+  `1247 vs 1941 µs` full-region 1.56× — the prefix above is only the gather boundary, not the GEMM.
+- **decode `T=64`** for both sides (padding-immune, but sort oversizing is 183× — check §2.1 there).
+- A same-process fused-vs-unfused run (removes cross-run variance) once the MORI+IRIS coexist hang (§3.4)
+  is fixed.
+
+Per `T ∈ {64, 1024}`:
 
 - the per-stage MAX-over-ranks table,
 - tier-1 and tier-2 prefix totals for `{unfused bf16, unfused fp8, fused SEG, fused rowmap}`,
