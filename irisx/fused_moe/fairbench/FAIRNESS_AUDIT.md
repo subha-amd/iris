@@ -634,16 +634,24 @@ Stage decomposition of the prefill T=1024 tier-2 comparison (the drop-in, from r
 
 **The all-to-all is 71–73% of the cost on both sides; the sort is only 19%.** So eliminating the sort
 entirely caps the win at 391/(391−73) = **1.23×**; the rest of the 1.27× is the fp8-vs-bf16 movement
-(gather 226 < dispatch 276). **The bottleneck is XGMI, not HBM:** XGMI ≈ 47 GiB/s/link is ~20× slower than
-HBM (~8 TB/s), so `moe_sorting`'s index-scale HBM round-trips are cheap — the expensive, *irreducible*
-part is shipping each token to its expert's GPU across the fabric, which both paths pay. **⇒ the only
-high-ceiling lever is making the all-to-all itself move fewer bytes / fewer transactions** (fp8 already
-taken; next: max-width XGMI transactions per lane, and attacking `EpDispatch`'s atomics on the push side).
-This is the target handed to the `auto-gpu-kernel` optimizer (§6).
+(gather 226 < dispatch 276). The **stage** to attack is unambiguously the gather; both paths must ship
+each token to its expert's GPU across XGMI (≈ 47 GiB/s/link, ~20× slower than HBM), which is the
+irreducible physics.
+
+> **⭐ CORRECTION (2026-07-09, from the optimizer's exp3/exp4 — supersedes the earlier "XGMI-read-bound"
+> reading).** Within the 226 µs gather, the exposed bottleneck is **the fine-grained `A_pk` HBM WRITES,
+> not the XGMI reads.** Evidence: (exp3) raising occupancy made it *worse* → bandwidth-, not latency-,
+> bound; (exp4) a byte-verified dedup that cuts XGMI reads ~1.5× gained only **~1.5%** → reads are not the
+> limiter. So "reduce XGMI read bytes" (dedup, wider reads) is a *weak* lever here; the real headroom is
+> the write pattern + `build_plan`'s global atomics. Optimizer wins so far: prefill region 315→306 µs,
+> decode 104→98 (~3–5%), gated 8/8. This is **strongly indicated but not yet directly split** — a
+> read-vs-write micro-decomposition (`GP_NOREAD`) was staged but the node lapsed before it ran. Full
+> detail: `MASTER_HANDOFF.md §0.6` + `auto-gpu-kernel/iris_moe_dropin/experiments/`.
 
 > XGMI bytes moved (rank0, prefill): fused pull **58 MB** fp8 (8132 rows × 7168) vs bf16 push **79 MB**
-> (5490 dedup tokens × 7168 × 2). Note the pull re-reads (dup 1.5×) but fp8 halves the per-byte, so it
-> still moves ~26% fewer bytes — matching the 226-vs-276 gap.
+> (5490 dedup tokens × 7168 × 2). The pull re-reads (dup 1.5×) but fp8 halves the per-byte, so it still
+> moves ~26% fewer bytes — matching the 226-vs-276 gap. (Per the correction above, that read-byte edge is
+> *not* what bounds the gather; the write pattern is.)
 
 ### 5.10 Results still pending
 

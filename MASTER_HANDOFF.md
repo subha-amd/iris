@@ -1,8 +1,13 @@
 # MASTER HANDOFF — Fused DeepSeek-R1 MoE expert region on AMD MI355X
 
-> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-08.
+> **You are a Claude agent resuming this project. Read this whole file first.** It encapsulates the goal, the current state, where everything lives, how to run on the cluster, and how to use the `auto-gpu-kernel` optimizer + spawn subagents. Last updated 2026-07-09.
 >
-> **🛑 NEW AGENT: read §0.4 (2026-07-08 FAIRNESS AUDIT) FIRST.** The headline `1.56×` and the
+> **🛑 NEW AGENT — the CURRENT active workstream is §0.6 (2026-07-09): the tier-2 DROP-IN gather
+> optimization loop.** Start there — it has your task, the node/build/bench recipe, the progress so far,
+> the lever roadmap, and the BENCHMARKING PITFALLS you must not repeat. Then read §0.4 for *why* the
+> tier-2 methodology exists.
+>
+> **🛑 read §0.4 (2026-07-08 FAIRNESS AUDIT) too.** The headline `1.56×` and the
 > `combine 386 vs 398 µs` numbers in §0/§3/§4 are **under audit and must not be quoted**. One kernel
 > (`combine_pull`) is **outright incorrect** under real EP routing — confirmed on device.
 >
@@ -247,6 +252,185 @@ the SAME §10 open item — do it once and it decides both the abstraction AND t
   2.9.1+rocm7.2, triton 3.6). DeepSeek models cached in `/data2/huggingface/hub`. See Claude memory
   `mi350x-node-access` (Node B) + `tilecomm-abstraction`.
 - Commits pushed to `subha/moe-dispatch-v0` (through `5953fec`).
+
+---
+
+## 0.6 — 2026-07-09 session: the TIER-2 DROP-IN GATHER optimization loop ★ ACTIVE WORKSTREAM ★
+
+> **⭐ END-OF-SESSION CORRECTION (read before the mid-session detail below).** The optimizer ran 4
+> experiments (`auto-gpu-kernel/iris_moe_dropin/experiments/{summary,LESSONS}.md`) before the node
+> lapsed, and its own later experiments **overturned the "XGMI-read-bound" hypothesis** stated further
+> down. The verified picture:
+> - **Modest, gated wins (kept):** exp1 (split the fp8 pull from the fp32 scale load — the scale was
+>   being reloaded 8× per row) + exp2 (software-pipeline `GP_PIPE=4` outstanding `uint4` loads). Net:
+>   prefill REGION **315→306 µs**, gather **217→211**; decode REGION **104→98 µs**, gather **44→42**.
+>   ~3% prefill / ~5% decode.
+> - **THE FINDING — the tier-2 gather is WRITE-bound, not XGMI-read-bound.** Proven two ways: exp3
+>   (raising occupancy `GP_SPLIT` 8→16 made it *worse* → bandwidth-, not latency-, bound) and exp4
+>   (implemented the "kill the 1.5× pull re-read" idea behind `GP_DEDUP` — byte-verified it cuts XGMI
+>   reads ~1.5× — yet a paired A/B moved the gather only **~1.5%**). So the exposed cost is the
+>   fine-grained `A_pk` HBM **writes**, not the XGMI reads. **⇒ read-side levers (dedup, more pipelining,
+>   more occupancy) are marginal; the real headroom is the write pattern + `build_plan`'s atomics (§ lever
+>   roadmap, re-prioritized).** `GP_DEDUP` is kept behind a flag (production-valuable even if neutral here).
+> - **A trap correctly avoided:** "skip the padding writes" would shrink the bench but is NOT a fair
+>   drop-in (the packed buffer must be produced correctly) — a June-30-class artifact.
+> - The winning kernel + logs are LOCAL at `auto-gpu-kernel/iris_moe_dropin/` (survived the node);
+>   the diff vs `irisx/fused_moe/kernel.cpp` is un-merged (needs a live node to re-verify before merge).
+> - **Node `10.145.64.89` lapsed** (key → `Permission denied (publickey)` at the day boundary). Resuming
+>   needs a fresh node IP from the user.
+
+**The task (from the user, emphatic).** Make the fused MoE **all-to-all gather** faster —
+specifically `gather_pack_rowmap_kernel` in `irisx/fused_moe/kernel.cpp` — using the `auto-gpu-kernel`
+discipline (**research → profile → ONE change → benchmark → log → repeat**), running many iterations.
+The **non-negotiable rule**: the fused path's INPUT must be EXACTLY the router's output
+`(tokens bf16, topk_ids)` — TIER-2, the true drop-in. Routing is derived **on device**
+(`plan_allgather_ids` + `build_plan`), never host-precomputed (that is tier-1 and is INVALID — see the
+pitfalls below). **Benchmark ONLY via `fairbench/bench_dropin.py`** (the tier-2 region). Every speedup
+must be a real drop-in speedup at the tier-2 region, correctness-gated 8/8. **Do NOT use the old
+`example.py` / tier-1 methodology — that is exactly the June-30 mistake (§0.4).**
+
+### The numbers to beat (node `smci350...`=`10.145.64.89`, container `subha_fair`, warm, MAX/8 ranks)
+The tier-2 drop-in region `bench_dropin.py`: `quant → plan_allgather_ids → build_plan → gather_pack_rowmap`.
+
+| piece (prefill T=1024) | µs | | piece (decode T=64) | µs |
+|---|---|---|---|---|
+| quant+place (aiter+torch, out of scope) | 33 | | quant+place | 32 |
+| plan_allgather_ids | 14.5 | | plan_allgather_ids | 10 |
+| build_plan (count/scan/scatter) | 53 | | build_plan | 20 |
+| **gather_pack_rowmap ← THE bottleneck (69%)** | **217** | | **gather_pack_rowmap** | **44** |
+| **REGION tier-2 (the headline, minimize)** | **315** | | **REGION tier-2** | **104** |
+
+Unfused denominators (`bench_unfused_prefix.py`, DO NOT modify): fp8-dispatch 332/115 · bf16-dispatch
+391/131. The fused drop-in is already ~1.07–1.12× ahead of fp8-dispatch and ~1.25× ahead of bf16 — the
+job is to push the **217 µs prefill gather** down. **The bottleneck is XGMI (~47 GiB/s/link, ~20× slower
+than HBM), not HBM** — the gather is a PULL of fp8 tokens across the fabric. Attack **bytes + transactions
+on the fabric**.
+
+### Progress this session (logged in `auto-gpu-kernel/iris_moe_dropin/experiments/`)
+| exp | change | gather pf | gather dec | REGION pf | REGION dec | gates | verdict |
+|---|---|---|---|---|---|---|---|
+| 0 | baseline (this node) | 216.6 | 44.0 | 315 | 104 | 8/8 | reference |
+| 1 | **scale-load dedup 8×→1×** (split fp8 / scale passes) | 214.2 | 42.2 | 306 | 101.6 | 8/8 | tiny net win; KEPT |
+| 2 | software-pipelined fp8 loop (`GP_PIPE` outstanding loads) | — | — | — | — | — | **CODED, not yet built** (node down) |
+
+- **exp1 finding (important):** the gather reloaded each 128-group's fp32 scale once **per 16B chunk =
+  8× redundant** over XGMI (half of all load instructions were narrow 4B scale loads). Deduping to 1×
+  moved the gather only ~1%. ⇒ **the scale loads were NOT the bottleneck** (L2-absorbed or hidden under
+  the fp8 pull). **The fp8 uint4 XGMI movement dominates.** exp1 is kept (harmless + it makes PASS 1 a
+  pure `uint4` loop, easy to pipeline).
+- **exp2 (prepped, ready to build):** `gather_pack_rowmap_kernel` PASS 1 rewritten to issue `GP_PIPE`
+  (default 4) independent remote `uint4` loads into registers, THEN the `GP_PIPE` stores — so `GP_PIPE`
+  XGMI reads are in flight per lane before the first store's `s_waitcnt` (hides exposed pull latency
+  without more blocks). It doubles as a latency-vs-BW **probe**: if it helps a lot → latency-bound,
+  keep tuning `GP_PIPE`/`GP_SPLIT`; if it barely helps → BW-bound → pivot to the 1.5× pull-dup lever.
+
+### The XGMI ceiling (analytical — confirm with a profiler pass)
+Prefill: ~8192 packed rows/rank × 7168 fp8 B, ~7/8 crossing XGMI ≈ **51 MB pulled/rank**. At 214 µs
+that's **~240 GB/s achieved inbound** — already fairly high vs the ~300 GB/s dispatch-pack prototype
+(PROJECT_SUMMARY) and the ~350 GB/s aggregate ceiling (7 peers × ~47 GiB/s). So there is **only ~1.3–1.5×
+latency-hiding headroom**, but a **byte-reduction lever is bigger**:
+
+### Lever roadmap (single-change experiments, by expected impact / risk)
+1. **Software-pipeline the fp8 loop** (exp2, prepped) — `GP_PIPE` outstanding uint4 loads/lane. Low risk.
+   Also sweep `GP_SPLIT` (currently 8; grid = ceil(Mpacked/64)×8 ≈ 1024 blocks of 256 thr ≈ 16 waves/CU
+   on 256 CUs → room to ~32–40). Est: if latency-bound, up to ~1.3×; if BW-bound, marginal.
+2. **Kill the 1.5× pull re-read (the BIG byte lever).** A pull re-reads each distinct source token once
+   per LOCAL expert it routes to (measured **dup ≈ 1.506** under real top-8, §0.4). Pull each distinct
+   `(src_rank, src_token)` **ONCE** into a local staging row, then replicate to its ≤k expert-rows via a
+   **LOCAL (HBM, ~20× faster) copy**. Cuts XGMI bytes ~1.5× → ideal gather ~143 µs. **Invasive**: changes
+   `build_plan`'s output ABI (must emit a distinct-source list + staging-slot map + a local scatter list)
+   and adds a local-replicate kernel. Do this once the profile confirms BW-bound. **Highest ceiling.**
+3. **`build_plan` atomics (53 µs prefill piece).** `plan_scatter_kernel` uses a global `atomicAdd` per
+   `(token,expert)` pair; AMD global atomics are slow. Replace with a warp-aggregated / per-block-privatized
+   histogram + scan. Est: cut build_plan ~1.5–2×.
+4. **`plan_allgather_ids` (14.5 µs).** One int/lane all-gather of topk_ids; check vectorization / fewer
+   launches. Smaller lever.
+5. **Decode-specific.** The decode gather is 44 µs with Mpacked still ≈8192 (93% zero-pad) — but the pull
+   only moves REAL rows (padding rows are `src_rank<0` zero-sentinel, no XGMI), so 44 µs is mostly the
+   grid/occupancy + the local zero-writes to the padded buffer. Profile what the 44 µs actually is before
+   spending iterations (decode gather is small relative to build_plan+quant there).
+
+### ⛔ THE BENCHMARKING PITFALLS — what June-30 got WRONG (do NOT repeat; full detail §0.4)
+The June-30 deck headlined **"1.56× prefill / combine beats MORI"** and it **did not survive a fairness
+audit**. Six ways the measurement lied — internalize all of them; the tier-2 `bench_dropin.py` methodology
+exists specifically to prevent them:
+1. **Only ONE rank executed.** `example.py:643` ran the region on `rank==CONSUMER` only; ranks 0–6 idled
+   at a barrier. The gather pulled from **seven idle peers** → no all-to-all contention, no straggler. The
+   real baseline runs the full 8-way collective. **FIX: all 8 ranks active, MAX over ranks** (bench_dropin
+   does this).
+2. **The fused side never quantized + used a host-built plan, OFF the clock.** `A_src` was pre-quantized
+   fp8 on the host; the `SEG/TILE` routing plan was host-built. Production has **neither** — the router only
+   emits `topk_ids` on the GPU. **FIX = TIER-2**: time `quant → allgather_ids → build_plan → gather`
+   on-clock from raw `(tokens bf16, topk_ids)`. Host-precomputed plan = **tier-1 = INVALID drop-in**.
+3. **The synthetic route flattered the gather.** `ROUTE=uniform` gave mean `route_segment` run ~20.5 (real
+   top-8 = **1.03**), source-token dup **1.000** (real = **1.506**), and **0% BM=256 padding** (real =
+   35.4%). **FIX: real top-8 route** (`real_route.py`) for all shape-sensitive numbers.
+4. **A broken kernel scored a win.** `combine_pull` drops cross-rank partial sums (100% of tokens have
+   experts on ≥2 ranks); its "386 µs beats MORI 398" is **void** — the correct variant is 788 µs (a loss).
+   **FIX: correctness-gate 8/8 on all ranks BEFORE any timing counts.** A fast wrong kernel is worthless.
+5. **Mixed denominators across machines.** The baseline came from a *different node* (thor-4); the cluster
+   varies **~1.8×** node-to-node. **FIX: run candidate + baseline back-to-back on the SAME node**, warm.
+6. **EAGER, not graph-captured.** Eager overstates the region vs production's HIP-graph capture. Note it.
+
+**The one-line rule the new agent must live by:** *a speedup only counts if it's measured at the tier-2
+`bench_dropin.py` region — raw `(tokens bf16, topk_ids)` in, on-device routing, all 8 ranks, MAX over ranks,
+warm (WARMUP≥10), correctness-gated 8/8 — on the SAME node as the baseline.* Anything else is a June-30
+mirage.
+
+### HANDOFF — how to continuously run the optimize loop (node + build + bench)
+**Framework/task dir (all local):** `/Users/subha/repos/auto-gpu-kernel/iris_moe_dropin/` — copied from
+`iris_moe_gather/` and re-pointed at the drop-in task. Read its `CLAUDE.md`, `experiments/summary.md`,
+`experiments/LESSONS.md`, and `experiments/exp_1/result.md` first. Working kernel copy:
+`solution/hip/kernel.cpp` (+ `ep8_gather.h`) — **edit HERE, sync to the node; do NOT edit the iris repo's
+`irisx/fused_moe/kernel.cpp` in place** (the user commits that; report the winning diff for merge). The
+`.claude/agents/{research,profiler}.md` specialists exist — spawn `research` (clean context) before
+optimizing and at any plateau (2 consecutive <2% iters), `profiler` before a structural change. **Note:
+those custom subagent *types* are not registered in a fresh session — spawn `general-purpose` agents and
+paste the `.md` role into the prompt (as this session did); have them RETURN findings as text (the harness
+blocks Write of report-like filenames — maintain `experiments/*.md` via a Bash heredoc).**
+
+**Node (build + measure here; NO local GPU).** ⚠️ These Conductor/MI350X nodes are **time-reserved and the
+IP changes per reservation** (Claude memory `mi350x-node-access`). As of the 2026-07-09 day-boundary the
+key to `10.145.64.89` began returning `Permission denied (publickey)` — **the reservation lapsed; ASK THE
+USER for the current node IP** before resuming GPU work. When up:
+```
+ssh -o StrictHostKeyChecking=no -i ~/.ssh/muhammad-gpu subvadla@<CURRENT_IP>
+```
+Container `subha_fair` (`rocm/atom-dev:nightly_202607061543`, gfx950/ROCm7.2), runs as ROOT, mounts host
+HOME (`/home/subvadla/…` shared). Build mirror `/home/subvadla/HipKittens/distributed-kernels/` (target
+`b1_dispatch`); benches `/home/subvadla/fairbench/`.
+
+**Build** (⚠️ BUILD TRAP: the cmake cache `DK_BUILD` must be `b1_dispatch` or `cmake --build` silently
+no-ops — always reconfigure first, then verify the `.so` mtime advanced):
+```
+scp kernel.cpp → subvadla@<IP>:/home/subvadla/HipKittens/distributed-kernels/b1_dispatch/kernel.cpp
+docker exec -e MORI_GPU_ARCHS=gfx950 subha_fair bash -lc \
+ 'cd /home/subvadla/HipKittens/distributed-kernels && cmake -B build -DGPU_TARGET=CDNA4 -DDK_BUILD=b1_dispatch >/dev/null && flock /tmp/mi355x_compile.lock cmake --build build -j16 --target b1_dispatch'
+# verify: b1_dispatch/tk_kernel.cpython-312-x86_64-linux-gnu.so mtime advanced
+```
+
+**Run the tier-2 bench** (detached; poll a logfile — a foreground ssh dies at a 10-min cap):
+```
+docker exec -d -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 -e HSA_XNACK=1 -e MORI_GPU_ARCHS=gfx950 \
+ -e T=<64|1024> -e ITERS=30 -e WARMUP=10 -e PYTHONPATH=/home/subvadla/HipKittens/distributed-kernels subha_fair \
+ bash -lc "cd /home/subvadla/fairbench && setsid timeout 1200 mpirun --allow-run-as-root --mca pml ob1 --mca btl self,vader -np 8 python3 -u bench_dropin.py > /tmp/opt.log 2>&1; echo DONE_RC=\$? >> /tmp/opt.log"
+```
+Read the `region / piece` table (MAX µs). Gates `dev_plan_erb / dev_plan_sets / packed_nonzero` must be
+**8/8 PASS** before a timing counts. Run **both** `T=1024` (prefill — where the 217 µs gather bottleneck
+is biggest) and `T=64` (decode).
+
+**SHARED-NODE DISCIPLINE (critical — a node was wedged this way before):** tenants `okachur`/`hangy` share
+it. **Never run two 8-GPU jobs at once** — check `docker exec subha_fair bash -lc 'ps -eo args
+--no-headers | grep -c "[m]pirun"'` is 0 before launching. **Never SIGKILL a job mid-run** (leaks GPU IPC
+→ wedges the whole node → needs a device reset that kills other tenants) — always `setsid` + `timeout` and
+let jobs COMPLETE; kill ONLY your own procs. `MORI_GPU_ARCHS=gfx950` always. Warm (WARMUP≥10 — cold aiter
+JIT inflates the first pass ~2×). **Do NOT modify** `bench_dropin.py`, `bench_unfused_prefix.py`,
+`real_route.py`, or anything under `irisx/`. **Do NOT git-commit to the iris repo** (report the diff).
+
+**Deliverables to report back:** best drop-in region µs (prefill+decode) vs the 315/104 start + the winning
+kernel diff against `irisx/fused_moe/kernel.cpp`; the per-iteration `experiments/summary.md`; the profiler's
+finding on where the 217 µs gather goes (XGMI BW achieved, transaction count, latency-vs-BW); and an honest
+XGMI-floor / remaining-headroom assessment.
 
 ---
 
