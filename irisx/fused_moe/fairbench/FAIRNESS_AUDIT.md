@@ -621,6 +621,30 @@ stack via `DISPATCH=fp8`). This is the honest, production-relevant number: same 
 gated. It is **not** the deck's 1.56× (that is the full region incl. the expert GEMM + combine — a
 different, still-pending denominator, §5.10).
 
+### 5.9.1 Where the time goes — the all-to-all dominates (why the win is 1.27×, not 3×)
+
+Stage decomposition of the prefill T=1024 tier-2 comparison (the drop-in, from raw `topk_ids`):
+
+| unfused (bf16-dispatch) | MAX µs | | fused drop-in | MAX µs |
+|---|---:|---|---|---:|
+| **dispatch (all-to-all, XGMI)** | **276** | | **gather (all-to-all, XGMI)** | **226** |
+| dynamic_quant | 42 | | quant + place | 33 |
+| moe_sorting | 73 | | `build_plan` + `plan_allgather_ids` | ~42 |
+| **total** | **391** | | **total (region)** | **309** |
+
+**The all-to-all is 71–73% of the cost on both sides; the sort is only 19%.** So eliminating the sort
+entirely caps the win at 391/(391−73) = **1.23×**; the rest of the 1.27× is the fp8-vs-bf16 movement
+(gather 226 < dispatch 276). **The bottleneck is XGMI, not HBM:** XGMI ≈ 47 GiB/s/link is ~20× slower than
+HBM (~8 TB/s), so `moe_sorting`'s index-scale HBM round-trips are cheap — the expensive, *irreducible*
+part is shipping each token to its expert's GPU across the fabric, which both paths pay. **⇒ the only
+high-ceiling lever is making the all-to-all itself move fewer bytes / fewer transactions** (fp8 already
+taken; next: max-width XGMI transactions per lane, and attacking `EpDispatch`'s atomics on the push side).
+This is the target handed to the `auto-gpu-kernel` optimizer (§6).
+
+> XGMI bytes moved (rank0, prefill): fused pull **58 MB** fp8 (8132 rows × 7168) vs bf16 push **79 MB**
+> (5490 dedup tokens × 7168 × 2). Note the pull re-reads (dup 1.5×) but fp8 halves the per-byte, so it
+> still moves ~26% fewer bytes — matching the 226-vs-276 gap.
+
 ### 5.10 Results still pending
 
 - **The full *region*** (gather + fc1 + act + fc2 + combine) with `ALL_RANKS=1`, to correct the deck's
